@@ -1,0 +1,26 @@
+#!/bin/sh
+# Сторож блока видео PL (pl_video_ctl.sh, топики cmd/video/pl, state/video/pl) под goofy_supervise — с
+# перезапуском при падении. PL_VIDEO_ALLOW: mode ≠ 0 только при живой аренде (файл держит goofy_lease.sh;
+# без флага /etc/goofy/lease_enforce файл есть всегда). Оверлей goofy nano, PL-4a (E:\pl\docs\FW_BUILD.md).
+PIDFILE=/var/run/goofy-video.pid
+case "$1" in
+start)
+	printf "Starting pl_video_ctl: "
+	PL_VIDEO_ALLOW=/run/goofy/lease_ok start-stop-daemon -S -b -q -m -p "$PIDFILE" -x /usr/sbin/goofy_supervise -- \
+		pl_video_ctl /usr/sbin/pl_video_ctl.sh && echo "OK" || echo "FAIL"
+	;;
+stop)
+	printf "Stopping pl_video_ctl: "
+	start-stop-daemon -K -q -p "$PIDFILE" && echo "OK" || echo "FAIL"
+	rm -f "$PIDFILE"
+	;;
+restart|reload)
+	$0 stop
+	sleep 2
+	$0 start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0

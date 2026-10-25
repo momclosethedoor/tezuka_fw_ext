@@ -1,0 +1,21 @@
+#!/bin/sh
+# Гашение TX при загрузке, как можно раньше после привязки ad9361 (драйвер встроен в ядро — к rcS он уже
+# привязан): TX_LO_powerdown = 1, ослабление максимальное, DDS-тоны выкл., обратное чтение, строка в
+# /tmp/goofy_boot.log. Если ad9361-phy за 5 с не появился — ждём ещё 60 с в фоне (загрузку не держим).
+# Оверлей goofy nano, срез PL-4a (E:\pl\docs\FW_BUILD.md).
+case "$1" in
+start)
+	printf "goofy: TX off (boot): "
+	if /usr/sbin/goofy_tx_off boot 5; then
+		echo "OK"
+	else
+		echo "FAIL, retry in background"
+		/usr/sbin/goofy_tx_off boot-late 60 </dev/null >/dev/null 2>&1 &
+	fi
+	;;
+stop|restart|reload) ;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0

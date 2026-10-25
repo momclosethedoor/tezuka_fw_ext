@@ -1,0 +1,27 @@
+#!/bin/sh
+# goofy_supervise <имя> <команда> [арг…] — держит команду запущенной: после выхода перезапуск через 1 с
+# (5 и больше выходов за 60 с — через 10 с), строка в syslog. TERM/INT/HUP — остановить потомка и выйти.
+NAME=$1
+shift
+child=""
+stop() {
+	[ -n "$child" ] && kill "$child" 2>/dev/null && wait "$child" 2>/dev/null
+	exit 0
+}
+trap stop TERM INT HUP
+
+t0=0 n=0
+while :; do
+	"$@" &
+	child=$!
+	wait "$child"
+	rc=$?
+	child=""
+	read -r _up _rest </proc/uptime
+	now=${_up%.*}
+	if [ $((now - t0)) -ge 60 ]; then t0=$now n=0; fi
+	n=$((n + 1))
+	d=1; [ $n -ge 5 ] && d=10
+	logger -t goofy_supervise "$NAME завершился (код $rc), перезапуск через $d с"
+	sleep $d
+done

@@ -1,0 +1,28 @@
+#!/bin/sh
+# goofy_tx_off <метка> [ожидание, с] — дождаться ad9361-phy, погасить TX (TX_LO_powerdown = 1, ослабление
+# максимальное), выключить DDS-тоны, обратное чтение, строка в /tmp/goofy_boot.log. Циклический буфер TX
+# не запускает и не останавливает — только записывает его состояние (tx_buffer = buffer/enable DDS).
+# Код 0 — TX погашен и подтверждён чтением.
+. /usr/lib/goofy/tx.sh
+
+TAG=${1:-manual}
+WAIT=${2:-30}
+n=0
+until goofy_find_iio; do
+	n=$((n + 1))
+	if [ $n -gt $((WAIT * 10)) ]; then
+		goofy_log "$TAG: FAIL — ad9361-phy не появился за $WAIT с, TX не тронут"
+		logger -t goofy_tx_off "$TAG: FAIL — нет ad9361-phy" 2>/dev/null
+		exit 1
+	fi
+	usleep 100000
+done
+
+goofy_tx_off
+ok=$?
+goofy_dds_off
+[ $ok = 0 ] && res=OK || res=FAIL
+line="$TAG: TX_LO_powerdown=$TX_PD gain0=$TX_G0 gain1=$TX_G1 (max atten $MIN) dds_raw=$DDS_RAW tx_buffer=$TX_BUF -> $res"
+goofy_log "$line"
+logger -t goofy_tx_off "$line" 2>/dev/null
+exit $ok

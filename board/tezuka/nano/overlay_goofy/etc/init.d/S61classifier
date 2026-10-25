@@ -1,0 +1,12 @@
+#!/bin/sh
+# Классификатор (потребитель /waterfall maia-httpd) отключён в оверлее goofy nano (PL-4a): заменяет
+# board/tezuka/common/overlay_tezuka/etc/init.d/S61classifier. fw_setenv classifier_enabled и команда
+# Dashboard cmd/classifier/enabled его не запускают. Бинарь /usr/bin/classifier остаётся в образе.
+case "$1" in
+start|restart) echo "Starting classifier: disabled (goofy)" ;;
+stop) ;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0

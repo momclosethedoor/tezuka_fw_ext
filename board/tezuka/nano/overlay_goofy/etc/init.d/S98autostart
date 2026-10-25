@@ -1,0 +1,13 @@
+#!/bin/sh
+# Выполнение /mnt/jffs2/autorun.sh при загрузке отключено в оверлее goofy nano (PL-4a): заменяет
+# board/tezuka/common/overlay_base/etc/init.d/S98autostart. Наличие файла только отмечается в журнале.
+case "$1" in
+start)
+	[ -f /mnt/jffs2/autorun.sh ] && logger -t goofy "S98autostart: /mnt/jffs2/autorun.sh есть, НЕ выполняется"
+	;;
+stop|restart|reload) ;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0

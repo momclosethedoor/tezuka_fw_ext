@@ -1,0 +1,25 @@
+#!/bin/sh
+# Сторож аренды TX (goofy_lease.sh) под goofy_supervise — с перезапуском при падении. Стартует рано: до
+# сети и брокера (без сердцебиений аренды нет -> TX погашен). Оверлей goofy nano, PL-4a (E:\pl\docs\LEASE.md).
+PIDFILE=/var/run/goofy-lease.pid
+case "$1" in
+start)
+	printf "Starting goofy_lease: "
+	start-stop-daemon -S -b -q -m -p "$PIDFILE" -x /usr/sbin/goofy_supervise -- \
+		goofy_lease /usr/sbin/goofy_lease.sh && echo "OK" || echo "FAIL"
+	;;
+stop)
+	printf "Stopping goofy_lease: "
+	start-stop-daemon -K -q -p "$PIDFILE" && echo "OK" || echo "FAIL"
+	rm -f "$PIDFILE"
+	;;
+restart|reload)
+	$0 stop
+	sleep 2
+	$0 start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0

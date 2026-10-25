@@ -1,0 +1,32 @@
+#!/bin/sh
+# Повторное гашение TX после старта maia-httpd (он настраивает ad9361 при запуске): в фоне ждём, пока
+# maia-httpd слушает порт 80 (/proc/net/tcp, до 60 с), ещё 2 с, затем goofy_tx_off httpd -> /tmp/goofy_boot.log.
+# Оверлей goofy nano, PL-4a (E:\pl\docs\FW_BUILD.md).
+listening80() {
+	while read -r _sl _loc _rem _st _rest; do
+		case "$_loc:$_st" in *:0050:0A) return 0 ;; esac
+	done </proc/net/tcp
+	return 1
+}
+wait_and_kill() {
+	. /usr/lib/goofy/tx.sh
+	n=0
+	until listening80; do
+		n=$((n + 1))
+		if [ $n -gt 60 ]; then goofy_log "httpd: maia-httpd не слушает :80 за 60 с — гасим TX всё равно"; break; fi
+		sleep 1
+	done
+	sleep 2
+	/usr/sbin/goofy_tx_off httpd 10
+}
+case "$1" in
+start)
+	echo "goofy: TX off after maia-httpd: scheduled"
+	( wait_and_kill ) </dev/null >/dev/null 2>&1 &
+	;;
+stop|restart|reload) ;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0
