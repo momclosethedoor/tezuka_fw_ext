@@ -65,9 +65,9 @@ goofy_tx_is_off() {
 # Погасить TX и прочитать обратно; код 0 — подтверждено.
 goofy_tx_off() {
 	goofy_tx_min_gain
-	echo 1 >"$PHY/out_altvoltage1_TX_LO_powerdown" 2>/dev/null
+	echo 1 2>/dev/null >"$PHY/out_altvoltage1_TX_LO_powerdown"
 	for _c in 0 1; do
-		[ -e "$PHY/out_voltage${_c}_hardwaregain" ] && echo "$MIN" >"$PHY/out_voltage${_c}_hardwaregain" 2>/dev/null
+		[ -e "$PHY/out_voltage${_c}_hardwaregain" ] && echo "$MIN" 2>/dev/null >"$PHY/out_voltage${_c}_hardwaregain"
 	done
 	goofy_tx_read
 	goofy_tx_is_off
@@ -79,7 +79,7 @@ goofy_dds_off() {
 	[ -n "$DDS" ] || return 1
 	for _f in "$DDS"/out_altvoltage*_raw; do
 		[ -e "$_f" ] || continue
-		echo 0 >"$_f" 2>/dev/null
+		echo 0 2>/dev/null >"$_f"
 		[ "$DDS_RAW" = "-" ] && read -r DDS_RAW 2>/dev/null <"$_f"
 	done
 	read -r TX_BUF 2>/dev/null <"$DDS/buffer/enable"

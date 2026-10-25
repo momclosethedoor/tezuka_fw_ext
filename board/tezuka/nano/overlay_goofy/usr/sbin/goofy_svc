@@ -1,0 +1,22 @@
+#!/bin/sh
+# goofy_svc lease|video — точка входа сервисов goofy из /etc/inittab (respawn: init перезапускает при выходе).
+# Пауза 1 с перед стартом — busybox init перезапускает сразу, без неё падающий сервис крутился бы вхолостую.
+# Остановить до перезагрузки нельзя (respawn); перезапустить: kill $(cat /run/goofy/goofy_lease.pid) или
+# kill $(cat /run/pl_video/pl_video_ctl.pid). Оверлей goofy nano, PL-4a (E:\pl\docs\FW_BUILD.md).
+sleep 1
+case "$1" in
+lease)
+	logger -t goofy_svc "старт goofy_lease.sh" 2>/dev/null
+	exec /usr/sbin/goofy_lease.sh
+	;;
+video)
+	logger -t goofy_svc "старт pl_video_ctl.sh" 2>/dev/null
+	PL_VIDEO_ALLOW=/run/goofy/lease_ok
+	export PL_VIDEO_ALLOW
+	exec /usr/sbin/pl_video_ctl.sh
+	;;
+*)
+	echo "Usage: $0 lease|video" >&2
+	sleep 10
+	exit 1
+esac

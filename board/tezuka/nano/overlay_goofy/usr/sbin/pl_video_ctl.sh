@@ -3,7 +3,7 @@
 # в PL-4 файл идёт в оверлей прошивки (путей /tmp внутри нет; каталог состояния —
 # PL_VIDEO_RUN, по умолчанию /run/pl_video). busybox sh + mosquitto_sub/mosquitto_pub + devmem.
 # PL-4a (оверлей goofy nano, E:\pl\docs\FW_BUILD.md) — три добавки к версии goofy_v2 (ref/board):
-#   аренда: PL_VIDEO_ALLOW=<файл> (задаёт S64goofy-video) — mode ≠ 0 только пока файл есть (его держит
+#   аренда: PL_VIDEO_ALLOW=<файл> (задаёт goofy_svc video из inittab) — mode ≠ 0 только пока файл есть (его держит
 #     goofy_lease.sh); файла нет — команды mode ≠ 0 исполняются как mode 0, заданный mode ≠ 0 сбрасывается
 #     в 0 на ближайшем тике; без переменной — как раньше;
 #   счётчик насыщений (0x3C [15:0]) сбрасывается (sat_clear) при каждой смене mode / g / полей 0x40 — и

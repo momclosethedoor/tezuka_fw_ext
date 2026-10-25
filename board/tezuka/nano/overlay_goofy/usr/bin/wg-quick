@@ -1,0 +1,7 @@
+#!/bin/sh
+# Заглушка wg-quick (оверлей goofy nano, PL-4a; замещает wg-quick пакета wireguard-tools): исходный исполняет
+# PreUp/PostUp/PreDown/PostDown из конфига оболочкой, а конфиг приходит через анонимный MQTT. Утилита wg
+# (без исполнения команд) остаётся.
+logger -t goofy "wg-quick $*: отключён (goofy)" 2>/dev/null
+echo "wg-quick: disabled in this firmware (goofy PL-4a)" >&2
+exit 1

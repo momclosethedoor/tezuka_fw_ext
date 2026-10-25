@@ -1,0 +1,14 @@
+#!/bin/sh
+# WireGuard отключён целиком в оверлее goofy nano (PL-4a): заменяет
+# board/tezuka/common/overlay_tezuka/etc/init.d/S51wireguard. Причина: wg-quick исполняет PreUp/PostUp из
+# /mnt/jffs2/etc/wireguard/wg0.conf, а этот файл записывается через анонимный MQTT (api_controller.sh,
+# команда VPN Dashboard) — выполнение кода от root. /usr/bin/wg-quick в образе тоже заглушка.
+# fw_setenv wireguard_enabled и команда Dashboard его не включают.
+case "$1" in
+start|restart) echo "Starting wireguard: disabled (goofy)" ;;
+stop) ip link show wg0 >/dev/null 2>&1 && ip link del wg0 ;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+exit 0
