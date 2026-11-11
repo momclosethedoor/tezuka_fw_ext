@@ -111,3 +111,42 @@ Initial CRLF files and platform-dependent Path sorting were both corrected.
 Failed deliveries preserve an explicitly unverified diagnostic ELF and source map;
 a successfully compiled ARM dependency tree can be cached despite verification
 failure because Maia is always removed/re-extracted/re-patched on the next run.
+
+## Accepted execution, 2026-11-12
+
+ARM-only delivery and hardware API/RX/row/real8 transport smoke passed. Successful
+run: https://github.com/momclosethedoor/tezuka_fw_ext/actions/runs/43108518497,
+attempt 1, head 1265146212550a5c9a8100f898ff27c53d9e6f78. Artifact maia-httpd-nano
+(ID 13895333237), ELF 6,225,744 bytes, SHA256
+7367e94eeeb11adecf364ecf0ac2352d965589b4ea7e73cb8409f7b7c4343ff7.
+Source fingerprint 8470d0e05ee6bc27307e779907f14356fe6dc2440a5f6e5faf2922ef717864e9,
+49 exact files. GCC 15.1.0 / Bootlin 2025.08-1; Rust 1.94.0 --locked.
+Runner job: 855 seconds; Rust release: 4m23s. All four dependency/output cache saves
+succeeded. A warm-cache repeat was not run after the scope reduction.
+
+On Pluto, /proc/PID/exe hash matched the artifact and API reported git 1265146.
+74 fresh direct frames; 16 distinct spectral payloads excluding the tag. Host rows
+75 -> 674, 593 unique WS messages, zero time/tag losses. Real8: 881 blocks/15.03s,
+zero block losses, no overrun. RSS 7,760 -> 7,812 KiB; virtual size 230,384 KiB.
+Kernel log unchanged. Two peer resets occurred when test clients disconnected.
+No loader/library or new DMA/IIO errors. Video picture/RF accuracy and long-term
+memory were not accepted: demod remained searching, clipping was saturated as in
+the baseline. A host tracker IndexError (slot 66 vs capacity 64) occurred once;
+one stock-ELF control did not reproduce it. Cause remains open; classifier code
+was not changed and full classifier regression is not claimed.
+
+Stock ELF restored (SHA256 6e13d631f6e485bb11038799ff12d2c5130abc3220d23b6e42b2f95bec840596),
+RX/DDC/spectrometer/settings matched, fresh host rows 116 -> 714 after rollback.
+TX remained off, lease/video watchdogs stayed enabled, temporary Pluto files were
+removed. No flash or PL/DT/kernel/env changes. XSA remains byte-identical to 5162a79
+(SHA256 6175da5e91bf77747348449bcc3301e89c0c4daf18d1917855ab981038ce48f5).
+The old full image/run 40190150385 remains the accepted firmware baseline; no claim
+is made that its embedded ELF equals this new ARM ELF. Full-mode checks exist but
+were not accepted on a completed full run in this slice.
+
+Three source-fingerprint regression tests pass on Windows; they are included in
+future CI runs. Later commits add tests/docs without changing the compiled Maia
+source or recipe. Full local evidence/report: C:/proj/pluto_ag/evidence/OBS-001-CI.md;
+private host/connection data and raw captures remain outside this repository.
+OBS-002 starts with observation contracts and the replay harness; keep the host
+tracker finding visible when defining its tests.
