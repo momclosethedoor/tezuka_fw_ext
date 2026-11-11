@@ -3,3 +3,5 @@ package/maia-httpd/maia-httpd.mk text eol=lf
 package/maia-httpd/source.json text eol=lf
 tools/obs-ci/*.py text eol=lf
 doc/OBS-001-CI.md text eol=lf
+tools/observation/*.py text eol=lf
+doc/OBSERVATION-V1.md text eol=lf

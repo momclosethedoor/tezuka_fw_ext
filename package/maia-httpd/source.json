@@ -5,9 +5,13 @@
     {
       "name": "0001-ddc-routing-toggle.patch",
       "sha256": "865681fa6e020e3f9dd1c05d82d6cbaf2fd50d0a75fc349bd1816ca14b6e20a9"
+    },
+    {
+      "name": "0002-observation-v1.patch",
+      "sha256": "c4c66697de253a6a5c17b7fe9fadfa34745ecd7c5757f8a590302920f1ea346f"
     }
   ],
-  "maia_httpd_tree_sha256": "8470d0e05ee6bc27307e779907f14356fe6dc2440a5f6e5faf2922ef717864e9",
+  "maia_httpd_tree_sha256": "53d79d65db4ad4c1403f6892dd493ac1d2ec43482222b99664cc1513357d79d4",
   "files": {
     "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
     "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
@@ -51,12 +55,16 @@
     "maia-httpd/src/httpd/websocket.rs": "fe19d50c53dd02d89ce88a14cfbb518c7bfc803cf907871c6edc6df86dfe73d0",
     "maia-httpd/src/httpd/zeros.rs": "6a500dff4d4f761bb332c0551459bb7228afc3598ad2fd67115d302d991eb3a9",
     "maia-httpd/src/iio.rs": "74df718b885d674ae3904327c634e1fff29aac3b844dafdda1b4ae05180b2f7c",
-    "maia-httpd/src/lib.rs": "13de2f7a00b50c7b57a7b99821d3f541d8d644a151fcc74f3a4b978b42ecc932",
+    "maia-httpd/src/lib.rs": "8d990851efdbadfe333b8421154273ab496ebb7bf91e64d2056aa7106d223109",
     "maia-httpd/src/main.rs": "5787cda63686e0a3a1d4a3b4fbf3f2abaf0737bb2fbfe12e92075e73dbdf4f88",
+    "maia-httpd/src/observation.rs": "e2252fc1d0695daee8ec7dca1da82a1923ceb245e78778ad5e289376203511ca",
     "maia-httpd/src/rxbuffer.rs": "2c770250d68279396424ce12673a88f0e7682c76218bcefa95b7f5499576a2cf",
     "maia-httpd/src/sigmf.rs": "72396a53d0e5f6cb352aa36f44be1d72db583a8cdd954cc9970d835a25753b45",
     "maia-httpd/src/spectrometer.rs": "fb1c44ad5fcb9a250946fd86fccb3da9239832eb119efdb7dc0db465ba8c8669",
     "maia-httpd/src/uio.rs": "9c122903d7bfc0131a06c9b827cbf3fafce37bcbc201f335bc0b74ba6b8e9a07",
+    "maia-httpd/tests/observation-v1/expected.json": "069b12f54c336f9b3b84fb5d8f8de82da285f38ed2e3b86a62c1e1b1f197d87c",
+    "maia-httpd/tests/observation-v1/golden.hex": "ab2b04413797b861cc4c2f605dc696d4920671a884927d131712226a6cb93faf",
+    "maia-httpd/tests/observation-v1/legacy.hex": "06d64063abb57af2521ca91cbdbd32610c6dedefe87877006bcb0115293c5215",
     "maia-httpd/util/spectrum_client.py": "7df34b002bfb6c04cb0da39c5ca43bbc3f9df4772539bf4ec756912b5e2cdf89"
   }
 }

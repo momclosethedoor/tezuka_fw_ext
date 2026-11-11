@@ -132,8 +132,26 @@ jobs:
           path: pr-number.txt
           if-no-files-found: warn
 
+  observation-contract:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install contract Rust toolchain
+        run: |
+          RUST_VERSION=$(sed -n 's/^MAIA_HTTPD_RUST_VERSION = //p' package/maia-httpd/maia-httpd.mk)
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Check observation contract in Rust and Python
+        run: python3 tools/obs-ci/check-contract.py
+      - name: Upload contract test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: observation-contract
+          path: artifacts/observation-contract/
+          if-no-files-found: warn
+
   tezuka:
-    needs: matrix
+    needs: [matrix, observation-contract]
     runs-on: ubuntu-22.04
     name: ${{ matrix.defconfig }}
     permissions:

@@ -1,0 +1,430 @@
+diff --git a/maia-httpd/src/lib.rs b/maia-httpd/src/lib.rs
+index 2985272..a6d238e 100644
+--- a/maia-httpd/src/lib.rs
++++ b/maia-httpd/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod ddc;
+ pub mod fpga;
+ pub mod httpd;
+ pub mod iio;
++pub mod observation;
+ pub mod rxbuffer;
+ pub mod sigmf;
+ pub mod spectrometer;
+diff --git a/maia-httpd/src/observation.rs b/maia-httpd/src/observation.rs
+new file mode 100644
+index 0000000..4c90930
+--- /dev/null
++++ b/maia-httpd/src/observation.rs
+@@ -0,0 +1,211 @@
++//! Observation v1 codec. Detached from spectrometer/HTTP/DMA until OBS-003.
++//! All integers/floats have explicit little endian encoding; no struct casts.
++use std::collections::HashMap;
++/// Capture preamble, including the format version.
++pub const MAGIC: &[u8; 8] = b"GOBS1\r\n\0";
++/// Unavailable first-sample counter.
++pub const UNKNOWN_TICK: u64 = u64::MAX;
++/// No legacy producer tag.
++pub const NO_TAG: u32 = u32::MAX;
++const MAX_BINS: usize = 65536;
++/// Stable grid, accumulation mode and provenance, referenced by its capture-local ID.
++#[derive(Debug, Clone)]
++pub struct Descriptor {
++    /// Nonzero capture-local immutable ID.
++    pub id: u16,
++    /// Actual FFT input rate, in samples/second.
++    pub sample_rate: f64,
++    /// RF frequency of bin zero; canonical NaN only for legacy unknown RF origin.
++    pub bin0_hz: f64,
++    /// Window equivalent noise bandwidth in FFT bins.
++    pub enbw_bins: f64,
++    /// Source clock ticks/second, zero if unavailable. Not host arrival time.
++    pub tick_hz: u64,
++    /// FFT length and bins per plane.
++    pub bins: u32,
++    /// 1 mean, 2 peak, 3 mean then peak, over the same clean FFTs.
++    pub mode: u16,
++    /// 1 synthetic, 2 legacy Maia WS, 3 hardware-stamped producer.
++    pub source: u16,
++}
++/// Executed observation. Nonzero epoch asserts all contributing FFTs belong to it.
++#[derive(Debug, Clone)]
++pub struct Observation {
++    /// Immutable descriptor reference, not the current receiver configuration.
++    pub descriptor_id: u16,
++    /// Capture-scoped producer sequence, starting at zero; never reassigned on replay.
++    pub seq: u64,
++    /// RF visit/state epoch; zero means unattributed, not clean new-epoch data.
++    pub epoch: u64,
++    /// Tick of the first contributing sample, or UNKNOWN_TICK.
++    pub first_tick: u64,
++    /// Consecutive contributing nonoverlapping FFTs; clean only with epoch attribution.
++    /// Zero only for unknown legacy count.
++    pub nint: u32,
++    /// Legacy three-bit tag, or NO_TAG; never substitutes for epoch.
++    pub tag: u32,
++    /// Linear full-scale-squared per-bin power. Canonical NaN marks an invalid bin.
++    pub power: Vec<f32>,
++}
++/// Ordered record; descriptor definitions must precede their references.
++#[derive(Debug, Clone)]
++pub enum Record {
++    /// Stable descriptor definition.
++    Descriptor(Descriptor),
++    /// Measured/executed observation.
++    Observation(Observation),
++}
++/// One producer lifetime/sequence namespace. A restart/reset needs a new UUID.
++#[derive(Debug, Clone)]
++pub struct Capture {
++    /// Nonzero capture UUID bytes, in RFC 9562 network byte order (opaque here).
++    pub session: [u8; 16],
++    /// Records in stored delivery order, which need not be sequence order.
++    pub records: Vec<Record>,
++}
++fn fail<T>(s: &str) -> Result<T, String> { Err(s.into()) }
++fn u16_at(b: &[u8], i: usize) -> u16 { u16::from_le_bytes(b[i..i+2].try_into().unwrap()) }
++fn u32_at(b: &[u8], i: usize) -> u32 { u32::from_le_bytes(b[i..i+4].try_into().unwrap()) }
++fn u64_at(b: &[u8], i: usize) -> u64 { u64::from_le_bytes(b[i..i+8].try_into().unwrap()) }
++fn f64_at(b: &[u8], i: usize) -> Result<f64, String> {
++    let bits=u64_at(b,i); let v=f64::from_bits(bits);
++    if v.is_nan() && bits!=0x7ff8000000000000 { return fail("noncanonical NaN"); }
++    Ok(v)
++}
++fn descriptor_ok(d: &Descriptor) -> Result<(),String> {
++    if d.id==0 || d.bins<2 || d.bins as usize>MAX_BINS || !d.bins.is_power_of_two() {return fail("descriptor ID/FFT size");}
++    if !(1..=3).contains(&d.mode) || !(1..=3).contains(&d.source) {return fail("mode/source");}
++    if !d.sample_rate.is_finite() || d.sample_rate<=0.0 || !d.enbw_bins.is_finite() || d.enbw_bins<=0.0 || d.enbw_bins>d.bins as f64 || d.tick_hz==u64::MAX {return fail("descriptor rate/ENBW/clock");}
++    if d.source==2 {
++        if d.tick_hz!=0 || !d.bin0_hz.is_nan() {return fail("legacy has no authenticated RF grid/clock");}
++    } else if !d.bin0_hz.is_finite() {return fail("RF grid required");}
++    Ok(())
++}
++fn observation_ok(o: &Observation,d: &Descriptor) -> Result<(),String> {
++    if o.nint==0 && d.source!=2 {return fail("unknown nint only for legacy");}
++    if (d.tick_hz==0)!=(o.first_tick==UNKNOWN_TICK) {return fail("counter availability");}
++    if d.source==2 {
++        if o.epoch!=0 || o.tag>7 {return fail("legacy epoch/tag");}
++    } else if o.tag!=NO_TAG {return fail("legacy tag outside legacy source");}
++    let count=d.bins as usize * if d.mode==3 {2} else {1};
++    if o.power.len()!=count {return fail("payload size");}
++    for v in &o.power {
++        if v.is_infinite() || *v<0.0 || (v.is_nan() && v.to_bits()!=0x7fc00000) {return fail("power/NaN");}
++    }
++    Ok(())
++}
++/// Decode bounded records, rejecting truncation, conflicts and epoch/grid relabelling.
++/// Complete-record-boundary truncation is not detectable without an external file hash.
++pub fn decode(b: &[u8]) -> Result<Capture,String> {
++    if b.len()<24 || &b[..8]!=MAGIC {return fail("capture magic/version/truncation");}
++    let session: [u8;16]=b[8..24].try_into().unwrap();
++    if session==[0;16] {return fail("zero capture UUID");}
++    let mut c=Capture { session,records:Vec::new() };
++    let mut ds:HashMap<u16,Descriptor>=HashMap::new();
++    let mut epochs:HashMap<u64,u16>=HashMap::new();
++    let mut seqs:HashMap<u64,&[u8]>=HashMap::new();
++    let mut pos=24;
++    while pos<b.len() {
++        if b.len()-pos<8 {return fail("truncated prefix");}
++        let size=u32_at(b,pos) as usize; let kind=u16_at(b,pos+4); let id=u16_at(b,pos+6);
++        if id==0 || !(8..=40+8*MAX_BINS).contains(&size) || size>b.len()-pos {return fail("record bounds/truncation");}
++        let body=&b[pos+8..pos+size];
++        match kind {
++            1=>{
++                if size!=48 || ds.contains_key(&id) {return fail("descriptor size/redefinition");}
++                let d=Descriptor {id,sample_rate:f64_at(body,0)?,bin0_hz:f64_at(body,8)?,enbw_bins:f64_at(body,16)?,tick_hz:u64_at(body,24),bins:u32_at(body,32),mode:u16_at(body,36),source:u16_at(body,38)};
++                descriptor_ok(&d)?; ds.insert(id,d.clone());c.records.push(Record::Descriptor(d));
++            },
++            2=>{
++                let d=ds.get(&id).ok_or("missing descriptor")?;
++                let count=d.bins as usize * if d.mode==3 {2} else {1};
++                if size!=40+4*count {return fail("observation size");}
++                let power=(32..body.len()).step_by(4).map(|i|f32::from_bits(u32_at(body,i))).collect();
++                let o=Observation {descriptor_id:id,seq:u64_at(body,0),epoch:u64_at(body,8),first_tick:u64_at(body,16),nint:u32_at(body,24),tag:u32_at(body,28),power};
++                observation_ok(&o,d)?;
++                if o.epoch!=0 && *epochs.entry(o.epoch).or_insert(id)!=id {return fail("RF epoch changed descriptor");}
++                let wire=&b[pos..pos+size];
++                if let Some(old)=seqs.insert(o.seq,wire) {if old!=wire {return fail("conflicting observation ID");}}
++                c.records.push(Record::Observation(o));
++            },
++            _=>return fail("unknown record kind"),
++        }
++        pos+=size;
++    }
++    Ok(c)
++}
++fn put_f64(out: &mut Vec<u8>,x:f64) {let bits=if x.is_nan(){0x7ff8000000000000u64}else{x.to_bits()};out.extend_from_slice(&bits.to_le_bytes());}
++/// Encode a capture; all context invariants are checked before returning bytes.
++/// It is not called by the live path in OBS-002.
++pub fn encode(c: &Capture) -> Result<Vec<u8>,String> {
++    let mut out=Vec::new();out.extend_from_slice(MAGIC);out.extend_from_slice(&c.session);
++    for r in &c.records {
++        let mut body=Vec::new();
++        let (kind,id)=match r {
++            Record::Descriptor(d)=>{
++                put_f64(&mut body,d.sample_rate);put_f64(&mut body,d.bin0_hz);put_f64(&mut body,d.enbw_bins);
++                body.extend_from_slice(&d.tick_hz.to_le_bytes());body.extend_from_slice(&d.bins.to_le_bytes());body.extend_from_slice(&d.mode.to_le_bytes());body.extend_from_slice(&d.source.to_le_bytes());(1u16,d.id)
++            },
++            Record::Observation(o)=>{
++                body.extend_from_slice(&o.seq.to_le_bytes());body.extend_from_slice(&o.epoch.to_le_bytes());body.extend_from_slice(&o.first_tick.to_le_bytes());body.extend_from_slice(&o.nint.to_le_bytes());body.extend_from_slice(&o.tag.to_le_bytes());
++                for v in &o.power {let bits=if v.is_nan(){0x7fc00000u32}else{v.to_bits()};body.extend_from_slice(&bits.to_le_bytes());}
++                (2u16,o.descriptor_id)
++            },
++        };
++        let size=8usize.checked_add(body.len()).ok_or("record size overflow")?;
++        if size>40+8*MAX_BINS {return fail("record too large");}
++        out.extend_from_slice(&(size as u32).to_le_bytes());out.extend_from_slice(&kind.to_le_bytes());out.extend_from_slice(&id.to_le_bytes());out.extend_from_slice(&body);
++    }
++    decode(&out)?;Ok(out)
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn hex(s:&str)->Vec<u8>{let s:String=s.split_whitespace().collect();(0..s.len()).step_by(2).map(|i|u8::from_str_radix(&s[i..i+2],16).unwrap()).collect()}
++    fn golden()->Vec<u8>{hex(include_str!("../tests/observation-v1/golden.hex"))}
++    #[test] fn shared_bytes_and_values(){
++        let b=golden();let c=decode(&b).unwrap();assert_eq!(c.session,[0x11;16]);assert_eq!(c.records.len(),8);
++        if let Record::Descriptor(d)=&c.records[0]{assert_eq!((d.sample_rate,d.bin0_hz,d.enbw_bins,d.tick_hz,d.bins,d.mode,d.source),(4e6,100e6,1.5,1_000_000,4,3,1));}else{panic!()}
++        if let Record::Descriptor(d)=&c.records[1]{assert_eq!(d.bin0_hz,200e6);}else{panic!()}
++        let obs:Vec<_>=c.records.iter().filter_map(|r|if let Record::Observation(o)=r{Some(o)}else{None}).collect();
++        assert_eq!(obs.iter().map(|o|o.seq).collect::<Vec<_>>(),[0,1,2,3,5,6]);
++        assert_eq!((obs[0].epoch,obs[0].first_tick,obs[0].nint),(7,100,1));
++        assert_eq!(obs[0].power,[1.,2.,3.,4.,1.,2.,3.,4.]);
++        assert_eq!(obs[1].power,[2.,4.,6.,8.,3.,6.,9.,12.]);assert_eq!(obs[1].nint,3);
++        assert_eq!((obs[2].descriptor_id,obs[2].epoch),(2,8));assert_eq!(obs[5].epoch,0);
++        assert_eq!(encode(&c).unwrap(),b);
++        if let Ok(p)=std::env::var("OBS_RUST_REENCODED"){std::fs::write(p,encode(&c).unwrap()).unwrap();}
++    }
++    #[test] fn legacy_unknowns_are_not_hardware_metadata(){
++        let b=hex(include_str!("../tests/observation-v1/legacy.hex"));let c=decode(&b).unwrap();
++        if let Record::Observation(o)=&c.records[1]{assert_eq!((o.seq,o.epoch,o.first_tick,o.nint,o.tag),(0,0,UNKNOWN_TICK,0,3));assert!(o.power[0].is_nan());}else{panic!()}
++        assert_eq!(encode(&c).unwrap(),b);
++    }
++    #[test] fn partial_records_and_bad_lengths(){
++        let b=golden();let mut bounds=vec![24];let mut i=24;while i<b.len(){i+=u32_at(&b,i) as usize;bounds.push(i);}
++        for n in 0..b.len(){if !bounds.contains(&n){assert!(decode(&b[..n]).is_err(),"truncation {n}");}}
++        let mut bad=b.clone();bad[24..28].copy_from_slice(&u32::MAX.to_le_bytes());assert!(decode(&bad).is_err());
++    }
++    #[test] fn delayed_old_epoch_and_duplicate_identity(){
++        let c=decode(&golden()).unwrap();let mut r=c.records[..2].to_vec();
++        for index in [2,4,3,5,4,6,7]{r.push(c.records[index].clone());}
++        let delayed=Capture{session:c.session,records:r};let d=decode(&encode(&delayed).unwrap()).unwrap();
++        if let Record::Observation(o)=&d.records[4]{assert_eq!((o.seq,o.epoch,o.descriptor_id),(1,7,1));}else{panic!()}
++        let mut conflict=delayed.clone();if let Record::Observation(o)=&mut conflict.records[6]{o.nint=9;}
++        assert!(encode(&conflict).is_err());
++    }
++    #[test] fn epoch_binding_and_unknown_nint_rejected(){
++        let mut c=decode(&golden()).unwrap();if let Record::Observation(o)=&mut c.records[4]{o.epoch=7;}
++        assert!(encode(&c).is_err());let mut c=decode(&golden()).unwrap();if let Record::Observation(o)=&mut c.records[2]{o.nint=0;}assert!(encode(&c).is_err());
++    }
++    #[test] fn full_width_identity(){
++        let mut b=golden();b[128..136].copy_from_slice(&[8,7,6,5,4,3,2,1]);let c=decode(&b).unwrap();
++        if let Record::Observation(o)=&c.records[2]{assert_eq!(o.seq,0x0102030405060708);}else{panic!()}
++        assert_eq!(encode(&c).unwrap(),b);
++    }
++    #[test] fn descriptor_redefinition_and_nonfinite_power(){
++        let mut c=decode(&golden()).unwrap();c.records.push(c.records[0].clone());assert!(encode(&c).is_err());
++        let mut b=golden();b[160..164].copy_from_slice(&f32::INFINITY.to_bits().to_le_bytes());assert!(decode(&b).is_err());
++        let mut b=golden();b[160..164].copy_from_slice(&(-1f32).to_bits().to_le_bytes());assert!(decode(&b).is_err());
++    }
++}
+diff --git a/maia-httpd/tests/observation-v1/expected.json b/maia-httpd/tests/observation-v1/expected.json
+new file mode 100644
+index 0000000..f3a7a00
+--- /dev/null
++++ b/maia-httpd/tests/observation-v1/expected.json
+@@ -0,0 +1,161 @@
++{
++  "synthetic": true,
++  "session": "11111111111111111111111111111111",
++  "records": [
++    {
++      "descriptor_id": 1,
++      "seq": 0,
++      "epoch": 7,
++      "first_tick": 100,
++      "nint": 1,
++      "power": [
++        1,
++        2,
++        3,
++        4,
++        1,
++        2,
++        3,
++        4
++      ]
++    },
++    {
++      "descriptor_id": 1,
++      "seq": 1,
++      "epoch": 7,
++      "first_tick": 101,
++      "nint": 3,
++      "power": [
++        2,
++        4,
++        6,
++        8,
++        3,
++        6,
++        9,
++        12
++      ]
++    },
++    {
++      "descriptor_id": 2,
++      "seq": 2,
++      "epoch": 8,
++      "first_tick": 104,
++      "nint": 1,
++      "power": [
++        2,
++        3,
++        4,
++        5,
++        2,
++        3,
++        4,
++        5
++      ]
++    },
++    {
++      "descriptor_id": 2,
++      "seq": 3,
++      "epoch": 8,
++      "first_tick": 105,
++      "nint": 2,
++      "power": [
++        2.5,
++        4,
++        1,
++        0,
++        4,
++        6,
++        2,
++        0
++      ]
++    },
++    {
++      "descriptor_id": 2,
++      "seq": 5,
++      "epoch": 8,
++      "first_tick": 107,
++      "nint": 1,
++      "power": [
++        null,
++        1,
++        0,
++        2,
++        null,
++        1,
++        0,
++        2
++      ]
++    },
++    {
++      "descriptor_id": 2,
++      "seq": 6,
++      "epoch": 0,
++      "first_tick": 108,
++      "nint": 1,
++      "power": [
++        null,
++        null,
++        null,
++        null,
++        null,
++        null,
++        null,
++        null
++      ]
++    }
++  ],
++  "nint3_input_ffts": [
++    [
++      1,
++      2,
++      3,
++      4
++    ],
++    [
++      2,
++      4,
++      6,
++      8
++    ],
++    [
++      3,
++      6,
++      9,
++      12
++    ]
++  ],
++  "missing_seq": [
++    4
++  ],
++  "known_epochs": [
++    7,
++    8
++  ],
++  "unattributed_seq": [
++    6
++  ],
++  "descriptors": [
++    {
++      "id": 1,
++      "sample_rate": 4000000.0,
++      "bin0_hz": 100000000.0,
++      "enbw_bins": 1.5,
++      "tick_hz": 1000000,
++      "bins": 4,
++      "mode": 3,
++      "source": 1
++    },
++    {
++      "id": 2,
++      "sample_rate": 4000000.0,
++      "bin0_hz": 200000000.0,
++      "enbw_bins": 1.5,
++      "tick_hz": 1000000,
++      "bins": 4,
++      "mode": 3,
++      "source": 1
++    }
++  ],
++  "legacy_fixture": "also synthetic; illustrates unavailable metadata in legacy-import encoding"
++}
+diff --git a/maia-httpd/tests/observation-v1/golden.hex b/maia-httpd/tests/observation-v1/golden.hex
+new file mode 100644
+index 0000000..e9ef82d
+--- /dev/null
++++ b/maia-httpd/tests/observation-v1/golden.hex
+@@ -0,0 +1,18 @@
++474f4253310d0a00111111111111111111111111111111113000000001000100
++0000000080844e410000000084d79741000000000000f83f40420f0000000000
++040000000300010030000000010002000000000080844e410000000084d7a741
++000000000000f83f40420f000000000004000000030001004800000002000100
++00000000000000000700000000000000640000000000000001000000ffffffff
++0000803f0000004000004040000080400000803f000000400000404000008040
++4800000002000100010000000000000007000000000000006500000000000000
++03000000ffffffff00000040000080400000c04000000041000040400000c040
++0000104100004041480000000200020002000000000000000800000000000000
++680000000000000001000000ffffffff0000004000004040000080400000a040
++0000004000004040000080400000a04048000000020002000300000000000000
++0800000000000000690000000000000002000000ffffffff0000204000008040
++0000803f00000000000080400000c04000000040000000004800000002000200
++050000000000000008000000000000006b0000000000000001000000ffffffff
++0000c07f0000803f00000000000000400000c07f0000803f0000000000000040
++4800000002000200060000000000000000000000000000006c00000000000000
++01000000ffffffff0000c07f0000c07f0000c07f0000c07f0000c07f0000c07f
++0000c07f0000c07f
+diff --git a/maia-httpd/tests/observation-v1/legacy.hex b/maia-httpd/tests/observation-v1/legacy.hex
+new file mode 100644
+index 0000000..e48a3e3
+--- /dev/null
++++ b/maia-httpd/tests/observation-v1/legacy.hex
+@@ -0,0 +1,4 @@
++474f4253310d0a00222222222222222222222222222222223000000001000100
++0000000080844e41000000000000f87f000000000000f83f0000000000000000
++0400000001000200380000000200010000000000000000000000000000000000
++ffffffffffffffff00000000030000000000c07f0000003f0000803e00000000
