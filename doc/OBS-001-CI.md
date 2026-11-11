@@ -1,4 +1,4 @@
-﻿# OBS-001-CI
+# OBS-001-CI
 
 ARM base: goofy-pl4 / 5162a799e7d22db7ec417473058e87be36bd8408, PL-5b.
 PL development separately uses accepted FW2-R1-1R1T variant A on i5; no XSA/DT migration here.

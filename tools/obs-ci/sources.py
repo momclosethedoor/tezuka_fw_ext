@@ -20,6 +20,7 @@ if __name__ == '__main__':
     a=argparse.ArgumentParser(); a.add_argument('action',choices=['prepare','export','verify']); a.add_argument('tree',type=pathlib.Path); a.add_argument('--patch',default='0002-local.patch'); args=a.parse_args(); t=args.tree
     rev, patches=inputs()
     if args.action=='prepare':
+        git(t,'config','core.autocrlf','false')
         if git(t,'status','--porcelain').strip(): sys.exit('Refusing dirty tree')
         git(t,'checkout','--detach',rev)
         for p in patches: git(t,'apply','--index',str(p))
@@ -38,4 +39,4 @@ if __name__ == '__main__':
         actual=metadata(t)
         if expected!=actual: sys.exit('Source/patch fingerprint differs: '+json.dumps(actual))
     if args.action!='verify':
-        (ROOT/'package/maia-httpd/source.json').write_text(json.dumps(metadata(t),indent=2)+'\n',encoding='utf-8')
+        (ROOT/'package/maia-httpd/source.json').write_text(json.dumps(metadata(t),indent=2)+'\n',encoding='utf-8',newline='\n')
