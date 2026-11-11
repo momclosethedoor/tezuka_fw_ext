@@ -34,7 +34,9 @@ needed to validate this delivery chain. Git must use core.autocrlf=false.
 One existing workflow, Nano/release=false. Use mode=arm-only for edit/test cycles;
 mode=full also builds and verifies the firmware bundle. Full and ARM-only have
 separate concurrency groups, so dispatching ARM-only does not cancel a full run.
-Both export the ELF immediately after compilation. ARM-only verifies target staging;
+Both export the ELF immediately after compilation. ARM-only skips the expensive
+full-image runner disk cleanup. Download/ccache/tree caches survive later build
+failures; full output is saved only after successful verification. ARM-only verifies target staging;
 only full mode certifies equality with the packed rootfs and FIT.
  Rust 1.94.0, cargo --locked,
 Buildroot TARGET_CROSS and STAGING_DIR. Downloads/ccache/Buildroot caches remain.
