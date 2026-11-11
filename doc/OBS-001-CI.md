@@ -96,9 +96,14 @@ reception nor RF measurement accuracy. Record unsupported video preconditions.
 
 ## Continuation
 
-Run-specific results are recorded in the workspace evidence/OBS-001-CI.md.
-OBS-002 begins with observation contracts and the replay harness only after delivery
-acceptance. No spectrum, waterfall, DMA, accumulation or product protocol changes here.
+OBS-002 contract/replay is accepted; canonical format and OBS-003 hook points:
+[OBSERVATION-V1.md](OBSERVATION-V1.md). Rust/Python shared-vector checks and ARM-only
+run 43118803431 (attempt 1, head 75f0acee03469bd009a25512bc228981ad7e417b) passed.
+Local report: C:/proj/pluto_ag/evidence/OBS-002-CONTRACT.md. No live endpoint or
+hardware was changed in OBS-002. Next: OBS-003 must carry real acquisition seq,
+RF visit/map generation, first-sample clock and completed count through FFT/DMA,
+then add bounded live producer/host adapters. PL-5b does not supply those fields.
+The host tracker IndexError 66/64 remains open; failing state was not captured.
 
 ## Acceptance scope after lead clarification
 
@@ -131,7 +136,7 @@ zero block losses, no overrun. RSS 7,760 -> 7,812 KiB; virtual size 230,384 KiB.
 Kernel log unchanged. Two peer resets occurred when test clients disconnected.
 No loader/library or new DMA/IIO errors. Video picture/RF accuracy and long-term
 memory were not accepted: demod remained searching, clipping was saturated as in
-the baseline. A host tracker IndexError (slot 66 vs capacity 64) occurred once;
+the baseline. A host tracker IndexError (index 66 vs array length 64; failing index/array not captured) occurred once;
 one stock-ELF control did not reproduce it. Cause remains open; classifier code
 was not changed and full classifier regression is not claimed.
 
@@ -148,5 +153,4 @@ Three source-fingerprint regression tests pass on Windows; they are included in
 future CI runs. Later commits add tests/docs without changing the compiled Maia
 source or recipe. Full local evidence/report: C:/proj/pluto_ag/evidence/OBS-001-CI.md;
 private host/connection data and raw captures remain outside this repository.
-OBS-002 starts with observation contracts and the replay harness; keep the host
-tracker finding visible when defining its tests.
+Current continuation and the retained host tracker finding are linked above.
