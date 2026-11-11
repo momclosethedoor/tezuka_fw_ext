@@ -1,4 +1,5 @@
 {
+  "fingerprint_format": "exact bytes; UTF-8 POSIX path string order; v2",
   "upstream": "2637b59891bdfe38d8c5bf52c84984b3da68064e",
   "patches": [
     {
@@ -6,5 +7,56 @@
       "sha256": "865681fa6e020e3f9dd1c05d82d6cbaf2fd50d0a75fc349bd1816ca14b6e20a9"
     }
   ],
-  "maia_httpd_tree_sha256": "4fe56324ea667ad1cf72e8a0de2abdfbf377b2388ba230de99fbdeb4f71512a5"
+  "maia_httpd_tree_sha256": "8470d0e05ee6bc27307e779907f14356fe6dc2440a5f6e5faf2922ef717864e9",
+  "files": {
+    "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
+    "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
+    "maia-httpd/CHANGELOG.md": "1af678a213eb4b4df6b423336d1bfb4c6b2aecc10164b05492dda9e3b69cd89f",
+    "maia-httpd/Cargo.lock": "a73f38c9421ccc6f644709612e5ca5b959a7c6437239b705a4f51ce656a56b95",
+    "maia-httpd/Cargo.toml": "546a97d419907b975d14bf359af50d9b12ae469eaab0b16d4001266b9ddcca5b",
+    "maia-httpd/Cross.toml": "56f6c859829b46f04362d866fee8a54e4b173cf39e12f324981de7f4543a5fb4",
+    "maia-httpd/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "maia-httpd/LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+    "maia-httpd/README.md": "e9a12cac63bce2774ad8ad8371296b1881369d942bddd831070ed2d5de4a6d87",
+    "maia-httpd/maia-json/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
+    "maia-httpd/maia-json/CHANGELOG.md": "8939a75ff4736af4b11a599117ebe69bbbbc98dffbfc1dc5b739756d927346be",
+    "maia-httpd/maia-json/Cargo.toml": "ccdb356685c3e241a94a1f1b2169f901c3f279c11655285155fbfc0798dd814c",
+    "maia-httpd/maia-json/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "maia-httpd/maia-json/LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+    "maia-httpd/maia-json/README.md": "73e845acf20f76d61e03598e993a16cbafff6d626a5db2a8beb935a4fc468e3d",
+    "maia-httpd/maia-json/src/lib.rs": "043bfaec3f041e73e54726a7b720748a2cb6da03091803a1a71e09c1b28d284f",
+    "maia-httpd/maia-pac/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
+    "maia-httpd/maia-pac/Cargo.toml": "02fdb29f0da08cdb36196b9b5893729258f6a0e2c101d96bd96e5ff4f03877c9",
+    "maia-httpd/maia-pac/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "maia-httpd/maia-pac/LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+    "maia-httpd/maia-pac/README.md": "2e7e058a1a9bc4b88a66cedd896c04dd76819b85588f15592885f5d926b15ea4",
+    "maia-httpd/maia-pac/src/lib.rs": "715aa4e24917cff459ca5f272b963901f2da7bc40bfffb36466bf289541d78ef",
+    "maia-httpd/maia-pac/svd/maia-sdr.svd": "f5b26a623c6c88cf1b24fb35606dcf3c627e05373b6b75cb77ed45ef1d32a085",
+    "maia-httpd/src/app.rs": "03f2c17d5036aa6e471d85c5f2d1f3c6d4d29605ec2356f85e9e5f7a3980c251",
+    "maia-httpd/src/args.rs": "a688462ec210e7868e47e87025952da83155fca9b8b37a5846819c4cf18ac9d1",
+    "maia-httpd/src/ddc.rs": "c4afe7a6187b3391acc12c0a4e173c02525a542687aff64930d4979d8de5ff84",
+    "maia-httpd/src/ddc/constants.rs": "686fa8d5b1280f908256a83a108e7dbb1917d70374cb9e0acdfc6ed6e41362ad",
+    "maia-httpd/src/fpga.rs": "4a63faee90240c3a98de3ec1fa4485980a0956e8875482ad6ebdca04c8a2c937",
+    "maia-httpd/src/httpd.rs": "8d5a4edecd73197fc133004c29c02fa26e876ae2280d8573a55d438837df28a8",
+    "maia-httpd/src/httpd/ad9361.rs": "81ddb5486815f3b48d67d0386e9990bf2745746ac5d38a4d45e40cde80bea2c0",
+    "maia-httpd/src/httpd/api.rs": "985918cdbb1e06132670a42ee19c8587aed86b52255bb626921026cb5b3059dc",
+    "maia-httpd/src/httpd/ddc.rs": "b052bc392513379a489ac3dddc937abae105905646c590fd59d347fb0a0511b8",
+    "maia-httpd/src/httpd/geolocation.rs": "e49dedfe9bb2b570ffb0ce7f249d04240f3ebc8747be1f73815ec168e211a85c",
+    "maia-httpd/src/httpd/iqengine.rs": "4232fd1ee63c47c502d11be39ded344480e2cd1ff9e97349ebefb9aaa809abed",
+    "maia-httpd/src/httpd/recording.rs": "632da8d74912106d5d0494a6badb73f207629afa5653e41001f0ba1a592d2050",
+    "maia-httpd/src/httpd/recording/iqengine.rs": "99df90957c5429d65c24dc58bfcc3cd7b7e652aa84d6542ab0794f687a152a15",
+    "maia-httpd/src/httpd/spectrometer.rs": "f239ce5be2365bc76d9ee560d93a299f2b7d107d7d8ef861f945b089b8ab98ca",
+    "maia-httpd/src/httpd/time.rs": "21f4e51d38640ad1e7eaec7f26787b6dff54e13a61afe634e8ae46e72fc73d52",
+    "maia-httpd/src/httpd/version.rs": "b34aeb3a67af50b6700732b206aef26c5d5d7b74f7c2122a85bd014521d9c9c6",
+    "maia-httpd/src/httpd/websocket.rs": "fe19d50c53dd02d89ce88a14cfbb518c7bfc803cf907871c6edc6df86dfe73d0",
+    "maia-httpd/src/httpd/zeros.rs": "6a500dff4d4f761bb332c0551459bb7228afc3598ad2fd67115d302d991eb3a9",
+    "maia-httpd/src/iio.rs": "74df718b885d674ae3904327c634e1fff29aac3b844dafdda1b4ae05180b2f7c",
+    "maia-httpd/src/lib.rs": "13de2f7a00b50c7b57a7b99821d3f541d8d644a151fcc74f3a4b978b42ecc932",
+    "maia-httpd/src/main.rs": "5787cda63686e0a3a1d4a3b4fbf3f2abaf0737bb2fbfe12e92075e73dbdf4f88",
+    "maia-httpd/src/rxbuffer.rs": "2c770250d68279396424ce12673a88f0e7682c76218bcefa95b7f5499576a2cf",
+    "maia-httpd/src/sigmf.rs": "72396a53d0e5f6cb352aa36f44be1d72db583a8cdd954cc9970d835a25753b45",
+    "maia-httpd/src/spectrometer.rs": "fb1c44ad5fcb9a250946fd86fccb3da9239832eb119efdb7dc0db465ba8c8669",
+    "maia-httpd/src/uio.rs": "9c122903d7bfc0131a06c9b827cbf3fafce37bcbc201f335bc0b74ba6b8e9a07",
+    "maia-httpd/util/spectrum_client.py": "7df34b002bfb6c04cb0da39c5ca43bbc3f9df4772539bf4ec756912b5e2cdf89"
+  }
 }

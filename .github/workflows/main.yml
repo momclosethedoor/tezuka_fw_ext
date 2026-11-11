@@ -267,6 +267,7 @@ jobs:
       # Always re-extract/re-patch Maia, including on an exact output-cache hit.
       # This also removes Cargo outputs: evidence must show a real compilation.
       - name: Rebuild Maia from pinned sources and ordered patches
+        id: maia-build
         run: |
           set -euo pipefail
           make -C buildroot O="${OUTPUT_DIR}" maia-httpd-dirclean board-fpga-dirclean
@@ -330,6 +331,17 @@ jobs:
         if: matrix.board == 'nano' && inputs.mode != 'arm-only'
         run: python3 tools/obs-ci/verify.py "${OUTPUT_DIR}"
 
+      - name: Preserve failed ARM delivery diagnostics
+        if: failure() && matrix.board == 'nano'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maia-httpd-nano-unverified
+          path: |
+            maia-build.log
+            artifacts/maia-httpd-nano/actual-sources.json
+            ${{ env.OUTPUT_DIR }}/build/maia-httpd-*/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd
+          if-no-files-found: warn
+
       # Save phase. 'if cache-hit != true' avoids re-uploading
       # already-cached content and prevents duplicate entries on
       # the backend (concurrent matrix saves don't dedupe reliably).
@@ -341,7 +353,7 @@ jobs:
           key: ${{ steps.br-cache.outputs.cache-primary-key }}
 
       - name: Save Buildroot output
-        if: needs.matrix.outputs.single_board == 'true' && steps.output-cache.outputs.cache-hit != 'true'
+        if: always() && needs.matrix.outputs.single_board == 'true' && steps.output-cache.outcome == 'success' && steps.output-cache.outputs.cache-hit != 'true' && (success() || (inputs.mode == 'arm-only' && steps.maia-build.outcome == 'success'))
         uses: actions/cache/save@v5
         with:
           path: ${{ env.OUTPUT_DIR }}

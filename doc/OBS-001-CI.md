@@ -25,7 +25,8 @@ gh run download RUN_ID -R momclosethedoor/tezuka_fw_ext --dir artifacts/RUN_ID-a
 
 Preparation refuses dirty trees. The local obs-patch-base commit is only a developer
 baseline; CI fetches the pinned upstream archive and applies package patches in
-lexical order. source.json fingerprints maia-httpd sources, including Cargo.lock;
+lexical order. source.json fingerprints exact maia-httpd file bytes, including Cargo.lock,
+using explicit POSIX path string sorting (identical on Windows/Linux);
 CI rejects divergence. Export is restricted to maia-httpd, no product change is
 needed to validate this delivery chain. Git must use core.autocrlf=false.
 
@@ -98,3 +99,15 @@ reception nor RF measurement accuracy. Record unsupported video preconditions.
 Run-specific results are recorded in the workspace evidence/OBS-001-CI.md.
 OBS-002 begins with observation contracts and the replay harness only after delivery
 acceptance. No spectrum, waterfall, DMA, accumulation or product protocol changes here.
+
+## Acceptance scope after lead clarification
+
+The existing PL-5b firmware/run 40190150385 is accepted as the firmware baseline.
+Only ARM-only delivery and hardware smoke are required for this execution; no new
+full image is needed. Full run 43100358402 was cancelled as instructed after the
+first ARM run 43104265437 exposed a cross-platform source fingerprint bug.
+The corrected local tree matches the exact upstream tar plus GNU patch, 49 files.
+Initial CRLF files and platform-dependent Path sorting were both corrected.
+Failed deliveries preserve an explicitly unverified diagnostic ELF and source map;
+a successfully compiled ARM dependency tree can be cached despite verification
+failure because Maia is always removed/re-extracted/re-patched on the next run.

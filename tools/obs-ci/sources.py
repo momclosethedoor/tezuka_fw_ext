@@ -7,15 +7,22 @@ def inputs():
     recipe = (ROOT/'package/maia-httpd/maia-httpd.mk').read_text()
     rev = re.search(r'^MAIA_HTTPD_VERSION = (\w+)', recipe, re.M)[1]
     return rev, sorted((ROOT/'package/maia-httpd').glob('*.patch'))
-def digest(tree):
-    h = hashlib.sha256()
-    for p in sorted((tree/'maia-httpd').rglob('*')):
+def source_files(tree):
+    # Explicit string ordering is identical on Windows and Linux. Path ordering
+    # is case-insensitive on Windows and must not define a cross-platform hash.
+    result={}
+    for p in sorted((tree/'maia-httpd').rglob('*'),key=lambda p:p.relative_to(tree).as_posix()):
         if p.is_file() and 'target' not in p.relative_to(tree).parts:
-            h.update(p.relative_to(tree).as_posix().encode()+b'\0'+hashlib.sha256(p.read_bytes()).digest())
-    return h.hexdigest()
+            result[p.relative_to(tree).as_posix()]=hashlib.sha256(p.read_bytes()).hexdigest()
+    return result
+
 def metadata(tree):
-    rev, patches = inputs()
-    return {'upstream':rev,'patches':[{'name':p.name,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in patches], 'maia_httpd_tree_sha256':digest(tree)}
+    rev, patches = inputs(); files=source_files(tree); h=hashlib.sha256()
+    for name, sha in files.items(): h.update(name.encode()+b'\0'+bytes.fromhex(sha))
+    return {'fingerprint_format':'exact bytes; UTF-8 POSIX path string order; v2',
+            'upstream':rev,'patches':[{'name':p.name,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()} for p in patches],
+            'maia_httpd_tree_sha256':h.hexdigest(),'files':files}
+
 if __name__ == '__main__':
     a=argparse.ArgumentParser(); a.add_argument('action',choices=['prepare','export','verify']); a.add_argument('tree',type=pathlib.Path); a.add_argument('--patch',default='0002-local.patch'); args=a.parse_args(); t=args.tree
     rev, patches=inputs()
@@ -37,6 +44,8 @@ if __name__ == '__main__':
         # CI's freshly extracted and patched Buildroot tree versus expected local source.
         expected=json.loads((ROOT/'package/maia-httpd/source.json').read_text())
         actual=metadata(t)
-        if expected!=actual: sys.exit('Source/patch fingerprint differs: '+json.dumps(actual))
+        if expected!=actual:
+            old=expected.get('files',{}); new=actual['files']
+            sys.exit('Source/patch fingerprint differs: '+json.dumps({'actual':actual,'missing':sorted(old.keys()-new.keys()),'unexpected':sorted(new.keys()-old.keys()),'changed':[n for n in old.keys() & new.keys() if old[n]!=new[n]]}))
     if args.action!='verify':
         (ROOT/'package/maia-httpd/source.json').write_text(json.dumps(metadata(t),indent=2)+'\n',encoding='utf-8',newline='\n')

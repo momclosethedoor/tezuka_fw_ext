@@ -7,6 +7,8 @@ def run(*a): return subprocess.check_output(list(map(str,a)),text=True)
 def check(ok,msg):
     if not ok: raise RuntimeError(msg)
 src=next((out/'build').glob('maia-httpd-*'))
+diagnostics=ROOT/'artifacts/maia-httpd-nano'; diagnostics.mkdir(parents=True,exist_ok=True)
+(diagnostics/'actual-sources.json').write_text(json.dumps(metadata(src),indent=2)+'\n')
 subprocess.run([sys.executable,str(ROOT/'tools/obs-ci/sources.py'),'verify',str(src)],check=True)
 check('Compiling maia-httpd v' in pathlib.Path('maia-build.log').read_text(),'No compilation evidence')
 # Parse newc without extracting device nodes or following rootfs symlinks.
