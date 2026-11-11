@@ -9,6 +9,7 @@ MAIA_HTTPD_VERSION = 2637b59891bdfe38d8c5bf52c84984b3da68064e
 MAIA_HTTPD_SITE = https://github.com/F5OEO/maia-sdr/archive
 MAIA_HTTPD_SOURCE = $(MAIA_HTTPD_VERSION).tar.gz
 MAIA_HTTPD_DEPENDENCIES = host-openssl
+MAIA_HTTPD_RUST_VERSION = 1.94.0
 
 # Use Buildroot's $(TARGET_CROSS) which expands to $(HOST_DIR)/bin/<prefix>-
 # and adapts per toolchain: arm-none-linux-gnueabihf- for Arm GNU, or
@@ -26,10 +27,10 @@ define MAIA_HTTPD_BUILD_CMDS
 	OPENSSL_DIR="$(HOST_DIR)" \
 	OPENBLAS_TARGET=armv7 \
 	OPENBLAS_HOSTCC=gcc \
-	BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--sysroot=$(HOST_DIR)/arm-buildroot-linux-gnueabihf/sysroot" \
+	BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--sysroot=$(STAGING_DIR)" \
 	OPENBLAS_CC="$(MAIA_HTTPD_TOOLCHAIN_GCC)" \
 	OPENBLAS_FC="$(MAIA_HTTPD_TOOLCHAIN_GFORTRAN)" \
-	cargo build --release --target armv7-unknown-linux-gnueabihf \
+	cargo +$(MAIA_HTTPD_RUST_VERSION) build --locked --release --target armv7-unknown-linux-gnueabihf \
 		--config "target.armv7-unknown-linux-gnueabihf.linker=\"$(MAIA_HTTPD_TOOLCHAIN_GCC)\""
 endef
 

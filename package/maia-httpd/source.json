@@ -1,0 +1,10 @@
+{
+  "upstream": "2637b59891bdfe38d8c5bf52c84984b3da68064e",
+  "patches": [
+    {
+      "name": "0001-ddc-routing-toggle.patch",
+      "sha256": "865681fa6e020e3f9dd1c05d82d6cbaf2fd50d0a75fc349bd1816ca14b6e20a9"
+    }
+  ],
+  "maia_httpd_tree_sha256": "4fe56324ea667ad1cf72e8a0de2abdfbf377b2388ba230de99fbdeb4f71512a5"
+}

@@ -226,7 +226,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.OUTPUT_DIR }}
-          key: output-${{ matrix.board }}-${{ hashFiles('package/**/*.mk', 'package/**/*.hash', 'package/**/Config.in', 'Config.in', 'buildroot.version', 'patches/buildroot/**', 'board/tezuka/common/patches/**', 'board/tezuka/**/kernel/**', format('configs/{0}', matrix.defconfig)) }}
+          key: output-${{ matrix.board }}-${{ hashFiles('package/**/*.mk', 'package/**/*.hash', 'package/**/*.patch', 'package/**/Config.in', 'Config.in', 'buildroot.version', 'patches/buildroot/**', 'board/tezuka/common/patches/**', 'board/tezuka/**', 'tools/obs-ci/**', format('configs/{0}', matrix.defconfig)) }}
 
       # uboot-env-hook.mk writes this in the source tree at U-Boot
       # extract time; with output/ cached, extract is skipped and the
@@ -248,6 +248,19 @@ jobs:
           echo 'BR2_CCACHE=y' >> "${OUTPUT_DIR}/.config"
           echo 'BR2_CCACHE_USE_BASEDIR=y' >> "${OUTPUT_DIR}/.config"
           make -C buildroot O="${OUTPUT_DIR}" olddefconfig
+
+      - name: Install pinned Maia Rust toolchain
+        run: |
+          RUST_VERSION=$(sed -n 's/^MAIA_HTTPD_RUST_VERSION = //p' package/maia-httpd/maia-httpd.mk)
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target armv7-unknown-linux-gnueabihf
+
+      # Always re-extract/re-patch Maia, including on an exact output-cache hit.
+      # This also removes Cargo outputs: evidence must show a real compilation.
+      - name: Rebuild Maia from pinned sources and ordered patches
+        run: |
+          make -C buildroot O="${OUTPUT_DIR}" maia-httpd-dirclean board-fpga-dirclean
+          make -C buildroot O="${OUTPUT_DIR}" maia-httpd V=1 2>&1 | tee maia-build.log
+          grep -E 'Compiling maia-httpd v' maia-build.log
 
       - name: Build U-Boot
         run: make -C buildroot O="${OUTPUT_DIR}" uboot
@@ -284,6 +297,18 @@ jobs:
 
       - name: Assemble image
         run: make -C buildroot O="${OUTPUT_DIR}"
+
+      - name: Verify Nano payloads and export ARM binary
+        if: matrix.board == 'nano'
+        run: python3 tools/obs-ci/verify.py "${OUTPUT_DIR}"
+
+      - name: Upload verified ARM binary
+        if: matrix.board == 'nano'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maia-httpd-nano
+          path: artifacts/maia-httpd-nano/
+          if-no-files-found: error
 
       # Save phase. 'if cache-hit != true' avoids re-uploading
       # already-cached content and prevents duplicate entries on
@@ -324,6 +349,7 @@ jobs:
           ARTIFACT_DIR="artifacts/tezuka-${{ matrix.board }}"
           mkdir -p "${ARTIFACT_DIR}"
           unzip -q "build/${{ matrix.board }}.zip" -d "${ARTIFACT_DIR}"
+          if [ "${{ matrix.board }}" = nano ]; then cp artifacts/maia-httpd-nano/manifest.json "${ARTIFACT_DIR}/manifest.json"; fi
           {
             echo "### ${{ matrix.board }} (${{ matrix.defconfig }})"
             echo
