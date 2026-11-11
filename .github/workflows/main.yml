@@ -16,6 +16,11 @@ on:
         type: string
         required: false
         default: "all"
+      mode:
+        description: "full firmware or Maia ELF only (Nano)"
+        type: choice
+        options: [full, arm-only]
+        default: full
       release:
         description: "Create a draft release (for testing)"
         type: boolean
@@ -26,7 +31,7 @@ on:
 # never cancel a tag-push release build (a half-published release is worse
 # than a queued one).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.mode || 'full' }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
@@ -35,7 +40,7 @@ permissions:
 run-name: >-
   ${{ github.event_name == 'push'
       && format('Release {0}', github.ref_name)
-      || format('CI ({0})', inputs.boards || 'all') }}
+      || format('CI ({0}, {1})', inputs.boards || 'all', inputs.mode || 'full') }}
 
 jobs:
   matrix:
@@ -55,8 +60,10 @@ jobs:
         id: set-matrix
         env:
           INPUT: ${{ inputs.boards || 'all' }}
+          MODE: ${{ inputs.mode || 'full' }}
         run: |
           set -euo pipefail
+          if [ "$MODE" = arm-only ] && [ "$INPUT" != nano ]; then echo "ARM-only requires boards=nano" >&2; exit 1; fi
           if [ "$INPUT" = "all" ]; then
             INCLUDE=$(jq -c . boards.json)
           else
@@ -217,8 +224,8 @@ jobs:
 
       # Full per-board OUTPUT_DIR. Hit -> Buildroot sees every
       # stamp_built and 'make' just re-finalises (~5min vs ~50min).
-      # Single-board only: 12 x ~3 GB busts the 10 GB budget. No
-      # restore-keys: partial match leaves an unrepairable state.
+      # Single-board only: 12 x ~3 GB busts the 10 GB budget.
+      # Cross-mode restore below uses the SAME complete input fingerprint only.
       # Iterate via: gh workflow run main.yml -f boards=fishball7020
       - name: Restore Buildroot output
         id: output-cache
@@ -226,7 +233,8 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ env.OUTPUT_DIR }}
-          key: output-${{ matrix.board }}-${{ hashFiles('package/**/*.mk', 'package/**/*.hash', 'package/**/*.patch', 'package/**/Config.in', 'Config.in', 'buildroot.version', 'patches/buildroot/**', 'board/tezuka/common/patches/**', 'board/tezuka/**', 'tools/obs-ci/**', format('configs/{0}', matrix.defconfig)) }}
+          key: output-obs1-${{ matrix.board }}-${{ inputs.mode || 'full' }}-${{ hashFiles('package/**/*.mk', 'package/**/*.hash', 'package/**/*.patch', 'package/**/Config.in', 'Config.in', 'buildroot.version', 'patches/buildroot/**', 'board/tezuka/common/patches/**', 'board/tezuka/**', format('configs/{0}', matrix.defconfig)) }}
+          restore-keys: output-obs1-${{ matrix.board }}-${{ inputs.mode == 'arm-only' && 'full' || 'arm-only' }}-${{ hashFiles('package/**/*.mk', 'package/**/*.hash', 'package/**/*.patch', 'package/**/Config.in', 'Config.in', 'buildroot.version', 'patches/buildroot/**', 'board/tezuka/common/patches/**', 'board/tezuka/**', format('configs/{0}', matrix.defconfig)) }}
 
       # uboot-env-hook.mk writes this in the source tree at U-Boot
       # extract time; with output/ cached, extract is skipped and the
@@ -258,11 +266,25 @@ jobs:
       # This also removes Cargo outputs: evidence must show a real compilation.
       - name: Rebuild Maia from pinned sources and ordered patches
         run: |
+          set -euo pipefail
           make -C buildroot O="${OUTPUT_DIR}" maia-httpd-dirclean board-fpga-dirclean
           make -C buildroot O="${OUTPUT_DIR}" maia-httpd V=1 2>&1 | tee maia-build.log
           grep -E 'Compiling maia-httpd v' maia-build.log
 
+      - name: Verify and export Maia ELF early
+        if: matrix.board == 'nano'
+        run: python3 tools/obs-ci/verify.py "${OUTPUT_DIR}" --arm-only
+
+      - name: Upload verified ARM binary
+        if: matrix.board == 'nano'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maia-httpd-nano
+          path: artifacts/maia-httpd-nano/
+          if-no-files-found: error
+
       - name: Build U-Boot
+        if: inputs.mode != 'arm-only'
         run: make -C buildroot O="${OUTPUT_DIR}" uboot
 
       # Ruled out disk exhaustion here: runs 35377178709/35382993872/
@@ -277,6 +299,7 @@ jobs:
       # diagnostic since it's cheap and free-disk-space is a real
       # improvement regardless.
       - name: Disk space before kernel build
+        if: inputs.mode != 'arm-only'
         run: df -h /
 
       # V=1: Buildroot's LINUX_BUILD_CMDS package-level recipe gives
@@ -288,27 +311,22 @@ jobs:
       # not command execution) -- belt and suspenders, this step's
       # log is the only place either matters.
       - name: Build kernel
+        if: inputs.mode != 'arm-only'
         run: |
           set -x
           make -C buildroot O="${OUTPUT_DIR}" linux V=1
 
       - name: Build rootfs
+        if: inputs.mode != 'arm-only'
         run: make -C buildroot O="${OUTPUT_DIR}" target-finalize
 
       - name: Assemble image
+        if: inputs.mode != 'arm-only'
         run: make -C buildroot O="${OUTPUT_DIR}"
 
       - name: Verify Nano payloads and export ARM binary
-        if: matrix.board == 'nano'
+        if: matrix.board == 'nano' && inputs.mode != 'arm-only'
         run: python3 tools/obs-ci/verify.py "${OUTPUT_DIR}"
-
-      - name: Upload verified ARM binary
-        if: matrix.board == 'nano'
-        uses: actions/upload-artifact@v7
-        with:
-          name: maia-httpd-nano
-          path: artifacts/maia-httpd-nano/
-          if-no-files-found: error
 
       # Save phase. 'if cache-hit != true' avoids re-uploading
       # already-cached content and prevents duplicate entries on
@@ -342,6 +360,7 @@ jobs:
           key: ${{ steps.dl-cache.outputs.cache-primary-key }}
 
       - name: Assemble artifact
+        if: inputs.mode != 'arm-only'
         run: |
           mkdir -p build
           cp "${OUTPUT_DIR}/images/tezuka.zip" "build/${{ matrix.board }}.zip"
@@ -367,6 +386,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate SBOM
+        if: inputs.mode != 'arm-only'
         run: |
           python3 -m pip install -q cyclonedx-buildroot
           make -C buildroot O="${OUTPUT_DIR}" legal-info
@@ -389,12 +409,14 @@ jobs:
           ls -la "${ARTIFACT}/"
 
       - name: Attest artifact with SBOM
+        if: inputs.mode != 'arm-only'
         uses: actions/attest@v4
         with:
           subject-path: ${{ github.workspace }}/build/${{ matrix.board }}.zip
           sbom-path: ${{ github.workspace }}/artifacts/tezuka-${{ matrix.board }}/sbom.json
 
       - name: Clean up root duplicates
+        if: inputs.mode != 'arm-only'
         run: |
           rm -f "artifacts/tezuka-${{ matrix.board }}/sbom.json"
           rm -f "artifacts/tezuka-${{ matrix.board }}/sbom.xml"
@@ -413,6 +435,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
+        if: inputs.mode != 'arm-only'
         uses: actions/upload-artifact@v7
         with:
           name: tezuka-${{ matrix.board }}
@@ -423,7 +446,7 @@ jobs:
     needs: tezuka
     if: |
       github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-      || github.event_name == 'workflow_dispatch' && inputs.release
+      || github.event_name == 'workflow_dispatch' && inputs.release && inputs.mode != 'arm-only'
     runs-on: ubuntu-22.04
     permissions:
       contents: write

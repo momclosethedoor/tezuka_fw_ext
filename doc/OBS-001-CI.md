@@ -17,7 +17,7 @@ python firmware/tools/obs-ci/sources.py export maia-sdr --patch 0002-local.patch
 # For further edits, prepare again, then export a new numbered patch.
 python firmware/tools/obs-ci/sources.py verify maia-sdr
 git -C firmware push origin obs-001-ci
-gh workflow run main.yml -R momclosethedoor/tezuka_fw_ext --ref obs-001-ci -f boards=nano -f release=false
+gh workflow run main.yml -R momclosethedoor/tezuka_fw_ext --ref obs-001-ci -f boards=nano -f release=false -f mode=arm-only
 # Record run ID, run_attempt and head_sha before download.
 gh run view RUN_ID -R momclosethedoor/tezuka_fw_ext --json headSha,attempt,status,conclusion,url
 gh run download RUN_ID -R momclosethedoor/tezuka_fw_ext --dir artifacts/RUN_ID-attempt-N
@@ -31,9 +31,17 @@ needed to validate this delivery chain. Git must use core.autocrlf=false.
 
 ## CI contract
 
-One existing workflow, Nano/release=false. Rust 1.94.0, cargo --locked,
+One existing workflow, Nano/release=false. Use mode=arm-only for edit/test cycles;
+mode=full also builds and verifies the firmware bundle. Full and ARM-only have
+separate concurrency groups, so dispatching ARM-only does not cancel a full run.
+Both export the ELF immediately after compilation. ARM-only verifies target staging;
+only full mode certifies equality with the packed rootfs and FIT.
+ Rust 1.94.0, cargo --locked,
 Buildroot TARGET_CROSS and STAGING_DIR. Downloads/ccache/Buildroot caches remain.
 The exact output key includes package patches and board inputs (including XSA).
+Cross-mode restoration permits only the identical input fingerprint: full make can
+finish a valid partial ARM cache, and ARM can reuse full dependencies. Verification
+script/doc changes do not invalidate the build output cache.
 Maia and board-fpga dirclean remove stale extraction/patch stamps on every run;
 Maia must print a real Compiling line. First run may require a full dependency build.
 
