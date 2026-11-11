@@ -26,6 +26,7 @@ else:
     binary=lzma.decompress(files['usr/bin/maia-httpd.xz'])
     check(binary==compiled.read_bytes(),'Rootfs and compiled binary differ')
 artifact=ROOT/'artifacts/maia-httpd-nano'; artifact.mkdir(parents=True,exist_ok=True)
+shutil.copyfile(ROOT/'doc/OBS-001-CI.md',artifact/'RUNBOOK.md')
 elf=artifact/'maia-httpd'; elf.write_bytes(binary); elf.chmod(0o755)
 header=run('readelf','-h',elf); program=run('readelf','-l',elf); attrs=run('readelf','-A',elf); dynamic=run('readelf','-d',elf)
 check('ARM' in header and 'ELF32' in header and 'hard-float ABI' in header,'Wrong ARM ABI')

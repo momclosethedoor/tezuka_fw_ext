@@ -65,6 +65,31 @@ Stop S60maia-httpd, wait for its PID to disappear, then start the candidate from
 lease/video watchdogs intact. Arrange a timed rollback before stopping the service.
 After at most five minutes (normally 30–60 seconds), kill and wait for the temporary
 PID, start S60maia-httpd, restore saved settings and confirm fresh spectra/host rows.
+The local tested orchestration is `evidence/hardware.py` (outside source trees):
+
+```powershell
+# Arguments are the exact downloaded artifact, expected run ID, head SHA, attempt.
+C:/proj/goofy_v2/.venv/Scripts/python.exe -X utf8 evidence/hardware.py artifacts/RUN/maia-httpd-nano/maia-httpd RUN_ID HEAD_SHA 1
+```
+
+Its board transaction uses these commands, with a unique temporary directory D;
+it arms a detached 150-second rollback before stopping the stock service:
+
+```sh
+/etc/init.d/S60maia-httpd stop
+# Wait until pidof maia-httpd is empty, otherwise abort.
+cd /root
+"$D/maia-httpd" --listen 0.0.0.0:80 --ssl-cert /mnt/jffs2/maia-httpd.crt --ssl-key /mnt/jffs2/maia-httpd.key --ca-cert /mnt/jffs2/maia-sdr-ca.crt >"$D/candidate.log" 2>&1 &
+echo $! >"$D/pid"
+/usr/sbin/goofy_tx_off obs-001-candidate 10
+# Rollback, also performed by the detached guard on host/SSH failure:
+kill "$(cat "$D/pid")"
+# Wait until that PID exits before restarting the stock owner.
+/etc/init.d/S60maia-httpd start
+/usr/sbin/goofy_tx_off obs-001-restore 10
+# Restore saved RX/spectrometer settings through the existing API; check fresh rows.
+```
+
 Never enable TX for this test. A WebSocket handshake alone proves neither fresh
 reception nor RF measurement accuracy. Record unsupported video preconditions.
 
