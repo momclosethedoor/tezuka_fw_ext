@@ -94,7 +94,8 @@ zero is measured zero, not missing. RF-grid NaN is `0x7ff8000000000000`. Other N
 representations/infinities are rejected on wire. Payload has no legacy tag bin:
 legacy bin zero becomes invalid NaN, not invented neighbour power. For finite
 bins, dBFS is `10log10(power)`; sum of bin powers divided by ENBW gives coherent
-signal-power convention. This is not RF dBm calibration.
+signal-power convention. A binwise peak envelope is not simultaneous total RF
+power when its bins peak at different times. This is not RF dBm calibration.
 
 Mean/peak use the **same** contributing FFT windows: arithmetic mean of linear
 bin powers and per-bin maximum, respectively. Mode 3 is one observation with two
@@ -120,7 +121,7 @@ codec checks structural/context invariants; it cannot physically verify this
 producer assertion. OBS-003 must supply real metadata atomically with the data.
 
 Legacy provenance requires epoch=0, clock Hz=0/tick=MAX, unknown RF bin0 and tag
-0..7. nint=0 means unknown, not nint=1. The import context may provide Fs/ENBW for
+0..7. nint=0 means unknown, not nint=1. The explicit import context provides the recorded mean/peak mode and Fs/ENBW for
 unit conversion; it does not turn configuration readback into per-FFT hardware
 metadata. Original raw tag is diagnostic only, never an RF epoch/map generation.
 
@@ -134,6 +135,9 @@ Detect boundary-aligned file truncation using a storage hash/length, not this co
 
 Rust: `maia-httpd/src/observation.rs`, exposed by `lib.rs` only. No live caller.
 Python: `tools/observation/observation.py` (stdlib reader/writer), `obs.py` CLI.
+The reference Capture APIs materialize a finite capture in memory. OBS-003 must
+add the bounded incremental live producer/transport adapter; do not collect an
+unbounded live stream into Capture. The wire layout need not change.
 Shared exact byte vectors are hex-encoded text in
 `maia-httpd/tests/observation-v1/{golden,legacy}.hex`, so Buildroot GNU patch can
 transfer them without unsupported Git binary patches. `expected.json` gives
@@ -160,7 +164,7 @@ omission from source loss. Epoch changes across missing/unattributed records are
 observed bounds, not proof of a precise hardware transition boundary.
 Output preserves capture/record IDs and payloads, including repeats.
 
-Optional `legacy input.npz output.gobs --sample-rate FS --enbw ENBW` uses existing
+Optional `legacy input.npz output.gobs --sample-rate FS --enbw ENBW --mode mean` uses existing
 host NumPy only to read saved `frames`; normal reader/replay/tests are stdlib.
 It derives a deterministic import capture ID from source-file SHA256, numbers
 saved frames by ordinal (not hardware seq), marks epoch/tick/nint unknown, retains
@@ -194,3 +198,12 @@ physical identity across independently repackaged legacy files is unknowable.
   assignments on one source line; no failing candidates/k/ls/array snapshots were
   retained. The 16 saved direct frames precede the failing host/video segment.
   They are not a reproducer. No cause, clamp, drop or classifier fix is invented.
+
+## Code rollback
+
+The retained firmware branch obs-001-ci is the saved point
+`eb6e8062c970b5c40f8279ab192ee4512d2a2a77`. With clean worktrees, switch firmware
+back to that branch and run its `tools/obs-ci/sources.py prepare maia-sdr` to restore
+the pinned Maia plus routing-only stack. The OBS-002 branches/commits remain;
+no reset/force/cleanup or hardware operation is needed. Dirty trees must be saved
+before switching/preparing; the helper refuses them.
