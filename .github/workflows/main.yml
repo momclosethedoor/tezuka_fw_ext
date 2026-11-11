@@ -157,6 +157,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Source fingerprint regression tests
+        run: python3 -m unittest discover -s tools/obs-ci -p "test_*.py"
+
       - name: Free disk space
         if: inputs.mode != 'arm-only'
         uses: jlumbroso/free-disk-space@v1.3.1
