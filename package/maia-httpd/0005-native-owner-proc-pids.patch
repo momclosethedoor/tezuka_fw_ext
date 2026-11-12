@@ -1,0 +1,36 @@
+diff --git a/maia-httpd/src/native_observation.rs b/maia-httpd/src/native_observation.rs
+index 7bd9854..54b76b3 100644
+--- a/maia-httpd/src/native_observation.rs
++++ b/maia-httpd/src/native_observation.rs
+@@ -93,8 +93,18 @@ impl Series{
+     }
+ }
+ 
++/// /proc also contains self/thread-self aliases: only another numeric PID can own DMA.
++pub fn is_other_process(name:&std::ffi::OsStr,current:u32)->bool{
++    name.to_str().and_then(|s|s.parse::<u32>().ok()).is_some_and(|pid|pid!=0 && pid!=current)
++}
++
+ #[cfg(test)]
+ mod tests{
++    #[test]fn native_owner_ignores_proc_aliases_but_keeps_other_pid(){
++        use std::ffi::OsStr;
++        for name in ["self","thread-self","net","42","0"]{assert!(!is_other_process(OsStr::new(name),42),"{name}");}
++        assert!(is_other_process(OsStr::new("43"),42));
++    }
+     use super::*;use crate::observation::{Observation,NO_TAG};use crate::observation_live::Encoder;
+     fn fixture(name:&str)->Vec<u8>{let s=std::fs::read_to_string(std::path::Path::new(env!("OBS_NATIVE_VECTOR_ROOT")).join(format!("{name}.hex"))).unwrap();s.split_whitespace().map(|s|u8::from_str_radix(s,16).unwrap()).collect()}
+     fn obs()->Observation{Observation{descriptor_id:1,seq:0,epoch:0,first_tick:0,nint:1,tag:NO_TAG,power:vec![0.;BINS]}}
+diff --git a/maia-httpd/src/native_runtime.rs b/maia-httpd/src/native_runtime.rs
+index 6cd812d..e862937 100644
+--- a/maia-httpd/src/native_runtime.rs
++++ b/maia-httpd/src/native_runtime.rs
+@@ -41,7 +41,7 @@ impl Guard{
+         let boot=std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+         ensure!(uuid(boot.trim())?==uuid(&c.coordinated_boot_id)?,"requires the explicitly coordinated system boot; stale boot ID");
+         for entry in std::fs::read_dir("/proc")?{
+-            let p=entry?.path();if p.file_name().unwrap().to_string_lossy().parse::<u32>().ok()==Some(std::process::id()){continue;}
++            let p=entry?.path();if !native::is_other_process(p.file_name().unwrap(),std::process::id()){continue;}
+             if let Ok(name)=std::fs::read_to_string(p.join("comm")){ensure!(name.trim()!="maia-httpd","stop the stock DMA owner and its auto-restart before native startup");}
+         }
+         let lease=OpenOptions::new().read(true).write(true).create(true).truncate(false).open("/run/maia-observation.lock")?;
