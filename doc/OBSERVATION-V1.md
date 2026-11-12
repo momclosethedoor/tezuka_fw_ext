@@ -426,10 +426,16 @@ added, and no marker was removed to bypass source lifetime checks.
 
 ## OBS-004: explicit RAM instrumentation and derived avg/peak
 
-Implementation is prepared; local Python/host checks passed. **Changed Rust has
-not been compiled/executed on Pentium; no new ARM-only CI or hardware acceptance
-was run.** See [OBS-004](OBS-004.md) for the exact scope and continuation.
-Earlier software/hardware results above describe their historical versions.
+The initial implementation-only PARTIAL at6cf8331 was followed by
+**OBS-004-BUILD-HW PASS in the documented static raw/RAM boundaries**:
+ARM-only CI43252820579/1 at6cf8331 passed25 Rust+25 Python tests per OS,
+actual ARM release and QEMU config checks. The delivered ELF ran live single60s
+and avg/peak90s on the unchanged OBS-003 PL. Completed DMA independently matched
+all4096 single/mean/peak bins; epochs, actual nint3/4, bounded slow-client behavior,
+normal exit and a controlled parser-error exit passed. Physical power cycling
+restored the stock pair, fresh spectrum/real8 and TX off. Full crate unit tests,
+hardware dirty/fault injection and experimental real8 remain outside that result.
+See [OBS-004](OBS-004.md); earlier results above retain their historical versions.
 
 Gleb's 2026-11-12 clarification: the 544-word displacement occurs **only during
 RAM bitstream loading**; normal full programming has no displacement. This is an
@@ -448,14 +454,17 @@ The strict headers/order/context and final hardware last_seq must match for the
 whole series before publication. No suffix is retained between series and no
 ring-end/ring-start concatenation is attempted. Any incompatible completion or
 invalid record fails explicitly, without reset/fallback. Two accepted real
-records reproduce exactly with the Python counterpart; multiple live rearm
-cycles with the new ARM implementation remain NOT RUN.
+records reproduce exactly with the Python counterpart. Hardware continuation
+completed3955 single and5207 accepted avg/peak series/rearm cycles; final live
+payloads matched the independently decoded stable completed DMA extent.
 
 Native acquisition uses completion counters. `App::run` does not start the legacy
 IRQ reader or recorder-finish waiter in native mode. Native failures are logged
 inside Runtime before its Drop/transport teardown; bounded sender draining still
 has the existing 15-second limit. Normal/error exit and absence of uio_read hangs
-must be verified on the new ELF. Lifetime/boot/owner checks remain enabled.
+were verified on the new ELF: normal exit0 and expected RAM-layout/parser error
+exit1, with the error logged before validity-off/teardown. No AXI faults were
+injected. Lifetime/boot/owner checks remain enabled.
 
 Accumulation configuration is independent of dwell, settling, selection rate
 and rendering rate:
