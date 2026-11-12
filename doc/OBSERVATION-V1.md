@@ -266,9 +266,10 @@ $id=[guid]::NewGuid().ToString('N')
 & $py firmware/tools/observation/check_live.py $exe evidence/obs-003-another-local-live --seconds 30
 ```
 
-Native integration is deliberately pending the i5 OBS-003-PL document and shared
-native golden records, then successful P&R + compatible bit/bin. PL base is 1R1T A
-+ PL-PREP ccbd2a58a271469e83d3ab84aa656376334195c1; current board remains PL-5b.
+The original independent phase preceded the i5 handoff. The OBN1-r1 document,
+shared records and successful compatible P&R bit/bin are now received; software
+integration and its acceptance are described below. PL base is 1R1T A + PL-PREP
+ccbd2a58a271469e83d3ab84aa656376334195c1; no board load was performed here.
 The adapter must decode that **single** ABI at the existing
 `fpga.rs::get_spectrometer_buffers` / rxbuffer and `Spectrometer::run` boundary,
 validate carried seq/context/first-sample tick with the matching payload, map
@@ -392,7 +393,25 @@ matched pair. The i5 DMA can pre-issue AW while idle; SDR-only live reset is uns
 Keep TX off and existing lease/watchdog rules. Report/continuation:
 C:/proj/pluto_ag/evidence/OBS-003-ARM.md and C:/proj/pluto_ag/CHAT_CONTEXT.md.
 
+Software acceptance passed run 43138510348, attempt 1, head
+170747eed43d0156468a8c47814fb941f82d4ab3: 18 Rust and 22 Python tests per OS,
+Linux/Windows TCP stress, actual ARM ELF offline config execution under QEMU,
+negative unset-settling rejection and ARM ABI/library/source checks. Local Pentium
+rechecked all 22 Python tests against Rust output and the shared transport on
+60,000 synthetic observations/30 seconds. This closes the software scope after
+the user's explicit hardware deferral; it does not close hardware acceptance.
+ARM ELF SHA256 7539195d9462b8704310f32c6c0a8149f727e1326ba9a6d7429d401f4f75f2d5.
+The firmware checkout still contains the accepted PL-5b XSA; full-mode images
+from it are not an OBN1 pair. Only the explicitly matched A/1R1T RAM environment,
+i5 bit/bin and this native-mode ELF can be considered for the next hardware visit.
+
 ## Code rollback
+
+Native-only rollback can use local checkpoint `obs-003-streaming-accepted` /
+8625483842be3653d3c9c003965a1ccfa4ee7a84 and its prepare (patches 0001..0003).
+The full slice rollback is the OBS-002 point below. After a future PL/ARM hardware
+load, code rollback alone will be insufficient: restore the agreed complete pair
+through coordinated system boot. No hardware was changed in this software stage.
 
 For OBS-003, the retained firmware branch obs-002-contract is the saved point
 `66e569206830c2b6d2631b17a4bc90db0c58cf6b`. With clean worktrees, switch firmware

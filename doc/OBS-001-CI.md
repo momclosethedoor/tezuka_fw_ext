@@ -96,31 +96,43 @@ reception nor RF measurement accuracy. Record unsupported video preconditions.
 
 ## Continuation
 
-OBS-003 independent streaming work is on `obs-003-arm`, based on OBS-002 commit
+OBS-003 software integration is on `obs-003-arm`, based on OBS-002 commit
 66e569206830c2b6d2631b17a4bc90db0c58cf6b. Per-record codec, bounded fanout,
 explicit synthetic TCP exerciser and headless live reader are documented in
 [OBSERVATION-V1.md](OBSERVATION-V1.md). Local execution report and exact build
-provenance: C:/proj/pluto_ag/evidence/OBS-003-ARM.md. OBS-003 as a whole stays open
-until i5 supplies the native ABI/golden records and successful compatible P&R
-bit/bin, followed by the agreed PL/ARM hardware acceptance and restoration.
-The user will forward that handoff when available; no substitute ABI or PL-5b
-metadata is invented. No board access is required for the independent tests.
+provenance: C:/proj/pluto_ag/evidence/OBS-003-ARM.md. The OBN1-r1 i5 handoff,
+golden/simulation records and successful P&R bit/bin have been received and checked.
+The user explicitly deferred hardware because Pluto is disconnected. Software is
+accepted; native PL-to-ARM operation, normalization, CPU/RSS and real8 regression
+still require the next hardware visit with a matched A/1R1T RAM environment.
+
+Native software run 43138510348, attempt 1, head
+170747eed43d0156468a8c47814fb941f82d4ab3 passed: 18 Rust + 22 Python tests per OS,
+bounded TCP stress, ARM-only compilation, target loader/libs and actual ARM ELF
+offline config checks under QEMU. Artifact directory:
+C:/proj/pluto_ag/artifacts/43138510348-attempt-1/. Maia ELF 6,332,288 bytes, SHA256
+7539195d9462b8704310f32c6c0a8149f727e1326ba9a6d7429d401f4f75f2d5.
+Native mode requires `--native-observations CONFIG.json`; see the contract runbook.
+Do not apply the legacy OBS-001 hardware.py ELF-only procedure to the experimental
+PL pair. A verified full RAM boot/rollback route is required; the i5 AXI master
+may pre-issue AW, so SDR-only live reset/hot PL reload is unsafe.
 
 Independent part passed run 43129725401, attempt 1, head
 279e1dffa63b867de8c551459cb963e65937f608: Linux/Windows native tests, TCP backpressure,
 Pentium bounded-memory test and Nano ARM-only delivery. Artifacts downloaded under
 C:/proj/pluto_ag/artifacts/43129725401-attempt-1/. Maia ELF SHA256
 9c4a209af450d55bc0a55242304757d924a05bc9aa9a952d497dd93468637263.
-No native DMA adapter or hardware acceptance is claimed. Later tooling/docs commits
-do not change the compiled Maia tree; the source manifest remains authoritative.
+That earlier run accepted the independent part only. The native adapter is in the
+newer run above; hardware acceptance is not claimed. The source manifest remains
+authoritative, including after later documentation-only commits.
 
 OBS-002 contract/replay is accepted; canonical format and OBS-003 hook points:
 [OBSERVATION-V1.md](OBSERVATION-V1.md). Rust/Python shared-vector checks and ARM-only
 run 43118803431 (attempt 1, head 75f0acee03469bd009a25512bc228981ad7e417b) passed.
 Local report: C:/proj/pluto_ag/evidence/OBS-002-CONTRACT.md. No live endpoint or
-hardware was changed in OBS-002. Remaining OBS-003 work must carry real acquisition seq,
-RF visit/map generation, first-sample clock and completed count through FFT/DMA,
-then connect the bounded live producer/reader adapters. PL-5b does not supply those fields.
+hardware was changed in OBS-002. The native software now carries the OBN1 fields
+through the bounded adapter; actual PL-to-DMA-to-ARM behavior is untested here.
+PL-5b does not supply those fields.
 The host tracker IndexError 66/64 remains open; failing state was not captured.
 
 ## Acceptance scope after lead clarification
