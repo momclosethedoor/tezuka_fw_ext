@@ -3,7 +3,7 @@
 Record payload is borrowed from one reusable bytearray until the next read.
 There is no Capture, lifetime dedup set, epoch map, or cached payload history.
 """
-import argparse, json, math, socket, struct, sys, time
+import argparse, json, math, os, socket, struct, sys, time
 from dataclasses import dataclass
 from observation import MAGIC, UNKNOWN, MAX_BINS, Descriptor, validate_descriptor
 MAX_RECORD=40+8*MAX_BINS
@@ -131,9 +131,13 @@ def main():
     p.add_argument('--context-every',type=int,default=10000)
     p.add_argument('--unclean-every',type=int,default=0)
     p.add_argument('--output',help='JSON summary path')
+    p.add_argument('--pid-file',help='Instrumentation: write the actual reader PID, including behind a venv launcher')
     a=p.parse_args()
     if not 0<a.seconds<=270 or not 0<=a.read_delay_ms<=1000 or a.context_every<=0 or a.unclean_every<0:p.error('duration/delay/context bounds')
     if a.verify_synthetic and a.expect_source!='synthetic':p.error('synthetic oracle requires explicit synthetic provenance')
+    if a.pid_file:
+        import pathlib
+        pathlib.Path(a.pid_file).write_text(str(os.getpid()),encoding='ascii')
     host,port=a.connect.rsplit(':',1);start=time.monotonic();cpu=time.process_time()
     with socket.create_connection((host,int(port)),timeout=10) as s:
         s.settimeout(min(10,a.seconds))
@@ -144,7 +148,7 @@ def main():
             if a.verify_synthetic:verify_synthetic(f,r.reader.descriptors[f.descriptor_id],a.context_every,a.unclean_every)
             if a.read_delay_ms:time.sleep(a.read_delay_ms/1000)
         else:raise TimeoutError('scenario duration limit')
-    result=dict(r.summary(),source=a.expect_source,seconds=time.monotonic()-start,cpu_seconds=time.process_time()-cpu,
+    result=dict(r.summary(),source=a.expect_source,pid=os.getpid(),seconds=time.monotonic()-start,cpu_seconds=time.process_time()-cpu,
                 synthetic_oracle=a.verify_synthetic,read_delay_ms=a.read_delay_ms)
     if a.output:
         import pathlib

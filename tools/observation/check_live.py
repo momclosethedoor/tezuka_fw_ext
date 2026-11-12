@@ -43,16 +43,23 @@ def run(exe,output,seconds):
         address=ready[6:]
         for name,delay in [('fast',0),('slow',20)]:
             log=(output/(name+'.log')).open('w',encoding='utf-8');files.append(log)
-            cmd=[sys.executable,str(pathlib.Path(__file__).with_name('live.py')),'--connect',address,'--expect-source','synthetic','--verify-synthetic','--context-every','1000','--unclean-every','997','--read-delay-ms',str(delay),'--seconds',str(seconds+25),'--output',str(output/(name+'.json'))]
+            pid_file=output/(name+'.pid')
+            if pid_file.exists():raise FileExistsError('Use a fresh evidence directory: '+str(pid_file))
+            cmd=[sys.executable,str(pathlib.Path(__file__).with_name('live.py')),'--connect',address,'--expect-source','synthetic','--verify-synthetic','--context-every','1000','--unclean-every','997','--read-delay-ms',str(delay),'--seconds',str(seconds+25),'--output',str(output/(name+'.json')),'--pid-file',str(pid_file)]
             children.append(subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT))
         while source.poll() is None or any(p.poll() is None for p in children):
             elapsed=time.monotonic()-start
             if elapsed>seconds+30:raise TimeoutError('bounded stress timeout')
             for name,p in [('source',source),*zip(['fast','slow'],children)]:
-                usage=process_usage(p.pid)
+                pid=p.pid
+                if name!='source':
+                    pid_file=output/(name+'.pid')
+                    if not pid_file.exists():continue
+                    pid=int(pid_file.read_text(encoding='ascii'))
+                usage=process_usage(pid)
                 if usage:
                     rss,used=usage;last_uses[name]=usage
-                    m=mem.setdefault(name,dict(peak=0,warm_min=None,warm_max=0))
+                    m=mem.setdefault(name,dict(pid=pid,launcher_pid=p.pid,peak=0,warm_min=None,warm_max=0))
                     m['peak']=max(m['peak'],rss)
                     if 3<elapsed<seconds:
                         m['warm_min']=rss if m['warm_min'] is None else min(m['warm_min'],rss);m['warm_max']=max(m['warm_max'],rss)
@@ -73,6 +80,8 @@ def run(exe,output,seconds):
             if seconds>5:
                 assert m['warm_min'] is not None and m['warm_max']-m['warm_min']<16*1024*1024,(name,m,'RSS growth beyond bounded stress allowance')
             m['last_cpu_seconds']=last_uses[name][1]
+        for name,r in [('fast',fast),('slow',slow)]:
+            assert mem[name]['pid']==r['pid'],(name,'RSS sampled from wrong process')
         report=dict(kind='explicit synthetic TCP; no hardware claims',source=src,fast=fast,slow=slow,memory=mem,wall_seconds=time.monotonic()-start,commands=dict(source=args))
         (output/'stress.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8');print(json.dumps(report,indent=2));return report
     finally:
