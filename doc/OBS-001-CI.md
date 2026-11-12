@@ -106,13 +106,21 @@ bit/bin, followed by the agreed PL/ARM hardware acceptance and restoration.
 The user will forward that handoff when available; no substitute ABI or PL-5b
 metadata is invented. No board access is required for the independent tests.
 
+Independent part passed run 43129725401, attempt 1, head
+279e1dffa63b867de8c551459cb963e65937f608: Linux/Windows native tests, TCP backpressure,
+Pentium bounded-memory test and Nano ARM-only delivery. Artifacts downloaded under
+C:/proj/pluto_ag/artifacts/43129725401-attempt-1/. Maia ELF SHA256
+9c4a209af450d55bc0a55242304757d924a05bc9aa9a952d497dd93468637263.
+No native DMA adapter or hardware acceptance is claimed. Later tooling/docs commits
+do not change the compiled Maia tree; the source manifest remains authoritative.
+
 OBS-002 contract/replay is accepted; canonical format and OBS-003 hook points:
 [OBSERVATION-V1.md](OBSERVATION-V1.md). Rust/Python shared-vector checks and ARM-only
 run 43118803431 (attempt 1, head 75f0acee03469bd009a25512bc228981ad7e417b) passed.
 Local report: C:/proj/pluto_ag/evidence/OBS-002-CONTRACT.md. No live endpoint or
-hardware was changed in OBS-002. Next: OBS-003 must carry real acquisition seq,
+hardware was changed in OBS-002. Remaining OBS-003 work must carry real acquisition seq,
 RF visit/map generation, first-sample clock and completed count through FFT/DMA,
-then add bounded live producer/host adapters. PL-5b does not supply those fields.
+then connect the bounded live producer/reader adapters. PL-5b does not supply those fields.
 The host tracker IndexError 66/64 remains open; failing state was not captured.
 
 ## Acceptance scope after lead clarification

@@ -256,12 +256,14 @@ pending acceptance of their agreed replacement.
 ```powershell
 $py='C:\proj\goofy_v2\.venv\Scripts\python.exe'
 # Portable exe comes from the exact CI run, not a local Rust installation:
+$run=43129725401 # accepted independent streaming build, attempt 1
+$exe="artifacts/$run-attempt-1/observation-live-windows/gobs-synthetic.exe"
 $id=[guid]::NewGuid().ToString('N')
-& artifacts/<run>-attempt-1/observation-live-windows/gobs-synthetic.exe --synthetic --capture-id $id --bind 127.0.0.1:9009 --seconds 30 --rate 2000 --wait-clients 1
+& $exe --synthetic --capture-id $id --bind 127.0.0.1:9009 --seconds 30 --rate 2000 --wait-clients 1
 # In another terminal; all data remain explicitly synthetic:
 & $py firmware/tools/observation/live.py --connect 127.0.0.1:9009 --expect-source synthetic --verify-synthetic --seconds 55
 # Automated fast/slow clients, RSS/CPU and payload/label oracle, <=5 minutes:
-& $py firmware/tools/observation/check_live.py artifacts/<run>-attempt-1/observation-live-windows/gobs-synthetic.exe evidence/obs-003-local-live --seconds 30
+& $py firmware/tools/observation/check_live.py $exe evidence/obs-003-another-local-live --seconds 30
 ```
 
 Native integration is deliberately pending the i5 OBS-003-PL document and shared
@@ -278,11 +280,23 @@ Before hardware acceptance, verify native vectors, payload units/bin order,
 counter domain/reset semantics and the agreed temporary PL/ARM reload/rollback
 procedure. No hardware test or real8 regression claim follows from synthetic TCP.
 
+Independent streaming acceptance: run 43129725401, attempt 1, source head
+279e1dffa63b867de8c551459cb963e65937f608 passed Linux/Windows native tests and
+Nano ARM-only build. Each OS passed 11 Rust tests (including 1,000,000 observations)
+and 18 Python tests. Local Pentium TCP test produced 60,000 synthetic observations
+in 30 seconds, preserved each received payload/label, and reconciled all queue and
+contention drops. Source warmed RSS was 3,637,248 bytes; readers approximately
+15.3 MB, stable within 16 KiB. Python oracle CPU limits throughput; even the client
+without artificial delay had visible losses. No maximum-Fs or hardware claim.
+Artifacts: `observation-contract`, `observation-live-windows`, `maia-httpd-nano`.
+Local full report: C:/proj/pluto_ag/evidence/OBS-003-ARM.md. Later reader-PID tooling
+and documentation commits preserve the exact compiled source fingerprint.
+
 ## Code rollback
 
-The retained firmware branch obs-001-ci is the saved point
-`eb6e8062c970b5c40f8279ab192ee4512d2a2a77`. With clean worktrees, switch firmware
+For OBS-003, the retained firmware branch obs-002-contract is the saved point
+`66e569206830c2b6d2631b17a4bc90db0c58cf6b`. With clean worktrees, switch firmware
 back to that branch and run its `tools/obs-ci/sources.py prepare maia-sdr` to restore
-the pinned Maia plus routing-only stack. The OBS-002 branches/commits remain;
+the pinned Maia plus routing/OBS-002 stack. The OBS-003 branches/commits remain;
 no reset/force/cleanup or hardware operation is needed. Dirty trees must be saved
 before switching/preparing; the helper refuses them.
