@@ -292,6 +292,106 @@ Artifacts: `observation-contract`, `observation-live-windows`, `maia-httpd-nano`
 Local full report: C:/proj/pluto_ag/evidence/OBS-003-ARM.md. Later reader-PID tooling
 and documentation commits preserve the exact compiled source fingerprint.
 
+## OBN1-r1 native adapter (software stage; hardware acceptance deferred)
+
+The i5 handoff is now available: [authoritative ABI](OBN1-ABI-r1.md), PL commit
+`370d03a02fface2a287d8d7cafb6cee7422217ee`, parent PL-PREP `ccbd2a58`.
+Its 130 SHA256SUMS entries and bit-in-XSA equality were verified. Integrated P&R/
+bitgen passed: WNS +0.057 ns, WHS +0.021 ns, TNS/THS 0, with the inherited timing/
+CDC limitations documented by i5. These reports are not hardware acceptance.
+Expected experimental bit SHA256 is
+`311b49bc1d82646ad2f73d33ff475b304318b0e4b0d9049b83f31b087a6b19f9`,
+bin `089e9227e72593c546821ca79711caf46246fecff074f741925b7c783ed6ad12`.
+They are kept in the local handoff, not substituted into the firmware's PL-5b XSA.
+
+`native_observation.rs` validates every header constant/reserved bit/exponent and
+all 4096 bins. GOBS index k reads native index reverse12((k+2048)%4096), then
+computes float32(M*2^(2E)/750668^2), ENBW 2.0050129965307675. There is no legacy
+K(Fs), 4e6/Fs, extra nint division, sacrificed bin zero or duplicate peak plane.
+The first live profile accepts static **raw** input only; DDC flags fail closed
+until its immutable gain/grid provenance is implemented. Dirty records retain
+their measured powers and epoch=0. A finite immutable epoch-to-descriptor table
+selects by carried metadata, never by the currently staged token or IIO readback.
+One optional diagnostic context transition uses the same RF grid; changing that
+token does not measure RF settling.
+
+`maia-httpd --native-observations CONFIG.json` opts into the experimental producer.
+Without that flag the legacy application path remains selected. In native mode:
+
+- `IpCore::take_native` checks OBN1 and the 8 x 32768 mapping, skips legacy DDC/
+  integration initialization, and refuses DDC input. It never asserts SDR reset.
+- The old Spectrometer task is not started; `/waterfall` returns 410. Existing GET
+  APIs remain available, while mutating HTTP requests return 423 for this static
+  source lifetime. Configure RF outside this mode before starting it. This is a
+  restricted acceptance mode, not a new product configuration/control protocol.
+- Each command arms 1..8 windows. Completion requires idle/no fault/reject and
+  consistent selected/recorded/lost deltas, not IRQ count or pointer differences.
+  Full 8-slot wrap and modulo32 counters are handled. All completed slots are
+  invalidated through the existing rxbuffer ioctl and copied before rearm. The
+  whole series is validated before any of its records is published. Corruption,
+  context mismatch, counter rollback, fault or timeout aborts the source; there
+  is no automatic reset/recovery or decoder fallback.
+- Reusable storage includes one 8*32768-byte native copy batch plus the existing
+  bounded output ring/encoder/power/pending buffers. CPU conversion and time
+  between series can leave **unselected** FFTs; native selected-window loss,
+  output contention loss and per-client ring skips are separate counters.
+- The source requires an explicitly coordinated full system boot ID, matching
+  static IIO Fs/LO and an external settling assertion. A per-boot create_new marker
+  refuses blind restart; a nonblocking owner lock and another-maia process check
+  supplement the required existing service/lease ownership procedure. Neither
+  boot ID nor ABI ID attests the loaded bit hash or RF purity: delivery/boot proof
+  must be checked independently. Fresh capture UUID after producer reset is an
+  operator/controller obligation, not a value derived from receive time.
+- Source runs are bounded to 240 seconds plus completion/drain. On stop it clears
+  validity, never resets the AXI master. The per-boot marker is intentionally kept.
+  A coordinated system reset/RAM boot is required for another source lifetime;
+  restarting the stock ELF alone is not a valid PL/ARM rollback.
+
+Example schema (IDs, Fs/LO and settling must come from the FUTURE verified setup;
+the artifact contains an intentionally unusable dummy boot ID for offline checks):
+
+```json
+{
+  "capture_id": "11111111-1111-4111-8111-111111111111",
+  "coordinated_boot_id": "22222222-2222-4222-8222-222222222222",
+  "externally_settled": true,
+  "sample_rate": 61440000,
+  "rx_lo_hz": 5190000000,
+  "epoch": 7,
+  "series_windows": 8,
+  "run_seconds": 30,
+  "bind": "0.0.0.0:9009",
+  "diagnostic_after_series": 20,
+  "diagnostic_next_epoch": 8
+}
+```
+
+`maia-httpd --check-native-observations CONFIG.json` validates syntax/profile and
+exits **before** FPGA/IIO/ownership access. It does not verify the boot/RF assertion
+and emits no observations. CI executes this mode on the actual ARM ELF with
+qemu-arm and the target sysroot, including an invalid-settling negative case.
+
+Seven shared native fixtures include three i5 golden vectors and four actual HDL
+simulation DMA writes, all driven by synthetic IQ. Their exact native bytes are
+stored as patch-compatible hex with expected metadata and SHA256 of all normalized
+float32 bins, derived from the i5 semantic JSON. Rust produces GOBS1; independent
+Python checks every output byte via those payload hashes, epoch/seq/tick, ENBW,
+single-plane nint=1 and visible seq gaps. Simulated records use source=1, with
+distinct capture namespaces for native-vector and DMA-simulation families. They
+are never relabelled hardware data. Transactional drain, full-ring wrap, lost
+windows/delayed completion, bad payload and legacy/native HTTP policy are tested
+without a board. Shared bounded TCP code is re-exercised on Linux and Windows.
+
+The user explicitly deferred hardware testing because Pluto is disconnected.
+Software acceptance does not establish PL-to-ARM runtime, cache/CDC/reset safety,
+RF normalization, settling, real8 regression or ARM CPU/RSS. The next hardware
+visit needs a compatible **A 1R1T** RAM-boot environment (kernel/DT/transports), the
+verified temporary boot/rollback procedure, the matched new ELF and a static RF
+test condition. Do not hot-load this bit into installed PL-5b/2R2T and call it a
+matched pair. The i5 DMA can pre-issue AW while idle; SDR-only live reset is unsafe.
+Keep TX off and existing lease/watchdog rules. Report/continuation:
+C:/proj/pluto_ag/evidence/OBS-003-ARM.md and C:/proj/pluto_ag/CHAT_CONTEXT.md.
+
 ## Code rollback
 
 For OBS-003, the retained firmware branch obs-002-contract is the saved point

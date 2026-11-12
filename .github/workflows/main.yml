@@ -230,6 +230,7 @@ jobs:
             mtools bison flex libncurses5-dev libssl-dev bc cpio rsync \
             cmake xz-utils libgmp-dev libmpc-dev bootgen-xlnx libclang-dev \
             libgnutls28-dev curl
+          if [ "${{ matrix.board }}" = nano ]; then sudo apt-get install -y qemu-user; fi
 
       # Hashed on package version pins -- defconfig flag toggles
       # don't change tarball identity, so they shouldn't invalidate.

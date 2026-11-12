@@ -30,10 +30,11 @@ def main():
         actual=metadata(tree);expected=json.loads((ROOT/'package/maia-httpd/source.json').read_text())
         (output/'source.json').write_text(json.dumps(actual,indent=2)+'\n')
         if actual!=expected:raise SystemExit('Contract test source differs from Buildroot patch manifest')
-        vectors=tree/'maia-httpd/tests/observation-v1';env=dict(os.environ,OBS_VECTOR_ROOT=str(vectors),OBS_RUST_REENCODED=str(output/'rust-roundtrip.gobs'),OBS_RUST_STREAMED=str(output/'rust-streamed.gobs'),PYTHONUTF8='1')
+        vectors=tree/'maia-httpd/tests/observation-v1';native_vectors=tree/'maia-httpd/tests/observation-native';native_output=output/'native-conversion';native_output.mkdir(exist_ok=True)
+        env=dict(os.environ,OBS_VECTOR_ROOT=str(vectors),OBS_NATIVE_VECTOR_ROOT=str(native_vectors),OBS_NATIVE_OUTPUT_DIR=str(native_output),OBS_RUST_REENCODED=str(output/'rust-roundtrip.gobs'),OBS_RUST_STREAMED=str(output/'rust-streamed.gobs'),PYTHONUTF8='1')
         # The same std-only modules used by the ARM crate, without host BLAS/toolchain.
         harness=work/'contract.rs'
-        harness.write_text('\n'.join('#[path='+json.dumps(str(tree/('maia-httpd/src/'+name+'.rs')).replace('\\','/'))+'] mod '+name+';' for name in ['observation','observation_live']))
+        harness.write_text('\n'.join('#[path='+json.dumps(str(tree/('maia-httpd/src/'+name+'.rs')).replace('\\','/'))+'] mod '+name+';' for name in ['observation','observation_live','native_observation','observation_transport']))
         exe=work/('contract-tests.exe' if windows else 'contract-tests')
         command(['rustc','+'+version,'--edition=2024','-O','--test',harness,'-o',exe],tree,env,output/'rust-compile.log')
         command([exe,'--nocapture'],tree,env,output/'rust-tests.log')
@@ -46,6 +47,8 @@ def main():
             data=bytes.fromhex((vectors/(name+'.hex')).read_text());(output/(name+'.gobs')).write_bytes(data)
         shutil.copyfile(vectors/'expected.json',output/'expected.json')
         shutil.copyfile(ROOT/'doc/OBSERVATION-V1.md',output/'OBSERVATION-V1.md')
-        (output/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in sorted(output.iterdir()) if p.is_file() and p.name!='SHA256SUMS'))
+        shutil.copyfile(ROOT/'doc/OBN1-ABI-r1.md',output/'OBN1-ABI-r1.md')
+        shutil.copyfile(native_vectors/'expected.json',output/'native-expected.json')
+        (output/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.relative_to(output).as_posix()+'\n' for p in sorted(output.rglob('*')) if p.is_file() and p.name!='SHA256SUMS'))
         print('Observation contract verified in both languages; ARM build may proceed.')
 if __name__=='__main__':main()

@@ -29,6 +29,8 @@ else:
     check(binary==compiled.read_bytes(),'Rootfs and compiled binary differ')
 artifact=ROOT/'artifacts/maia-httpd-nano'; artifact.mkdir(parents=True,exist_ok=True)
 shutil.copyfile(ROOT/'doc/OBS-001-CI.md',artifact/'RUNBOOK.md')
+shutil.copyfile(ROOT/'doc/OBN1-ABI-r1.md',artifact/'OBN1-ABI-r1.md')
+shutil.copyfile(ROOT/'doc/OBSERVATION-V1.md',artifact/'OBSERVATION-V1.md')
 elf=artifact/'maia-httpd'; elf.write_bytes(binary); elf.chmod(0o755)
 header=run('readelf','-h',elf); program=run('readelf','-l',elf); attrs=run('readelf','-A',elf); dynamic=run('readelf','-d',elf)
 synthetic=artifact/'gobs-synthetic'
@@ -63,6 +65,19 @@ while queue:
             for v in req: check(v in provided,'Unsatisfied symbol version '+lib+':'+v)
 common={'scope':'arm-only; target staging checked, packed rootfs/FIT not checked','head_sha':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sources':metadata(src),'target':'armv7-unknown-linux-gnueabihf','rust':run('rustc','+1.94.0','-Vv'),'gcc':run(out/'host/bin/arm-linux-gcc','--version'),'sysroot':run(out/'host/bin/arm-linux-gcc','-print-sysroot').strip(),'interpreter':interp,'needed':needed,'libraries':{str(p.relative_to(out/'target')):sha(p) for p in seen},'maia_sha256':sha(elf),'cargo_lock_sha256':sha(src/'maia-httpd/Cargo.lock')}
 if arm_only:
+    # Execute the actual delivered ARM ELF under the target loader/sysroot.
+    # This mode exits before UIO/IIO/proc ownership checks and emits no observations.
+    config={'capture_id':'11111111-1111-4111-8111-111111111111','coordinated_boot_id':'22222222-2222-4222-8222-222222222222','externally_settled':True,'sample_rate':61440000,'rx_lo_hz':5190000000,'epoch':7,'series_windows':8,'run_seconds':30,'bind':'127.0.0.1:9009'}
+    config_path=artifact/'native-config-example.json';config_path.write_text(json.dumps(config,indent=2)+'\n')
+    smoke=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(config_path)],text=True,timeout=20)
+    check('no hardware access' in smoke,'Offline ARM native config check did not complete')
+    bad=dict(config,externally_settled=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        path=pathlib.Path(tmp)/'invalid.json';path.write_text(json.dumps(bad))
+        r=subprocess.run(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(path)],capture_output=True,text=True,timeout=20)
+        check(r.returncode!=0 and 'settling' in r.stderr,'Unsafe native config was not rejected')
+    (artifact/'native-arm-offline-check.txt').write_text(smoke+'\nNegative unset-settling case rejected. No hardware accessed.\n')
+    common['native_abi']={'id':'OBN1-r1','pl_commit':'370d03a02fface2a287d8d7cafb6cee7422217ee','pl_bit_sha256':'311b49bc1d82646ad2f73d33ff475b304318b0e4b0d9049b83f31b087a6b19f9','pl_bin_sha256':'089e9227e72593c546821ca79711caf46246fecff074f741925b7c783ed6ad12','abi_document_sha256':sha(ROOT/'doc/OBN1-ABI-r1.md'),'arm_qemu_offline_config_check':True,'hardware_accepted':False}
     common['synthetic_exerciser']={'sha256':sha(synthetic),'source':'explicit synthetic; not installed or automatically started','interpreter':synthetic_interp,'needed':re.findall(r'Shared library: \[(.*?)\]',synth_info)}
     (artifact/'manifest.json').write_text(json.dumps(common,indent=2)+'\n')
     (artifact/'SHA256SUMS').write_text(sha(elf)+'  maia-httpd\n'+sha(synthetic)+'  gobs-synthetic\n')
