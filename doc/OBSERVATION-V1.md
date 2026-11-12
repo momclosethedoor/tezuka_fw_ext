@@ -383,16 +383,23 @@ are never relabelled hardware data. Transactional drain, full-ring wrap, lost
 windows/delayed completion, bad payload and legacy/native HTTP policy are tested
 without a board. Shared bounded TCP code is re-exercised on Linux and Windows.
 
-Hardware continuation on 2026-11-12 is **BLOCKED**, not deferred:
+Hardware continuation on 2026-11-12 is **PARTIAL**:
 [OBS-003-HW](OBS-003-HW.md). The agreed full FPGA manager UART procedure reached
 OBS_READY with the installed kernel/DT and existing 8 x 32768 ring. This supersedes
 the earlier hypothesis that a different DT/kernel or RAM-DFU was mandatory.
-The real matched PL/native ARM source recognized OBN1 and completed eight DMA
-writes, but native headers appeared at word 3552 instead of word 0; slot 7 at that
-offset was not valid. No GOBS observations were accepted. Do not compensate for
-this by rotating bins/records in ARM or by an arbitrary SDR-only reset. The
-manager transition and DMA prefetch/bank/address behavior need review against
-the saved real records; pre-issued AW alone is not an established root cause.
+The first run recognized OBN1 and completed eight DMA writes, but native headers
+appeared at word 3552 instead of word 0. Gleb explicitly waived this known
+RAM-load 544-word artifact for the data/stamp acceptance and deferred its fix.
+A short repeat used the same existing ELF, without a rebuild or runtime change.
+The offline test reader assembled two COMPLETE records across adjacent physical
+slots with the explicit 544-word correction. Strict native validation, all 4096
+bin order/scaling checks (three implementations), seq2049/2050, epoch7, nint1,
+tick spacing and fresh payloads passed. Offline host GOBS encoding/reading passed;
+this is NOT live ARM GOBS output. Full hardware slow-client/memory/context and
+experimental real8 checks remain NOT RUN and are listed in the report.
+The 544 artifact is recorded as an agreed exception, not a new blocker for the
+completed data/stamp check. ABI, production decoding, HDL and reset behavior
+were not changed. Pre-issued AW alone is not an established root cause.
 After physical power cycling the installed PL-5b/ELF, fresh spectrum, short real8
 transport and TX-off were verified. No flash/kernel/DT/boot configuration changed.
 
@@ -410,10 +417,12 @@ guard bug. Patch 0005 checks only other numeric PIDs, retaining boot/counter/
 marker checks. ARM-only run 43213696707/1, source 46d31bdc4389bd4f33c63f7e4fe9b230f3d27b6a,
 passed 19 Rust and 22 Python tests per OS and target ELF checks. Hardware ELF SHA256
 d03d22c360d2eda399f27bd36d9e43a5d494cb89dca0f38ac8cee0802e3c9c7c.
-The DMA/ABI blocker leaves normal native memory/slow-client/context/real8 checks
-unaccepted. Error shutdown can also wait on the legacy UIO blocking read; record
-the source error before runtime teardown and review native interrupt ownership
-before the next capture. No marker was removed to bypass source lifetime checks.
+The existing ELF still rejects the unadjusted RAM-load layout before live GOBS
+publication; the offline test exception does not establish native runtime load
+acceptance. Error shutdown can also wait on the legacy UIO blocking read. These
+remaining limitations and possible small follow-up fixes are documented, not
+implemented in this no-rebuild repeat. No new real8 CLI/DDC source profile was
+added, and no marker was removed to bypass source lifetime checks.
 
 ## Code rollback
 
