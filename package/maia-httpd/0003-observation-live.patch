@@ -1,0 +1,297 @@
+diff --git a/maia-httpd/src/bin/gobs-synthetic.rs b/maia-httpd/src/bin/gobs-synthetic.rs
+new file mode 100644
+index 0000000..cf93208
+--- /dev/null
++++ b/maia-httpd/src/bin/gobs-synthetic.rs
+@@ -0,0 +1,84 @@
++//! Explicit synthetic transport exerciser. Never opens DMA/IIO or controls RF.
++//! This is not a native PL producer and is not started by maia-httpd.
++#![allow(dead_code)]
++#[path="../observation.rs"] mod observation;
++#[path="../observation_live.rs"] mod observation_live;
++use observation::{Descriptor,Observation,NO_TAG};
++use observation_live::{Cursor,Encoder,Fanout};
++use std::io::{self,Write};
++use std::net::{TcpListener,TcpStream};
++use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
++use std::thread::{self,JoinHandle};
++use std::time::{Duration,Instant};
++
++#[derive(Default)]struct ClientResult{sent:u64,missed:u64,partial_disconnects:u64,errors:u64}
++fn serve(mut socket:TcpStream,hub:Arc<Fanout>,mut cursor:Cursor,header:Arc<Vec<u8>>,done:Arc<AtomicBool>,max:usize)->ClientResult{
++    let mut result=ClientResult::default();
++    let mut pending=Vec::with_capacity(max.max(header.len()));pending.extend_from_slice(&header);let mut offset=0;let mut record=false;let mut drain=None;
++    if socket.set_nonblocking(true).is_err(){result.errors=1;return result;}
++    let _=socket.set_nodelay(true);
++    loop {
++        if done.load(Ordering::Acquire) && drain.is_none(){drain=Some(Instant::now());}
++        if drain.is_some_and(|t|t.elapsed()>Duration::from_secs(15)){if offset!=0 && offset<pending.len(){result.partial_disconnects+=1;}result.errors+=1;break;}
++        if offset==pending.len(){
++            if record{result.sent+=1;record=false;}
++            if hub.poll(&mut cursor,&mut pending){offset=0;record=true;}
++            else if done.load(Ordering::Acquire){break;}
++            else{thread::sleep(Duration::from_millis(1));continue;}
++        }
++        match socket.write(&pending[offset..]){
++            Ok(0)=>{result.errors+=1;if offset!=0{result.partial_disconnects+=1;}break;},
++            Ok(n)=>offset+=n,
++            Err(e) if e.kind()==io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(1)),
++            Err(e) if e.kind()==io::ErrorKind::Interrupted=>{},
++            Err(_)=>{result.errors+=1;if offset!=0{result.partial_disconnects+=1;}break;}
++        }
++    }
++    result.missed=cursor.missed;result
++}
++fn main(){if let Err(e)=run(){eprintln!("{e}");std::process::exit(1);}}
++fn run()->Result<(),Box<dyn std::error::Error>>{
++    let args:Vec<String>=std::env::args().skip(1).collect();
++    if !args.iter().any(|s|s=="--synthetic"){return Err("SYNTHETIC ONLY: --synthetic and --capture-id UUID required; no hardware fallback".into());}
++    let value=|key:&str,default:&str|->String{args.iter().position(|s|s==key).map(|i|args.get(i+1).expect("missing option value").clone()).unwrap_or_else(||default.into())};
++    let known=["--capture-id","--bind","--seconds","--rate","--bins","--queue","--clients","--wait-clients","--context-every","--unclean-every"];
++    let mut i=0;while i<args.len(){if args[i]=="--synthetic"{i+=1;}else if known.contains(&args[i].as_str()) && i+1<args.len(){i+=2;}else{return Err(format!("unknown/missing argument {}",args[i]).into());}}
++    let id=value("--capture-id","").replace('-',"");
++    if id.len()!=32{return Err("explicit fresh capture UUID is required".into());}
++    let mut session=[0;16];for (i,x) in session.iter_mut().enumerate(){*x=u8::from_str_radix(&id[2*i..2*i+2],16)?;}
++    let seconds:f64=value("--seconds","30").parse()?;let rate:f64=value("--rate","1000").parse()?;
++    let bins:u32=value("--bins","4096").parse()?;let capacity:usize=value("--queue","8").parse()?;let clients:usize=value("--clients","2").parse()?;let wait:usize=value("--wait-clients","0").parse()?;
++    let context:u64=value("--context-every","10000").parse()?;let unclean:u64=value("--unclean-every","0").parse()?;
++    if !seconds.is_finite() || !(0.01..=240.).contains(&seconds) || !rate.is_finite() || !(1.0..=100000.).contains(&rate) || !(1..=8).contains(&clients) || wait>clients || context==0{return Err("duration/rate/clients/context bounds".into());}
++    let ds=(1..=2).map(|id|Descriptor{id,sample_rate:4e6,bin0_hz:id as f64*100e6,enbw_bins:1.5,tick_hz:4_000_000,bins,mode:1,source:1}).collect();
++    let mut encoder=Encoder::new_nint1(session,ds)?;let max=encoder.max_record();let header=Arc::new(encoder.header().to_vec());
++    let hub=Arc::new(Fanout::new(capacity,max)?);let done=Arc::new(AtomicBool::new(false));
++    let listener=TcpListener::bind(value("--bind","127.0.0.1:0"))?;listener.set_nonblocking(true)?;
++    println!("SYNTHETIC ONLY; no PL/DMA/RF access");println!("READY {}",listener.local_addr()?);io::stdout().flush()?;
++    let mut workers:Vec<Option<JoinHandle<ClientResult>>>=(0..clients).map(|_|None).collect();let mut total=ClientResult::default();let mut accepted=0u64;let mut rejected=0u64;
++    let mut accept=|workers:&mut Vec<Option<JoinHandle<ClientResult>>>|->io::Result<()> {
++        for slot in workers.iter_mut(){if slot.as_ref().is_some_and(|h|h.is_finished()){let r=slot.take().unwrap().join().expect("sender panic");total.sent+=r.sent;total.missed+=r.missed;total.errors+=r.errors;total.partial_disconnects+=r.partial_disconnects;}}
++        // Bounded work per acquisition turn, even during a connection flood.
++        for _ in 0..8{match listener.accept(){
++            Ok((socket,_))=>{if let Some(slot)=workers.iter_mut().find(|s|s.is_none()){let (q,h,d)=(hub.clone(),header.clone(),done.clone());let cursor=q.subscribe();*slot=Some(thread::spawn(move||serve(socket,q,cursor,h,d,max)));accepted+=1;}else{rejected+=1;}},
++            Err(e) if e.kind()==io::ErrorKind::WouldBlock=>break,Err(e)=>return Err(e)
++        }}Ok(())
++    };
++    let waiting=Instant::now();
++    while workers.iter().filter(|s|s.is_some()).count()<wait{accept(&mut workers)?;if waiting.elapsed()>Duration::from_secs(15){return Err("synthetic startup client timeout".into());}thread::sleep(Duration::from_millis(1));}
++    let start=Instant::now();let mut frame=Vec::with_capacity(max);let mut o=Observation{descriptor_id:1,seq:0,epoch:1,first_tick:0,nint:1,tag:NO_TAG,power:vec![0.;bins as usize]};
++    let mut produced=0u64;
++    while start.elapsed().as_secs_f64()<seconds{
++        accept(&mut workers)?;
++        let due=produced as f64/rate;let elapsed=start.elapsed().as_secs_f64();
++        if due>elapsed{thread::sleep(Duration::from_secs_f64((due-elapsed).min(0.001)));continue;}
++        o.seq=produced;o.epoch=1+produced/context;o.descriptor_id=1+((o.epoch-1)%2) as u16;o.first_tick=produced.checked_mul(bins as u64).ok_or("synthetic tick overflow")?;
++        if unclean!=0 && produced%unclean==0{o.epoch=0;}
++        for (k,x) in o.power.iter_mut().enumerate(){*x=((produced%1024)*16+k as u64%16) as f32/16384.;}
++        encoder.observation(&o,&mut frame)?;hub.publish(&frame)?;produced+=1;
++    }
++    drop(accept);done.store(true,Ordering::Release);
++    for h in workers.into_iter().flatten(){let r=h.join().map_err(|_|"sender panic")?;total.sent+=r.sent;total.missed+=r.missed;total.errors+=r.errors;total.partial_disconnects+=r.partial_disconnects;}
++    println!("{{\"source\":\"synthetic\",\"produced\":{produced},\"published\":{},\"contention_drops\":{},\"client_missed\":{},\"sent_records\":{},\"accepted\":{accepted},\"rejected\":{rejected},\"partial_disconnects\":{},\"sender_errors\":{},\"queue_payload_capacity\":{},\"frame_capacity\":{},\"power_capacity\":{},\"max_clients\":{clients},\"seconds\":{}}}",hub.published(),hub.contention_drops.load(Ordering::Relaxed),total.missed,total.sent,total.partial_disconnects,total.errors,hub.allocated_payload_bytes(),frame.capacity(),o.power.capacity(),start.elapsed().as_secs_f64());
++    Ok(())
++}
+diff --git a/maia-httpd/src/lib.rs b/maia-httpd/src/lib.rs
+index a6d238e..132953a 100644
+--- a/maia-httpd/src/lib.rs
++++ b/maia-httpd/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod fpga;
+ pub mod httpd;
+ pub mod iio;
+ pub mod observation;
++pub mod observation_live;
+ pub mod rxbuffer;
+ pub mod sigmf;
+ pub mod spectrometer;
+diff --git a/maia-httpd/src/observation.rs b/maia-httpd/src/observation.rs
+index 4c90930..50d650d 100644
+--- a/maia-httpd/src/observation.rs
++++ b/maia-httpd/src/observation.rs
+@@ -72,7 +72,7 @@ fn f64_at(b: &[u8], i: usize) -> Result<f64, String> {
+     if v.is_nan() && bits!=0x7ff8000000000000 { return fail("noncanonical NaN"); }
+     Ok(v)
+ }
+-fn descriptor_ok(d: &Descriptor) -> Result<(),String> {
++pub(crate) fn descriptor_ok(d: &Descriptor) -> Result<(),String> {
+     if d.id==0 || d.bins<2 || d.bins as usize>MAX_BINS || !d.bins.is_power_of_two() {return fail("descriptor ID/FFT size");}
+     if !(1..=3).contains(&d.mode) || !(1..=3).contains(&d.source) {return fail("mode/source");}
+     if !d.sample_rate.is_finite() || d.sample_rate<=0.0 || !d.enbw_bins.is_finite() || d.enbw_bins<=0.0 || d.enbw_bins>d.bins as f64 || d.tick_hz==u64::MAX {return fail("descriptor rate/ENBW/clock");}
+@@ -81,7 +81,7 @@ fn descriptor_ok(d: &Descriptor) -> Result<(),String> {
+     } else if !d.bin0_hz.is_finite() {return fail("RF grid required");}
+     Ok(())
+ }
+-fn observation_ok(o: &Observation,d: &Descriptor) -> Result<(),String> {
++pub(crate) fn observation_ok(o: &Observation,d: &Descriptor) -> Result<(),String> {
+     if o.nint==0 && d.source!=2 {return fail("unknown nint only for legacy");}
+     if (d.tick_hz==0)!=(o.first_tick==UNKNOWN_TICK) {return fail("counter availability");}
+     if d.source==2 {
+diff --git a/maia-httpd/src/observation_live.rs b/maia-httpd/src/observation_live.rs
+new file mode 100644
+index 0000000..e6a2ae5
+--- /dev/null
++++ b/maia-httpd/src/observation_live.rs
+@@ -0,0 +1,167 @@
++//! Bounded GOBS1 stream codec and fanout. No native PL/DMA ABI is assumed here.
++//! Offline Capture remains separate: live delivery is strictly producer ordered.
++#![allow(missing_docs)]
++use crate::observation::{self, Descriptor, Observation, MAGIC, UNKNOWN_TICK};
++use std::io::{self, Read};
++use std::sync::{Mutex, TryLockError};
++use std::sync::atomic::{AtomicU64, Ordering};
++pub const MAX_DESCRIPTORS: usize = 16;
++pub const MAX_RECORD: usize = 40 + 8 * 65536;
++
++fn number<const N:usize>(b:&[u8],i:usize)->[u8;N]{b[i..i+N].try_into().unwrap()}
++fn u16v(b:&[u8],i:usize)->u16{u16::from_le_bytes(number(b,i))}
++fn u32v(b:&[u8],i:usize)->u32{u32::from_le_bytes(number(b,i))}
++fn u64v(b:&[u8],i:usize)->u64{u64::from_le_bytes(number(b,i))}
++fn invalid(s:&str)->io::Error{io::Error::new(io::ErrorKind::InvalidData,s)}
++
++/// Constant-size monotonic live state. No lifetime seq or epoch collection.
++#[derive(Default, Clone)]
++pub struct Order { last:Option<u64>, epoch:u64, descriptor:u16, tick:Option<u64> }
++impl Order {
++    pub fn accept(&mut self,seq:u64,epoch:u64,id:u16,tick:u64)->Result<(),String>{
++        if self.last.is_some_and(|v|seq<=v){return Err("non-increasing live seq; reset needs new capture".into());}
++        if epoch!=0 && epoch==self.epoch && self.descriptor!=id{return Err("live epoch binding".into());}
++        if tick!=UNKNOWN_TICK && self.tick.is_some_and(|v|tick<v){return Err("source counter reset needs new capture".into());}
++        self.last=Some(seq);
++        if epoch!=0 {self.epoch=epoch;self.descriptor=id;}
++        if tick!=UNKNOWN_TICK {self.tick=Some(tick);}
++        Ok(())
++    }
++}
++
++/// Stable descriptors are checked once at installation. Caller owns a reusable frame.
++pub struct Encoder { descriptors:Vec<Descriptor>, header:Vec<u8>, order:Order, max:usize, nint1:bool }
++impl Encoder {
++    pub fn new(session:[u8;16],descriptors:Vec<Descriptor>)->Result<Self,String>{
++        if session==[0;16] || descriptors.is_empty() || descriptors.len()>MAX_DESCRIPTORS {return Err("capture/descriptor bounds".into());}
++        let mut header=Vec::with_capacity(24+48*descriptors.len());header.extend_from_slice(MAGIC);header.extend_from_slice(&session);
++        let mut max=0;
++        for (i,d) in descriptors.iter().enumerate(){
++            observation::descriptor_ok(d)?;
++            if descriptors[..i].iter().any(|x|x.id==d.id){return Err("descriptor redefinition".into());}
++            max=max.max(40+4*d.bins as usize*if d.mode==3 {2}else{1});
++            header.extend_from_slice(&48u32.to_le_bytes());header.extend_from_slice(&1u16.to_le_bytes());header.extend_from_slice(&d.id.to_le_bytes());
++            for x in [d.sample_rate,d.bin0_hz,d.enbw_bins]{header.extend_from_slice(&if x.is_nan(){0x7ff8000000000000u64}else{x.to_bits()}.to_le_bytes());}
++            header.extend_from_slice(&d.tick_hz.to_le_bytes());header.extend_from_slice(&d.bins.to_le_bytes());header.extend_from_slice(&d.mode.to_le_bytes());header.extend_from_slice(&d.source.to_le_bytes());
++        }
++        Ok(Self{descriptors,header,order:Order::default(),max,nint1:false})
++    }
++    pub fn new_nint1(session:[u8;16],descriptors:Vec<Descriptor>)->Result<Self,String>{let mut e=Self::new(session,descriptors)?;e.require_nint1_profile()?;e.nint1=true;Ok(e)}
++    /// First integration profile; the generic codec also supports old golden mode 3.
++    pub fn require_nint1_profile(&self)->Result<(),String>{
++        if self.descriptors.iter().any(|d|d.mode==3 || d.source==2 || d.tick_hz==0){return Err("live source requires one plane and explicit source counter".into());}Ok(())
++    }
++    pub fn header(&self)->&[u8]{&self.header}
++    pub fn max_record(&self)->usize{self.max}
++    /// Append exactly one complete record, without decoding any capture/history.
++    pub fn observation(&mut self,o:&Observation,out:&mut Vec<u8>)->Result<(),String>{
++        let d=self.descriptors.iter().find(|d|d.id==o.descriptor_id).ok_or("missing descriptor")?;
++        if self.nint1 && o.nint!=1{return Err("source profile requires nint=1".into());}
++        observation::observation_ok(o,d)?;
++        self.order.accept(o.seq,o.epoch,o.descriptor_id,o.first_tick)?;
++        out.clear();out.extend_from_slice(&(40u32+4*o.power.len() as u32).to_le_bytes());out.extend_from_slice(&2u16.to_le_bytes());out.extend_from_slice(&o.descriptor_id.to_le_bytes());
++        for x in [o.seq,o.epoch,o.first_tick]{out.extend_from_slice(&x.to_le_bytes());}
++        out.extend_from_slice(&o.nint.to_le_bytes());out.extend_from_slice(&o.tag.to_le_bytes());
++        for x in &o.power{out.extend_from_slice(&x.to_bits().to_le_bytes());}Ok(())
++    }
++}
++
++/// Borrowed payload, valid until the reader is advanced. No owned payload per record.
++pub struct Frame<'a>{pub descriptor_id:u16,pub seq:u64,pub epoch:u64,pub first_tick:u64,pub nint:u32,pub tag:u32,pub payload:&'a[u8]}
++impl Frame<'_>{pub fn power(&self)->impl Iterator<Item=f32>+'_ {self.payload.chunks_exact(4).map(|x|f32::from_le_bytes(x.try_into().unwrap()))}}
++/// Incremental bounded reader. Descriptors must be installed before observations.
++pub struct Reader<R>{input:R,pub session:[u8;16],pub descriptors:Vec<Descriptor>,scratch:Vec<u8>,order:Order,started:bool}
++impl<R:Read> Reader<R>{
++    pub fn new(mut input:R)->io::Result<Self>{
++        let mut h=[0;24];input.read_exact(&mut h)?;
++        if &h[..8]!=MAGIC || h[8..]==[0;16]{return Err(invalid("capture magic/UUID"));}
++        Ok(Self{input,session:h[8..].try_into().unwrap(),descriptors:Vec::with_capacity(MAX_DESCRIPTORS),scratch:vec![0;MAX_RECORD],order:Order::default(),started:false})
++    }
++    pub fn next_observation(&mut self)->io::Result<Option<Frame<'_>>>{
++        loop {
++            let b=&mut self.scratch;
++            // EOF is legal only on a record boundary. read_exact handles short reads.
++            loop {match self.input.read(&mut b[..1]){Ok(0)=>return Ok(None),Ok(_)=>break,Err(e) if e.kind()==io::ErrorKind::Interrupted=>continue,Err(e)=>return Err(e)}}
++            self.input.read_exact(&mut b[1..8])?;
++            let size=u32v(b,0) as usize;let kind=u16v(b,4);let id=u16v(b,6);
++            if !(8..=MAX_RECORD).contains(&size) || id==0 {return Err(invalid("record bounds"));}
++            match kind {
++                1=>{
++                    if size!=48 || self.started || self.descriptors.len()==MAX_DESCRIPTORS || self.descriptors.iter().any(|d|d.id==id){return Err(invalid("descriptor bounds/order/redefinition"));}
++                    self.input.read_exact(&mut b[8..size])?;
++                    let mut values=[0.;3];
++                    for (j,x) in values.iter_mut().enumerate(){let bits=u64v(b,8+8*j);*x=f64::from_bits(bits);if x.is_nan() && bits!=0x7ff8000000000000{return Err(invalid("noncanonical NaN"));}}
++                    let d=Descriptor{id,sample_rate:values[0],bin0_hz:values[1],enbw_bins:values[2],tick_hz:u64v(b,32),bins:u32v(b,40),mode:u16v(b,44),source:u16v(b,46)};
++                    observation::descriptor_ok(&d).map_err(|e|invalid(&e))?;self.descriptors.push(d);
++                },
++                2=>{
++                    let d=self.descriptors.iter().find(|d|d.id==id).ok_or_else(||invalid("missing descriptor"))?;
++                    if size!=40+4*d.bins as usize*if d.mode==3{2}else{1}{return Err(invalid("observation size"));}
++                    self.input.read_exact(&mut b[8..size])?;
++                    let (seq,epoch,tick,nint,tag)=(u64v(b,8),u64v(b,16),u64v(b,24),u32v(b,32),u32v(b,36));
++                    if nint==0 && d.source!=2 || (d.tick_hz==0)!=(tick==UNKNOWN_TICK) || d.source==2 && (epoch!=0 || tag>7) || d.source!=2 && tag!=u32::MAX{return Err(invalid("observation metadata"));}
++                    for x in b[40..size].chunks_exact(4){let bits=u32::from_le_bytes(x.try_into().unwrap());let v=f32::from_bits(bits);if v.is_infinite() || v<0. || v.is_nan() && bits!=0x7fc00000{return Err(invalid("power/NaN"));}}
++                    self.order.accept(seq,epoch,id,tick).map_err(|e|invalid(&e))?;self.started=true;
++                    return Ok(Some(Frame{descriptor_id:id,seq,epoch,first_tick:tick,nint,tag,payload:&self.scratch[40..size]}));
++                },_=>return Err(invalid("unknown record kind"))
++            }
++        }
++    }
++}
++
++struct Ring {slots:Vec<Vec<u8>>,head:u64}
++/// Fixed slots; acquisition never waits for a reader or its socket.
++pub struct Fanout {ring:Mutex<Ring>,pub contention_drops:AtomicU64,max:usize}
++/// One bounded subscriber cursor; ordinal is internal and never replaces source seq.
++#[derive(Default)]
++pub struct Cursor {next:u64,pub missed:u64}
++impl Fanout{
++    pub fn new(capacity:usize,max:usize)->Result<Self,String>{
++        if !(1..=1024).contains(&capacity) || !(40..=MAX_RECORD).contains(&max) || capacity*max>16*1024*1024{return Err("queue bounds (16 MiB maximum payload slots)".into());}
++        Ok(Self{ring:Mutex::new(Ring{slots:(0..capacity).map(|_|Vec::with_capacity(max)).collect(),head:0}),contention_drops:AtomicU64::new(0),max})
++    }
++    pub fn publish(&self,frame:&[u8])->Result<bool,String>{
++        if frame.len()>self.max || frame.len()<40 || u32v(frame,0) as usize!=frame.len() || u16v(frame,4)!=2{return Err("publish requires one complete observation".into());}
++        let mut r=match self.ring.try_lock(){Ok(r)=>r,Err(TryLockError::WouldBlock)=>{self.contention_drops.fetch_add(1,Ordering::Relaxed);return Ok(false)},Err(_)=>return Err("poisoned ring".into())};
++        let i=r.head as usize%r.slots.len();r.slots[i].clear();r.slots[i].extend_from_slice(frame);r.head=r.head.checked_add(1).ok_or("ring ordinal exhausted")?;Ok(true)
++    }
++    pub fn subscribe(&self)->Cursor{Cursor{next:self.ring.lock().unwrap().head,missed:0}}
++    /// Copy before socket I/O. No reference to an overwritten slot escapes the lock.
++    pub fn poll(&self,c:&mut Cursor,out:&mut Vec<u8>)->bool{
++        let r=self.ring.lock().unwrap();let oldest=r.head.saturating_sub(r.slots.len() as u64);
++        if c.next<oldest{c.missed+=oldest-c.next;c.next=oldest;}
++        if c.next==r.head{return false;}
++        out.clear();out.extend_from_slice(&r.slots[c.next as usize%r.slots.len()]);c.next+=1;true
++    }
++    pub fn published(&self)->u64{self.ring.lock().unwrap().head}
++    pub fn allocated_payload_bytes(&self)->usize{self.ring.lock().unwrap().slots.iter().map(|v|v.capacity()).sum()}
++}
++
++#[cfg(test)]
++mod tests{
++    use super::*;use crate::observation::{decode,Record,NO_TAG};
++    fn golden()->Vec<u8>{let s:String=include_str!("../tests/observation-v1/golden.hex").split_whitespace().collect();(0..s.len()).step_by(2).map(|i|u8::from_str_radix(&s[i..i+2],16).unwrap()).collect()}
++    #[test]fn incremental_golden_bytes_and_values(){
++        let wire=golden();let c=decode(&wire).unwrap();let ds=c.records.iter().filter_map(|r|if let Record::Descriptor(d)=r{Some(d.clone())}else{None}).collect();
++        let mut e=Encoder::new(c.session,ds).unwrap();let mut out=e.header().to_vec();let mut scratch=Vec::with_capacity(e.max_record());
++        for r in &c.records{if let Record::Observation(o)=r{e.observation(o,&mut scratch).unwrap();out.extend_from_slice(&scratch);}}
++        assert_eq!(out,wire);
++        let mut reader=Reader::new(&wire[..]).unwrap();let mut values=Vec::new();
++        while let Some(f)=reader.next_observation().unwrap(){values.push((f.seq,f.epoch,f.nint,f.power().count()));}
++        assert_eq!(values,[(0,7,1,8),(1,7,3,8),(2,8,1,8),(3,8,2,8),(5,8,1,8),(6,0,1,8)]);
++        if let Ok(p)=std::env::var("OBS_RUST_STREAMED"){std::fs::write(p,out).unwrap();}
++    }
++    #[test]fn order_reset_and_epoch_binding(){let mut s=Order::default();s.accept(8,7,1,100).unwrap();assert!(s.accept(8,7,1,100).is_err());assert!(s.accept(9,7,2,101).is_err());s.accept(9,0,2,101).unwrap();s.accept(10,8,2,102).unwrap();assert!(s.accept(11,8,1,103).is_err());assert!(s.accept(11,9,1,0).is_err());}
++    #[test]fn partial_eof_and_malformed_prefix(){let w=golden();for end in [1,23,25,71,121,551]{let result=Reader::new(&w[..end]);if let Ok(mut r)=result{assert!(loop{match r.next_observation(){Ok(Some(_))=>{},Ok(None)=>break false,Err(_)=>break true}});}}let mut w=w;w[24..28].copy_from_slice(&u32::MAX.to_le_bytes());assert!(Reader::new(&w[..]).unwrap().next_observation().is_err());}
++    #[test]fn million_observations_bounded_and_slow_consumer(){
++        let d=Descriptor{id:1,sample_rate:64.,bin0_hz:100.,enbw_bins:1.,tick_hz:64,bins:64,mode:1,source:1};let mut e=Encoder::new([3;16],vec![d]).unwrap();e.require_nint1_profile().unwrap();
++        let q=Fanout::new(8,e.max_record()).unwrap();let budget=q.allocated_payload_bytes();let mut c=q.subscribe();let mut frame=Vec::with_capacity(e.max_record());let mut pending=Vec::with_capacity(e.max_record());
++        let mut o=Observation{descriptor_id:1,seq:0,epoch:1,first_tick:0,nint:1,tag:NO_TAG,power:vec![0.;64]};let mut received=0;let mut prev=None;
++        for seq in 0..1_000_000u64{o.seq=seq;o.first_tick=seq*64;o.epoch=1+seq/200000;for (i,x) in o.power.iter_mut().enumerate(){*x=((seq%1024)*16+i as u64%16) as f32/16384.;}e.observation(&o,&mut frame).unwrap();assert!(q.publish(&frame).unwrap());
++            if seq%1000==999{while q.poll(&mut c,&mut pending){let seq=u64v(&pending,8);assert!(prev.is_none_or(|v|seq>v));assert_eq!(u64v(&pending,16),1+seq/200000);assert_eq!(u64v(&pending,24),seq*64);assert_eq!(f32::from_le_bytes(number(&pending,40)),((seq%1024)*16) as f32/16384.);prev=Some(seq);received+=1;}}
++        }
++        assert_eq!(received,8000);assert_eq!(c.missed,992000);assert_eq!(received+c.missed,q.published());assert_eq!(budget,q.allocated_payload_bytes());assert_eq!(frame.capacity(),e.max_record());assert_eq!(pending.capacity(),e.max_record());assert_eq!(o.power.capacity(),64);
++        // Deliberate lock contention drops a whole record without blocking acquisition.
++        let guard=q.ring.lock().unwrap();assert!(!q.publish(&frame).unwrap());drop(guard);assert_eq!(q.contention_drops.load(Ordering::Relaxed),1);
++    }
++}

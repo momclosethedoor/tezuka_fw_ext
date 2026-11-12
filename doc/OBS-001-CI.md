@@ -96,6 +96,16 @@ reception nor RF measurement accuracy. Record unsupported video preconditions.
 
 ## Continuation
 
+OBS-003 independent streaming work is on `obs-003-arm`, based on OBS-002 commit
+66e569206830c2b6d2631b17a4bc90db0c58cf6b. Per-record codec, bounded fanout,
+explicit synthetic TCP exerciser and headless live reader are documented in
+[OBSERVATION-V1.md](OBSERVATION-V1.md). Local execution report and exact build
+provenance: C:/proj/pluto_ag/evidence/OBS-003-ARM.md. OBS-003 as a whole stays open
+until i5 supplies the native ABI/golden records and successful compatible P&R
+bit/bin, followed by the agreed PL/ARM hardware acceptance and restoration.
+The user will forward that handoff when available; no substitute ABI or PL-5b
+metadata is invented. No board access is required for the independent tests.
+
 OBS-002 contract/replay is accepted; canonical format and OBS-003 hook points:
 [OBSERVATION-V1.md](OBSERVATION-V1.md). Rust/Python shared-vector checks and ARM-only
 run 43118803431 (attempt 1, head 75f0acee03469bd009a25512bc228981ad7e417b) passed.

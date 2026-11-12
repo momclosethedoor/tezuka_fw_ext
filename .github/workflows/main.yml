@@ -150,8 +150,27 @@ jobs:
           path: artifacts/observation-contract/
           if-no-files-found: warn
 
+  observation-live-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned native Rust for portable transport exerciser
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path package/maia-httpd/maia-httpd.mk -Pattern '^MAIA_HTTPD_RUST_VERSION = ').Line.Split('=')[1].Trim()
+          rustup toolchain install $version --profile minimal
+      - name: Check Windows transport and export explicit synthetic executable
+        run: python tools/obs-ci/check-contract.py
+      - name: Upload Windows transport evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: observation-live-windows
+          path: artifacts/observation-live-windows/
+          if-no-files-found: warn
+
   tezuka:
-    needs: [matrix, observation-contract]
+    needs: [matrix, observation-contract, observation-live-windows]
     runs-on: ubuntu-22.04
     name: ${{ matrix.defconfig }}
     permissions:

@@ -10,7 +10,8 @@ def command(args,cwd,env,log):
     if r.returncode:raise SystemExit(r.returncode)
 
 def main():
-    output=ROOT/'artifacts/observation-contract';output.mkdir(parents=True,exist_ok=True)
+    windows=os.name=='nt'
+    output=ROOT/('artifacts/observation-live-windows' if windows else 'artifacts/observation-contract');output.mkdir(parents=True,exist_ok=True)
     rev,patches=inputs();version=next(l.split(' = ')[1] for l in (ROOT/'package/maia-httpd/maia-httpd.mk').read_text().splitlines() if l.startswith('MAIA_HTTPD_RUST_VERSION = '))
     with tempfile.TemporaryDirectory(prefix='observation-contract-') as td:
         work=pathlib.Path(td);archive=work/'upstream.tar.gz';tree=work/'source';tree.mkdir()
@@ -29,11 +30,18 @@ def main():
         actual=metadata(tree);expected=json.loads((ROOT/'package/maia-httpd/source.json').read_text())
         (output/'source.json').write_text(json.dumps(actual,indent=2)+'\n')
         if actual!=expected:raise SystemExit('Contract test source differs from Buildroot patch manifest')
-        vectors=tree/'maia-httpd/tests/observation-v1';env=dict(os.environ,OBS_VECTOR_ROOT=str(vectors),OBS_RUST_REENCODED=str(output/'rust-roundtrip.gobs'),PYTHONUTF8='1')
-        exe=work/'contract-tests'
-        command(['rustc','+'+version,'--edition=2024','--test',tree/'maia-httpd/src/observation.rs','-o',exe],tree,env,output/'rust-compile.log')
+        vectors=tree/'maia-httpd/tests/observation-v1';env=dict(os.environ,OBS_VECTOR_ROOT=str(vectors),OBS_RUST_REENCODED=str(output/'rust-roundtrip.gobs'),OBS_RUST_STREAMED=str(output/'rust-streamed.gobs'),PYTHONUTF8='1')
+        # The same std-only modules used by the ARM crate, without host BLAS/toolchain.
+        harness=work/'contract.rs'
+        harness.write_text('\n'.join('#[path='+json.dumps(str(tree/('maia-httpd/src/'+name+'.rs')).replace('\\','/'))+'] mod '+name+';' for name in ['observation','observation_live']))
+        exe=work/('contract-tests.exe' if windows else 'contract-tests')
+        command(['rustc','+'+version,'--edition=2024','-O','--test',harness,'-o',exe],tree,env,output/'rust-compile.log')
         command([exe,'--nocapture'],tree,env,output/'rust-tests.log')
         command([sys.executable,'-m','unittest','discover','-s',ROOT/'tools/observation','-p','test_*.py','-v'],ROOT,env,output/'python-tests.log')
+        synthetic=output/('gobs-synthetic.exe' if windows else 'gobs-synthetic')
+        flags=['-C','target-feature=+crt-static'] if windows else []
+        command(['rustc','+'+version,'--edition=2024','-O',*flags,tree/'maia-httpd/src/bin/gobs-synthetic.rs','-o',synthetic],tree,env,output/'synthetic-compile.log')
+        command([sys.executable,ROOT/'tools/observation/check_live.py',synthetic,output/'live-stress','--seconds','10' if windows else '30'],ROOT,env,output/'live-stress.log')
         for name in ['golden','legacy']:
             data=bytes.fromhex((vectors/(name+'.hex')).read_text());(output/(name+'.gobs')).write_bytes(data)
         shutil.copyfile(vectors/'expected.json',output/'expected.json')

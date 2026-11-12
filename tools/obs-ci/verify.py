@@ -31,13 +31,20 @@ artifact=ROOT/'artifacts/maia-httpd-nano'; artifact.mkdir(parents=True,exist_ok=
 shutil.copyfile(ROOT/'doc/OBS-001-CI.md',artifact/'RUNBOOK.md')
 elf=artifact/'maia-httpd'; elf.write_bytes(binary); elf.chmod(0o755)
 header=run('readelf','-h',elf); program=run('readelf','-l',elf); attrs=run('readelf','-A',elf); dynamic=run('readelf','-d',elf)
+synthetic=artifact/'gobs-synthetic'
+shutil.copyfile(compiled.with_name('gobs-synthetic'),synthetic); synthetic.chmod(0o755)
+synth_info=''.join(run('readelf',flag,synthetic) for flag in ['-h','-l','-A','-d'])
+check('ARM' in synth_info and 'ELF32' in synth_info and 'hard-float ABI' in synth_info and 'Tag_ABI_VFP_args: VFP registers' in synth_info,'Wrong synthetic exerciser ARM ABI')
+(artifact/'gobs-synthetic-elf.txt').write_text(synth_info)
 check('ARM' in header and 'ELF32' in header and 'hard-float ABI' in header,'Wrong ARM ABI')
 check('Tag_ABI_VFP_args: VFP registers' in attrs,'Wrong float convention')
 interp=re.search(r'Requesting program interpreter: (.*?)\]',program)[1]
 check(interp.lstrip('/') in files,'Missing ELF interpreter')
+synthetic_interp=re.search(r'Requesting program interpreter: (.*?)\]',synth_info)[1]
+check(synthetic_interp==interp,'Synthetic exerciser interpreter mismatch')
 needed=re.findall(r'Shared library: \[(.*?)\]',dynamic)
 # Include transitive shared libs; check required symbol versions against rootfs providers.
-queue=[elf]; seen=set(); versions=[]
+queue=[elf,synthetic]; seen=set(); versions=[]
 while queue:
     obj=queue.pop(); dyn=run('readelf','-d',obj)
     ver=run('readelf','-V',obj)
@@ -56,8 +63,9 @@ while queue:
             for v in req: check(v in provided,'Unsatisfied symbol version '+lib+':'+v)
 common={'scope':'arm-only; target staging checked, packed rootfs/FIT not checked','head_sha':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sources':metadata(src),'target':'armv7-unknown-linux-gnueabihf','rust':run('rustc','+1.94.0','-Vv'),'gcc':run(out/'host/bin/arm-linux-gcc','--version'),'sysroot':run(out/'host/bin/arm-linux-gcc','-print-sysroot').strip(),'interpreter':interp,'needed':needed,'libraries':{str(p.relative_to(out/'target')):sha(p) for p in seen},'maia_sha256':sha(elf),'cargo_lock_sha256':sha(src/'maia-httpd/Cargo.lock')}
 if arm_only:
+    common['synthetic_exerciser']={'sha256':sha(synthetic),'source':'explicit synthetic; not installed or automatically started','interpreter':synthetic_interp,'needed':re.findall(r'Shared library: \[(.*?)\]',synth_info)}
     (artifact/'manifest.json').write_text(json.dumps(common,indent=2)+'\n')
-    (artifact/'SHA256SUMS').write_text(sha(elf)+'  maia-httpd\n')
+    (artifact/'SHA256SUMS').write_text(sha(elf)+'  maia-httpd\n'+sha(synthetic)+'  gobs-synthetic\n')
     (artifact/'elf.txt').write_text(header+program+attrs+dynamic)
     shutil.copyfile('maia-build.log',artifact/'maia-build.log')
     print(json.dumps(common,indent=2)); sys.exit(0)

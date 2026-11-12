@@ -9,9 +9,13 @@
     {
       "name": "0002-observation-v1.patch",
       "sha256": "c4c66697de253a6a5c17b7fe9fadfa34745ecd7c5757f8a590302920f1ea346f"
+    },
+    {
+      "name": "0003-observation-live.patch",
+      "sha256": "2de4881ed28c684052cfda75066677a24ebf8148649a419bd844672e0dd6d04e"
     }
   ],
-  "maia_httpd_tree_sha256": "53d79d65db4ad4c1403f6892dd493ac1d2ec43482222b99664cc1513357d79d4",
+  "maia_httpd_tree_sha256": "f152dcd8571e163f2a0bb4b4aec32bc9b479e5c919bd59d25174d4d6a9de9f4f",
   "files": {
     "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
     "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
@@ -38,6 +42,7 @@
     "maia-httpd/maia-pac/svd/maia-sdr.svd": "f5b26a623c6c88cf1b24fb35606dcf3c627e05373b6b75cb77ed45ef1d32a085",
     "maia-httpd/src/app.rs": "03f2c17d5036aa6e471d85c5f2d1f3c6d4d29605ec2356f85e9e5f7a3980c251",
     "maia-httpd/src/args.rs": "a688462ec210e7868e47e87025952da83155fca9b8b37a5846819c4cf18ac9d1",
+    "maia-httpd/src/bin/gobs-synthetic.rs": "ec6054678575e206f6d6dfb6d100d5ba984a705a51ef0e9abab5649de30af7f9",
     "maia-httpd/src/ddc.rs": "c4afe7a6187b3391acc12c0a4e173c02525a542687aff64930d4979d8de5ff84",
     "maia-httpd/src/ddc/constants.rs": "686fa8d5b1280f908256a83a108e7dbb1917d70374cb9e0acdfc6ed6e41362ad",
     "maia-httpd/src/fpga.rs": "4a63faee90240c3a98de3ec1fa4485980a0956e8875482ad6ebdca04c8a2c937",
@@ -55,9 +60,10 @@
     "maia-httpd/src/httpd/websocket.rs": "fe19d50c53dd02d89ce88a14cfbb518c7bfc803cf907871c6edc6df86dfe73d0",
     "maia-httpd/src/httpd/zeros.rs": "6a500dff4d4f761bb332c0551459bb7228afc3598ad2fd67115d302d991eb3a9",
     "maia-httpd/src/iio.rs": "74df718b885d674ae3904327c634e1fff29aac3b844dafdda1b4ae05180b2f7c",
-    "maia-httpd/src/lib.rs": "8d990851efdbadfe333b8421154273ab496ebb7bf91e64d2056aa7106d223109",
+    "maia-httpd/src/lib.rs": "1510a8a9614eb00e12d962b75004369ab69a993dace016f3070e9d50eea321aa",
     "maia-httpd/src/main.rs": "5787cda63686e0a3a1d4a3b4fbf3f2abaf0737bb2fbfe12e92075e73dbdf4f88",
-    "maia-httpd/src/observation.rs": "e2252fc1d0695daee8ec7dca1da82a1923ceb245e78778ad5e289376203511ca",
+    "maia-httpd/src/observation.rs": "72c01345ce6e5f2ab0e85c06394dd021a22fdcc740da1c2510938ccb98c496a9",
+    "maia-httpd/src/observation_live.rs": "204ac7ed957ffbed9e6c6c1d1eff79c4747d99bb2ac62cd89f8ee23b95c6e4e0",
     "maia-httpd/src/rxbuffer.rs": "2c770250d68279396424ce12673a88f0e7682c76218bcefa95b7f5499576a2cf",
     "maia-httpd/src/sigmf.rs": "72396a53d0e5f6cb352aa36f44be1d72db583a8cdd954cc9970d835a25753b45",
     "maia-httpd/src/spectrometer.rs": "fb1c44ad5fcb9a250946fd86fccb3da9239832eb119efdb7dc0db465ba8c8669",

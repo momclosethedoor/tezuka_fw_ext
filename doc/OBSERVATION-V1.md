@@ -199,6 +199,85 @@ physical identity across independently repackaged legacy files is unknowable.
   retained. The 16 saved direct frames precede the failing host/video segment.
   They are not a reproducer. No cause, clamp, drop or classifier fix is invented.
 
+## OBS-003 bounded live profile (independent of native PL ABI)
+
+The GOBS1 wire bytes above are unchanged. `observation_live.rs` provides a
+per-record `Encoder`, borrowed `Reader`, and bounded `Fanout`; the old `Capture`
+API and its history maps are offline only. `Encoder::new_nint1` installs at most
+16 immutable descriptors once, requires one plane, an explicit source clock and
+synthetic or hardware provenance, and rejects nint other than 1. It never decodes
+its encoded capture. No payload normalization is performed by this codec.
+
+Live order is strictly increasing **producer seq** within one capture. Duplicates,
+reordering and counter rollback fail closed; offline replay remains available for
+delayed/reordered records. Joining a running source establishes a baseline at the
+first delivered seq: missing leading observations are unknown, not invented loss.
+An epoch is opaque, not a numerical clock. Epoch zero is diagnostic/unattributed
+and does not erase the last known binding. The last known epoch/descriptor binding
+is checked; lifetime epoch non-reuse and immutable context binding remain producer
+obligations. The bounded reader cannot audit every historical epoch without an
+unbounded map. All live descriptors precede the first observation; new grids beyond
+the installed table require a new capture in this first profile. Source restart or
+hardware-counter reset requires a fresh capture UUID and new stream, not seq reset
+in an existing connection. The controller supplies a fresh UUID for each source
+lifetime; client reconnect alone does not create another observation/source.
+
+Fanout uses Q preallocated whole-record slots (default 8, maximum payload slot
+budget 16 MiB). Publishing uses `try_lock`: a copying reader can cause a whole
+incoming observation to be dropped and counted, but cannot block acquisition.
+Readers copy one complete slot before socket I/O. There are at most C senders
+(default 2, limit 8), each with one reusable pending record and a scalar cursor.
+While a socket is blocked, its pending record is finished before the cursor skips
+over overwritten slots. No header/payload splicing or partial-record drop occurs.
+A failed connection is closed, never resumed in the middle of a record. Forced
+drain timeout is reported as an error and partial-disconnect counter; a truncated
+receiver record is an error. Ring ordinals are internal and never replace source
+seq. `contention_drops` and per-client `missed` explain distinct loss causes.
+Slot reuse is not itself a loss for clients which already consumed that slot.
+
+Userspace payload storage is bounded by Q*R + C*max(R,header) + encoder frame R +
+source power 4*N, plus the descriptor/header tables and fixed threads. Python
+`tools/observation/live.py` uses one 524328-byte input buffer, at most 16 descriptors
+and scalar counters, returning a borrowed payload valid until the next read.
+Rust incremental Reader has the same fixed input buffer bound. Kernel TCP buffers,
+allocator/stack/runtime and process RSS are additional and measured separately.
+Nothing retains all source seq, payloads or epochs. Reader CPU is deliberately
+instrumental, without a claim of maximum-Fs FFT throughput or UI frame rate.
+
+`gobs-synthetic` is a separate, explicitly opted-in transport exerciser built from
+the same source stack for native Linux/Windows and ARM. It is not installed in
+rootfs, auto-started, or used as a fallback by maia-httpd. It opens no DMA/IIO/RF
+devices. Its source=1 descriptors, invented ticks/epochs and deterministic powers
+are synthetic throughout. Context alternation and epoch=0 diagnostic tests do not
+prove RF settling. TCP here is an instrumental transport, not a new native DMA
+ABI or a host product migration. Existing `/waterfall` and real8 are untouched
+pending acceptance of their agreed replacement.
+
+```powershell
+$py='C:\proj\goofy_v2\.venv\Scripts\python.exe'
+# Portable exe comes from the exact CI run, not a local Rust installation:
+$id=[guid]::NewGuid().ToString('N')
+& artifacts/<run>-attempt-1/observation-live-windows/gobs-synthetic.exe --synthetic --capture-id $id --bind 127.0.0.1:9009 --seconds 30 --rate 2000 --wait-clients 1
+# In another terminal; all data remain explicitly synthetic:
+& $py firmware/tools/observation/live.py --connect 127.0.0.1:9009 --expect-source synthetic --verify-synthetic --seconds 55
+# Automated fast/slow clients, RSS/CPU and payload/label oracle, <=5 minutes:
+& $py firmware/tools/observation/check_live.py artifacts/<run>-attempt-1/observation-live-windows/gobs-synthetic.exe evidence/obs-003-local-live --seconds 30
+```
+
+Native integration is deliberately pending the i5 OBS-003-PL document and shared
+native golden records, then successful P&R + compatible bit/bin. PL base is 1R1T A
++ PL-PREP ccbd2a58a271469e83d3ab84aa656376334195c1; current board remains PL-5b.
+The adapter must decode that **single** ABI at the existing
+`fpga.rs::get_spectrometer_buffers` / rxbuffer and `Spectrometer::run` boundary,
+validate carried seq/context/first-sample tick with the matching payload, map
+clean=0 to epoch=0, select an installed descriptor by carried context and call
+`Encoder::observation` then `Fanout::publish`. It must not read current RF settings
+to label pending buffers, duplicate nint=1 planes, reapply old K(Fs) to normalized
+payloads, or introduce a second DMA owner. No native layouts/registers are guessed.
+Before hardware acceptance, verify native vectors, payload units/bin order,
+counter domain/reset semantics and the agreed temporary PL/ARM reload/rollback
+procedure. No hardware test or real8 regression claim follows from synthetic TCP.
+
 ## Code rollback
 
 The retained firmware branch obs-001-ci is the saved point
