@@ -383,15 +383,18 @@ are never relabelled hardware data. Transactional drain, full-ring wrap, lost
 windows/delayed completion, bad payload and legacy/native HTTP policy are tested
 without a board. Shared bounded TCP code is re-exercised on Linux and Windows.
 
-The user explicitly deferred hardware testing because Pluto is disconnected.
-Software acceptance does not establish PL-to-ARM runtime, cache/CDC/reset safety,
-RF normalization, settling, real8 regression or ARM CPU/RSS. The next hardware
-visit needs a compatible **A 1R1T** RAM-boot environment (kernel/DT/transports), the
-verified temporary boot/rollback procedure, the matched new ELF and a static RF
-test condition. Do not hot-load this bit into installed PL-5b/2R2T and call it a
-matched pair. The i5 DMA can pre-issue AW while idle; SDR-only live reset is unsafe.
-Keep TX off and existing lease/watchdog rules. Report/continuation:
-C:/proj/pluto_ag/evidence/OBS-003-ARM.md and C:/proj/pluto_ag/CHAT_CONTEXT.md.
+Hardware continuation on 2026-11-12 is **BLOCKED**, not deferred:
+[OBS-003-HW](OBS-003-HW.md). The agreed full FPGA manager UART procedure reached
+OBS_READY with the installed kernel/DT and existing 8 x 32768 ring. This supersedes
+the earlier hypothesis that a different DT/kernel or RAM-DFU was mandatory.
+The real matched PL/native ARM source recognized OBN1 and completed eight DMA
+writes, but native headers appeared at word 3552 instead of word 0; slot 7 at that
+offset was not valid. No GOBS observations were accepted. Do not compensate for
+this by rotating bins/records in ARM or by an arbitrary SDR-only reset. The
+manager transition and DMA prefetch/bank/address behavior need review against
+the saved real records; pre-issued AW alone is not an established root cause.
+After physical power cycling the installed PL-5b/ELF, fresh spectrum, short real8
+transport and TX-off were verified. No flash/kernel/DT/boot configuration changed.
 
 Software acceptance passed run 43138510348, attempt 1, head
 170747eed43d0156468a8c47814fb941f82d4ab3: 18 Rust and 22 Python tests per OS,
@@ -402,8 +405,15 @@ rechecked all 22 Python tests against Rust output and the shared transport on
 the user's explicit hardware deferral; it does not close hardware acceptance.
 ARM ELF SHA256 7539195d9462b8704310f32c6c0a8149f727e1326ba9a6d7429d401f4f75f2d5.
 The firmware checkout still contains the accepted PL-5b XSA; full-mode images
-from it are not an OBN1 pair. Only the explicitly matched A/1R1T RAM environment,
-i5 bit/bin and this native-mode ELF can be considered for the next hardware visit.
+from it are not an OBN1 pair. Hardware startup also exposed a /proc/self owner
+guard bug. Patch 0005 checks only other numeric PIDs, retaining boot/counter/
+marker checks. ARM-only run 43213696707/1, source 46d31bdc4389bd4f33c63f7e4fe9b230f3d27b6a,
+passed 19 Rust and 22 Python tests per OS and target ELF checks. Hardware ELF SHA256
+d03d22c360d2eda399f27bd36d9e43a5d494cb89dca0f38ac8cee0802e3c9c7c.
+The DMA/ABI blocker leaves normal native memory/slow-client/context/real8 checks
+unaccepted. Error shutdown can also wait on the legacy UIO blocking read; record
+the source error before runtime teardown and review native interrupt ownership
+before the next capture. No marker was removed to bypass source lifetime checks.
 
 ## Code rollback
 
