@@ -6,6 +6,26 @@ BINS=4096
 BYTES=32768
 COEFFICIENT_SUM=750668
 ENBW=4096*275837336/(COEFFICIENT_SUM**2)
+
+def ram_records(data):
+    """One completed contiguous RAM-load extent, never a modulo-ring rotation.
+
+    Caller proves stability/series ownership. No suffix survives a call. Production
+    additionally requires all eight slots, loss=0 and matching completion seq.
+    The excluded prefix/suffix together cost one record, not a native DMA loss.
+    """
+    if not BYTES<=len(data)<=8*BYTES or len(data)%BYTES:
+        raise ValueError('RAM extent requires 1..8 complete adjacent slots')
+    first=(BINS-544)*8
+    result=tuple(bytes(data[first+j*BYTES:first+(j+1)*BYTES])
+                 for j in range(len(data)//BYTES-1))
+    previous=None
+    for record in result:
+        n=decode(record)
+        if previous is not None and n.seq!=previous+1:
+            raise ValueError('unrelated records inside RAM extent')
+        previous=n.seq
+    return result
 @dataclass(frozen=True)
 class Native:
     seq:int

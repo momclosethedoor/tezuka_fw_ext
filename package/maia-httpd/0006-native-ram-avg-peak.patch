@@ -1,0 +1,379 @@
+diff --git a/maia-httpd/src/app.rs b/maia-httpd/src/app.rs
+index 97830ed..cb01ffa 100644
+--- a/maia-httpd/src/app.rs
++++ b/maia-httpd/src/app.rs
+@@ -92,12 +92,16 @@ impl App {
+     /// This only returns if one of the objects that form the application fails.
+     #[tracing::instrument(name = "App::run", level = "debug", skip_all)]
+     pub async fn run(self) -> Result<()> {
+-        let source=async move{if let Some(native)=self.native{native.run().await}else{self.spectrometer.unwrap().run().await}};
++        if let Some(native)=self.native{
++            // Native uses completion counters; neither legacy IRQ blocking read
++            // nor recorder-finish waiter is needed (mutating native HTTP is locked).
++            return tokio::select!{ret=self.httpd.run()=>ret,ret=native.run()=>ret};
++        }
+         tokio::select! {
+             ret = self.httpd.run() => ret,
+             ret = self.interrupt_handler.run() => ret,
+             ret = self.recorder_finish.run() => ret,
+-            ret = source => ret,
++            ret = self.spectrometer.unwrap().run() => ret,
+         }
+     }
+ }
+diff --git a/maia-httpd/src/lib.rs b/maia-httpd/src/lib.rs
+index a9fc777..a0d0fc8 100644
+--- a/maia-httpd/src/lib.rs
++++ b/maia-httpd/src/lib.rs
+@@ -17,6 +17,7 @@ pub mod observation_live;
+ pub mod native_observation;
+ pub mod native_runtime;
+ pub mod observation_transport;
++pub mod observation_accumulator;
+ pub mod rxbuffer;
+ pub mod sigmf;
+ pub mod spectrometer;
+diff --git a/maia-httpd/src/native_observation.rs b/maia-httpd/src/native_observation.rs
+index 54b76b3..63f5114 100644
+--- a/maia-httpd/src/native_observation.rs
++++ b/maia-httpd/src/native_observation.rs
+@@ -74,6 +74,30 @@ pub struct Series{base:Snapshot,count:u32}
+ pub struct Complete{pub recorded:u32,pub lost:u32,pub first_slot:usize,pub last_seq:u64}
+ /// Implementations invalidate CPU cache and copy a stable completed DMA slot.
+ pub trait CompletedDma{fn copy_slot(&self,slot:usize,out:&mut[u8])->Result<(),String>;}
++/// Acceptance-only RAM reload correction. Each call is ONE proven contiguous,
++/// completed physical extent. No retained suffix, modulo wrap or cross-series join.
++pub fn assemble_ram_extent(raw:&[u8],out:&mut[Vec<u8>])->Result<usize,String>{
++    if raw.len()%BYTES!=0 || raw.len()/BYTES>8 || raw.len()<BYTES{return Err("RAM extent must contain 1..8 whole completed adjacent slots".into());}
++    let count=raw.len()/BYTES-1;
++    if out.len()<count || out.iter().any(|b|b.len()!=BYTES){return Err("RAM assembly storage bounds".into());}
++    let first=(BINS-544)*8;
++    for (j,b) in out.iter_mut().take(count).enumerate(){b.copy_from_slice(&raw[first+j*BYTES..first+(j+1)*BYTES]);}
++    Ok(count)
++}
++/// All eight physical slots belong to the current complete series. Its last
++/// seven records fit linearly; the fragmented edge window is counted separately.
++pub fn drain_ram<D:CompletedDma>(dma:&D,done:Complete,raw:&mut[u8],buffers:&mut[Vec<u8>],adapter:&Adapter,order:&crate::observation_live::Order)->Result<crate::observation_live::Order,String>{
++    if done.recorded!=8 || done.lost!=0 || done.first_slot!=0 || raw.len()!=8*BYTES{return Err("RAM mode requires one full loss-free completed ring starting at slot zero".into());}
++    for slot in 0..8{dma.copy_slot(slot,&mut raw[slot*BYTES..(slot+1)*BYTES])?;}
++    let count=assemble_ram_extent(raw,buffers)?;
++    let mut checked=order.clone();let mut previous=None;
++    for b in buffers.iter().take(count){
++        let h=validate(b)?;let id=adapter.check_context(h)?;
++        if previous.is_some_and(|v:u64|v.checked_add(1)!=Some(h.seq)){return Err("nonconsecutive records inside one RAM series".into());}
++        checked.accept(h.seq,h.epoch,id,h.first_tick)?;previous=Some(h.seq);
++    }
++    if previous!=Some(done.last_seq){return Err("RAM completion/header last_seq mismatch".into());}Ok(checked)
++}
+ /// Copy ALL slots before any consumer can publish or re-arm. Validate the whole
+ /// series transactionally; the caller's order is unchanged if any record is bad.
+ pub fn drain<D:CompletedDma>(dma:&D,done:Complete,buffers:&mut[Vec<u8>],adapter:&Adapter,order:&crate::observation_live::Order)->Result<crate::observation_live::Order,String>{
+@@ -100,6 +124,38 @@ pub fn is_other_process(name:&std::ffi::OsStr,current:u32)->bool{
+ 
+ #[cfg(test)]
+ mod tests{
++    #[test]fn ram_extent_does_not_carry_edges_or_join_modulo_slots(){
++        let mut out=vec![vec![0;BYTES];8];
++        assert_eq!(assemble_ram_extent(&vec![0;BYTES],&mut out).unwrap(),0);
++        assert!(assemble_ram_extent(&vec![0;BYTES-1],&mut out).is_err());
++        assert!(assemble_ram_extent(&vec![0;9*BYTES],&mut out).is_err());
++        let first=(BINS-544)*8;let mut raw=vec![0;3*BYTES];
++        for j in 0..2{raw[first+j*BYTES..first+(j+1)*BYTES].fill(j as u8+1);}
++        assert_eq!(assemble_ram_extent(&raw,&mut out).unwrap(),2);
++        assert!(out[0].iter().all(|b|*b==1));assert!(out[1].iter().all(|b|*b==2));
++        // A fresh call has no preceding suffix, even at the same slot indices.
++        assert_eq!(assemble_ram_extent(&vec![0;BYTES],&mut out).unwrap(),0);
++    }
++    #[test]fn ram_series_is_transactional_and_requires_current_full_completion(){
++        struct Mock(Vec<u8>);
++        impl CompletedDma for Mock{fn copy_slot(&self,s:usize,out:&mut[u8])->Result<(),String>{out.copy_from_slice(&self.0[s*BYTES..(s+1)*BYTES]);Ok(())}}
++        let mut raw=vec![0;8*BYTES];let first=(BINS-544)*8;
++        for seq in 1..=7u64{
++            let mut b=fixture("seq-0");
++            for (offset,v) in [(8,seq),(24,seq*8333)]{for (j,h) in v.to_le_bytes().chunks_exact(2).enumerate(){b[(offset/2+j)*8+6..(offset/2+j)*8+8].copy_from_slice(h);}}
++            raw[first+(seq as usize-1)*BYTES..first+seq as usize*BYTES].copy_from_slice(&b);
++        }
++        let dma=Mock(raw);let mut scratch=vec![0;8*BYTES];let mut copied=vec![vec![0;BYTES];8];
++        let a=Adapter::new(vec![(7,1)],1).unwrap();let order=crate::observation_live::Order::default();
++        let done=Complete{recorded:8,lost:0,first_slot:0,last_seq:7};
++        drain_ram(&dma,done,&mut scratch,&mut copied,&a,&order).unwrap();
++        assert_eq!(validate(&copied[0]).unwrap().seq,1);assert_eq!(validate(&copied[6]).unwrap().seq,7);
++        let bad=Complete{last_seq:8,..done};assert!(drain_ram(&dma,bad,&mut scratch,&mut copied,&a,&order).is_err());
++        let wrap=Complete{first_slot:7,..done};assert!(drain_ram(&dma,wrap,&mut scratch,&mut copied,&a,&order).is_err());
++        let loss=Complete{recorded:7,lost:1,..done};assert!(drain_ram(&dma,loss,&mut scratch,&mut copied,&a,&order).is_err());
++        let mut corrupt=dma;corrupt.0[first+3*BYTES+6]^=1;
++        assert!(drain_ram(&corrupt,done,&mut scratch,&mut copied,&a,&order).is_err());
++    }
+     #[test]fn native_owner_ignores_proc_aliases_but_keeps_other_pid(){
+         use std::ffi::OsStr;
+         for name in ["self","thread-self","net","42","0"]{assert!(!is_other_process(OsStr::new(name),42),"{name}");}
+diff --git a/maia-httpd/src/native_runtime.rs b/maia-httpd/src/native_runtime.rs
+index e862937..bbd6418 100644
+--- a/maia-httpd/src/native_runtime.rs
++++ b/maia-httpd/src/native_runtime.rs
+@@ -3,6 +3,7 @@
+ use crate::{app::AppState,native_observation::{self as native,Adapter,Series,Snapshot},observation::{Observation,NO_TAG},observation_live::{Encoder,Fanout,Order},observation_transport::Server};
+ use anyhow::{Result,bail,ensure};
+ use serde::Deserialize;
++use crate::observation_accumulator::Accumulator;
+ use std::{fs::{File,OpenOptions},io::Write,net::SocketAddr,os::fd::AsRawFd,path::Path,sync::{Arc,atomic::Ordering},time::{Duration,Instant}};
+ 
+ #[derive(Debug,Deserialize)]
+@@ -19,6 +20,10 @@ pub struct Config{
+     pub bind:SocketAddr,
+     pub diagnostic_after_series:Option<u64>,
+     pub diagnostic_next_epoch:Option<u64>,
++    #[serde(default)]
++    pub ram_load_test:bool,
++    pub accumulate_windows:Option<u32>,
++    pub derived_capture_id:Option<String>,
+ }
+ fn uuid(s:&str)->Result<[u8;16]>{
+     let s=s.replace('-',"");ensure!(s.len()==32 && s.is_ascii(),"UUID format");let mut id=[0;16];for (i,x) in id.iter_mut().enumerate(){*x=u8::from_str_radix(&s[2*i..2*i+2],16)?;}ensure!(id!=[0;16],"zero UUID");Ok(id)
+@@ -30,6 +35,12 @@ impl Config{
+         ensure!(self.externally_settled,"operator must establish static RF settling before asserting validity");
+         ensure!(self.sample_rate>0 && self.rx_lo_hz>0 && self.epoch!=0 && (1..=8).contains(&self.series_windows),"native static profile parameters");
+         ensure!(self.run_seconds.is_finite() && (0.01..=240.).contains(&self.run_seconds),"source duration must be <=240 seconds");
++        ensure!(!self.ram_load_test || self.series_windows==8,"RAM-load test requires full eight-window series");
++        match(self.accumulate_windows,&self.derived_capture_id){
++            (None,None)=>{},
++            (Some(n),Some(id)) if (1..=65536).contains(&n)=>{ensure!(uuid(id)?!=uuid(&self.capture_id)?,"derived capture UUID must differ from raw source UUID");},
++            _=>bail!("avg/peak requires explicit accumulate_windows and a separate derived_capture_id"),
++        }
+         match (self.diagnostic_after_series,self.diagnostic_next_epoch){(None,None)=>{},(Some(n),Some(e)) if n>0 && e!=0 && e!=self.epoch=>{},_=>bail!("diagnostic requires one distinct next epoch and a positive series boundary")}
+         Ok(())
+     }
+@@ -53,7 +64,7 @@ impl Guard{
+         writeln!(f,"OBN1-r1 capture={} coordinated_boot={}",c.capture_id,c.coordinated_boot_id)?;f.sync_all()?;Ok(())
+     }
+ }
+-pub struct Runtime{state:AppState,config:Config,_guard:Guard,adapter:Adapter,encoder:Encoder,q:Arc<Fanout>,server:Server}
++pub struct Runtime{state:AppState,config:Config,_guard:Guard,adapter:Adapter,encoder:Encoder,q:Arc<Fanout>,server:Server,accumulator:Option<Accumulator>}
+ impl std::fmt::Debug for Runtime{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("NativeRuntime").field("config",&self.config).finish_non_exhaustive()}}
+ impl Runtime{
+     pub async fn new(state:AppState,c:Config,guard:Guard)->Result<Self>{
+@@ -63,20 +74,28 @@ impl Runtime{
+         let mut contexts=vec![(c.epoch,1)];let mut ds=vec![Adapter::descriptor(1,3,c.sample_rate as f64,c.rx_lo_hz as f64)];
+         if let Some(epoch)=c.diagnostic_next_epoch{contexts.push((epoch,2));ds.push(Adapter::descriptor(2,3,c.sample_rate as f64,c.rx_lo_hz as f64));}
+         let adapter=Adapter::new(contexts,1).map_err(anyhow::Error::msg)?;
+-        let encoder=Encoder::new_nint1(uuid(&c.capture_id)?,ds).map_err(anyhow::Error::msg)?;
++        let accumulator=c.accumulate_windows.map(|n|Accumulator::new(n,ds.clone())).transpose().map_err(anyhow::Error::msg)?;
++        let encoder=if let Some(a)=&accumulator{Encoder::new(uuid(c.derived_capture_id.as_ref().unwrap())?,a.output_descriptors())}else{Encoder::new_nint1(uuid(&c.capture_id)?,ds)}.map_err(anyhow::Error::msg)?;
+         let q=Arc::new(Fanout::new(8,encoder.max_record()).map_err(anyhow::Error::msg)?);
+         let server=Server::bind(c.bind,q.clone(),encoder.header().to_vec(),encoder.max_record(),2)?;
+         guard.claim(&c)?;
+         state.ip_core().lock().unwrap().native_invalid();
+-        tracing::info!(abi="OBN1-r1",expected_pl_commit="370d03a02fface2a287d8d7cafb6cee7422217ee",capture=%c.capture_id,boot=%c.coordinated_boot_id,fs=c.sample_rate,lo=c.rx_lo_hz,enbw=native::ENBW,address=%server.address()?,"native hardware source READY; static raw input, external settling assertion, not RF calibration");
+-        Ok(Self{state,config:c,_guard:guard,adapter,encoder,q,server})
++        tracing::info!(abi="OBN1-r1",expected_pl_commit="370d03a02fface2a287d8d7cafb6cee7422217ee",capture=%c.capture_id,derived_capture=?c.derived_capture_id,accumulate_windows=?c.accumulate_windows,ram_load_test=c.ram_load_test,boot=%c.coordinated_boot_id,fs=c.sample_rate,lo=c.rx_lo_hz,enbw=native::ENBW,address=%server.address()?,"native hardware source READY; static raw input, external settling assertion, not RF calibration");
++        Ok(Self{state,config:c,_guard:guard,adapter,encoder,q,server,accumulator})
+     }
+     fn snapshot(&self)->Snapshot{self.state.ip_core().lock().unwrap().native_snapshot()}
+     pub async fn run(mut self)->Result<()>{
++        let result=self.run_inner().await;
++        if let Err(error)=&result{tracing::error!(%error,"native acquisition failed; logging before source teardown");}
++        result
++    }
++    async fn run_inner(&mut self)->Result<()>{
+         let mut copied:Vec<Vec<u8>>=(0..8).map(|_|vec![0;native::BYTES]).collect();
++        let mut ram=if self.config.ram_load_test{vec![0;8*native::BYTES]}else{Vec::new()};
+         let mut observation=Observation{descriptor_id:1,seq:0,epoch:0,first_tick:0,nint:1,tag:NO_TAG,power:vec![0.;native::BINS]};
++        let mut reduced=Observation{descriptor_id:1,seq:0,epoch:0,first_tick:0,nint:1,tag:NO_TAG,power:Vec::with_capacity(if self.accumulator.is_some(){2*native::BINS}else{0})};
+         let mut frame=Vec::with_capacity(self.encoder.max_record());let mut source_order=Order::default();
+-        let start=Instant::now();let mut base=self.snapshot();let initial=base;let mut series_count=0u64;let mut recorded=0u64;let mut lost=0u64;
++        let start=Instant::now();let mut base=self.snapshot();let initial=base;let mut series_count=0u64;let mut recorded=0u64;let mut lost=0u64;let mut ram_edges=0u64;let mut decoded=0u64;let mut output_records=0u64;
+         loop{
+             self.server.poll_accept()?;
+             let epoch=if self.config.diagnostic_after_series.is_some_and(|n|series_count>=n){self.config.diagnostic_next_epoch.unwrap()}else{self.config.epoch};
+@@ -94,19 +113,33 @@ impl Runtime{
+                 tokio::time::sleep(Duration::from_millis(1)).await;
+             };
+             // Never re-arm until ALL previous records have been invalidated/copied.
+-            let checked={let core=self.state.ip_core().lock().unwrap();native::drain(&*core,complete,&mut copied,&self.adapter,&source_order).map_err(anyhow::Error::msg)?};
++            let checked={let core=self.state.ip_core().lock().unwrap();
++                if self.config.ram_load_test{native::drain_ram(&*core,complete,&mut ram,&mut copied,&self.adapter,&source_order)}
++                else{native::drain(&*core,complete,&mut copied,&self.adapter,&source_order)}
++            }.map_err(anyhow::Error::msg)?;
+             let after=self.snapshot();ensure!(next.completion_eq(&after),"DMA completion changed while draining; competing owner/reset");
+             source_order=checked;
+-            for bytes in copied.iter().take(complete.recorded as usize){
++            let count=if self.config.ram_load_test{ram_edges+=1;7}else{complete.recorded as usize};
++            for bytes in copied.iter().take(count){
+                 self.adapter.convert(bytes,&mut observation).map_err(anyhow::Error::msg)?;
+-                self.encoder.observation(&observation,&mut frame).map_err(anyhow::Error::msg)?;
+-                self.q.publish(&frame).map_err(anyhow::Error::msg)?;
++                decoded+=1;
++                if let Some(a)=self.accumulator.as_mut(){
++                    if a.push(&observation,&mut reduced).map_err(anyhow::Error::msg)?{
++                        self.encoder.observation(&reduced,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
++                    }
++                }else{
++                    self.encoder.observation(&observation,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
++                }
+             }
+             series_count+=1;recorded+=complete.recorded as u64;lost+=complete.lost as u64;base=after;
+             if series_count==1 || series_count%1000==0{tracing::info!(series=series_count,native_recorded=recorded,native_lost=lost,last_seq=base.last_seq,"native bounded acquisition");}
+             if start.elapsed().as_secs_f64()>=self.config.run_seconds{break;}
+         }
+         self.state.ip_core().lock().unwrap().native_invalid();
++        if let Some(a)=self.accumulator.as_mut(){if a.finish(&mut reduced).map_err(anyhow::Error::msg)?{
++            self.encoder.observation(&reduced,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
++        }}
++        tracing::info!(native_decoded=decoded,ram_edge_records=ram_edges,ram_edge_bytes=ram_edges*native::BYTES as u64,ram_copy_capacity=ram.len(),accumulator_bytes=self.accumulator.as_ref().map(|a|a.storage_bytes()).unwrap_or(0),reduced_power_capacity=reduced.power.capacity(),output_records,accumulator=?self.accumulator.as_ref().map(|a|&a.stats),"native input/reduction accounting; RAM edge exclusion is not native lost");
+         let net=self.server.finish();
+         tracing::info!(series=series_count,produced_delta=base.produced.wrapping_sub(initial.produced),selected=recorded+lost,native_recorded=recorded,native_lost=lost,published=self.q.published(),contention_drops=self.q.contention_drops.load(Ordering::Relaxed),client_missed=net.missed,sent=net.sent,sender_errors=net.errors,partial_disconnects=net.partial_disconnects,queue_capacity=self.q.allocated_payload_bytes(),native_copy_capacity=8*native::BYTES,power_capacity=observation.power.capacity(),frame_capacity=frame.capacity(),elapsed=start.elapsed().as_secs_f64(),"native source stopped; retained lifetime marker requires coordinated new boot for another capture");
+         Ok(())
+@@ -114,3 +147,24 @@ impl Runtime{
+ }
+ impl native::CompletedDma for crate::fpga::IpCore{fn copy_slot(&self,slot:usize,out:&mut[u8])->Result<(),String>{self.native_copy(slot,out).map_err(|e|e.to_string())}}
+ impl Drop for Runtime{fn drop(&mut self){if let Ok(core)=self.state.ip_core().lock(){core.native_invalid();tracing::info!(snapshot=?core.native_snapshot(),"native validity disabled; no SDR-only reset attempted");}}}
++
++#[cfg(test)]
++mod tests{
++    use super::*;
++    fn config()->Config{serde_json::from_value(serde_json::json!({
++        "capture_id":"11111111-1111-4111-8111-111111111111",
++        "coordinated_boot_id":"22222222-2222-4222-8222-222222222222",
++        "externally_settled":true,"sample_rate":30720000,"rx_lo_hz":2400000000u64,
++        "epoch":7,"series_windows":8,"run_seconds":90.,"bind":"0.0.0.0:8765"
++    })).unwrap()}
++    #[test]fn default_is_uncompensated_single_and_ram_requires_full_series(){
++        let mut c=config();c.validate().unwrap();assert!(!c.ram_load_test);assert!(c.accumulate_windows.is_none());
++        c.ram_load_test=true;c.series_windows=7;assert!(c.validate().is_err());c.series_windows=8;c.validate().unwrap();
++    }
++    #[test]fn explicit_accumulation_has_separate_identity_and_bounded_target(){
++        let mut c=config();c.accumulate_windows=Some(4);assert!(c.validate().is_err());
++        c.derived_capture_id=Some(c.capture_id.clone());assert!(c.validate().is_err());
++        c.derived_capture_id=Some("33333333-3333-4333-8333-333333333333".into());c.validate().unwrap();
++        for n in [0,65537]{c.accumulate_windows=Some(n);assert!(c.validate().is_err());}
++    }
++}
+diff --git a/maia-httpd/src/observation.rs b/maia-httpd/src/observation.rs
+index 50d650d..d4efecb 100644
+--- a/maia-httpd/src/observation.rs
++++ b/maia-httpd/src/observation.rs
+@@ -33,7 +33,8 @@ pub struct Descriptor {
+ pub struct Observation {
+     /// Immutable descriptor reference, not the current receiver configuration.
+     pub descriptor_id: u16,
+-    /// Capture-scoped producer sequence, starting at zero; never reassigned on replay.
++    /// Capture-scoped producer sequence; native retains the hardware counter.
++    /// Derived avg/peak starts at zero in its own capture, never reassigned on replay.
+     pub seq: u64,
+     /// RF visit/state epoch; zero means unattributed, not clean new-epoch data.
+     pub epoch: u64,
+diff --git a/maia-httpd/src/observation_accumulator.rs b/maia-httpd/src/observation_accumulator.rs
+new file mode 100644
+index 0000000..fba4df7
+--- /dev/null
++++ b/maia-httpd/src/observation_accumulator.rs
+@@ -0,0 +1,109 @@
++//! Bounded reduction of normalized nint=1 observations. No level conversion.
++#![allow(missing_docs)]
++use crate::observation::{self,Descriptor,Observation,NO_TAG};
++use crate::observation_live::Order;
++
++#[derive(Default,Debug)]
++pub struct Stats{pub inputs:u64,pub accepted:u64,pub unusable:u64,pub input_gaps:u64,pub groups:u64,pub partial_groups:u64,pub contributing_ffts:u64}
++pub struct Accumulator{
++    descriptors:Vec<Descriptor>,target:u32,sum:Vec<f64>,peak:Vec<f32>,count:u32,
++    id:u16,epoch:u64,first_tick:u64,bins:usize,last_seq:Option<u64>,order:Order,
++    next_seq:u64,pub stats:Stats,
++}
++impl Accumulator{
++    pub fn new(target:u32,descriptors:Vec<Descriptor>)->Result<Self,String>{
++        if !(1..=65536).contains(&target) || descriptors.is_empty() || descriptors.len()>16{return Err("accumulation bounds".into());}
++        let mut max=0;
++        for (i,d) in descriptors.iter().enumerate(){
++            observation::descriptor_ok(d)?;
++            if d.mode!=1 || d.source==2 || d.tick_hz==0 || descriptors[..i].iter().any(|p|p.id==d.id){return Err("accumulator requires immutable normalized single-plane source descriptors".into());}
++            max=max.max(d.bins as usize);
++        }
++        Ok(Self{descriptors,target,sum:vec![0.;max],peak:vec![0.;max],count:0,id:0,epoch:0,first_tick:0,bins:0,last_seq:None,order:Order::default(),next_seq:0,stats:Stats::default()})
++    }
++    pub fn output_descriptors(&self)->Vec<Descriptor>{self.descriptors.iter().cloned().map(|mut d|{d.mode=3;d}).collect()}
++    pub fn storage_bytes(&self)->usize{self.sum.capacity()*8+self.peak.capacity()*4}
++    /// At most one output per input: after a boundary a new group has one FFT;
++    /// for target=1 there cannot be a pending previous group.
++    pub fn push(&mut self,o:&Observation,out:&mut Observation)->Result<bool,String>{
++        let d=self.descriptors.iter().find(|d|d.id==o.descriptor_id).ok_or("unknown accumulator descriptor")?;
++        observation::observation_ok(o,d)?;
++        if o.nint!=1{return Err("accumulator accepts nint=1 only".into());}
++        let bins=d.bins as usize;
++        let mut checked=self.order.clone();checked.accept(o.seq,o.epoch,o.descriptor_id,o.first_tick)?;
++        let gap=self.last_seq.is_some_and(|last|last.checked_add(1)!=Some(o.seq));
++        if let Some(last)=self.last_seq{self.stats.input_gaps+=o.seq-last-1;}
++        self.order=checked;self.last_seq=Some(o.seq);self.stats.inputs+=1;
++        let usable=o.epoch!=0 && o.power.iter().all(|p|p.is_finite());
++        let boundary=gap || !usable || self.id!=o.descriptor_id || self.epoch!=o.epoch;
++        let mut emitted=if boundary{self.finish(out)?}else{false};
++        if !usable{self.stats.unusable+=1;return Ok(emitted);}
++        if self.count==0{
++            self.id=o.descriptor_id;self.epoch=o.epoch;self.first_tick=o.first_tick;self.bins=bins;
++            self.sum[..bins].fill(0.);self.peak[..bins].fill(0.);
++        }
++        for (j,p) in o.power.iter().enumerate(){self.sum[j]+=*p as f64;self.peak[j]=self.peak[j].max(*p);}
++        self.count+=1;self.stats.accepted+=1;
++        if self.count==self.target{debug_assert!(!emitted);emitted=self.finish(out)?;}
++        Ok(emitted)
++    }
++    pub fn finish(&mut self,out:&mut Observation)->Result<bool,String>{
++        if self.count==0{return Ok(false);}
++        let next=self.next_seq.checked_add(1).ok_or("derived sequence exhausted; allocate new capture")?;
++        out.descriptor_id=self.id;out.seq=self.next_seq;out.epoch=self.epoch;out.first_tick=self.first_tick;out.nint=self.count;out.tag=NO_TAG;
++        out.power.resize(2*self.bins,0.);
++        for j in 0..self.bins{out.power[j]=(self.sum[j]/self.count as f64) as f32;out.power[self.bins+j]=self.peak[j];}
++        self.stats.groups+=1;self.stats.partial_groups+=u64::from(self.count<self.target);self.stats.contributing_ffts+=self.count as u64;
++        self.count=0;self.next_seq=next;Ok(true)
++    }
++}
++
++#[cfg(test)]
++mod tests{
++    use super::*;
++    fn desc(id:u16,source:u16)->Descriptor{Descriptor{id,sample_rate:8.,bin0_hz:10.,enbw_bins:1.,tick_hz:100,bins:2,mode:1,source}}
++    fn frame(seq:u64,epoch:u64,id:u16,p:[f32;2])->Observation{Observation{descriptor_id:id,seq,epoch,first_tick:seq*25,nint:1,tag:NO_TAG,power:p.to_vec()}}
++    fn output()->Observation{frame(0,0,1,[0.,0.])}
++    #[test]fn mean_and_true_peak_same_windows(){
++        let mut a=Accumulator::new(3,vec![desc(1,3)]).unwrap();let mut out=output();
++        assert!(!a.push(&frame(0,7,1,[1.,4.]),&mut out).unwrap());
++        assert!(!a.push(&frame(1,7,1,[100.,1.]),&mut out).unwrap());
++        assert!(a.push(&frame(2,7,1,[4.,7.]),&mut out).unwrap());
++        assert_eq!(out.power,vec![35.,4.,100.,7.]);assert_eq!((out.seq,out.nint,out.epoch,out.first_tick),(0,3,7,0));
++        if let Ok(dir)=std::env::var("OBS_NATIVE_OUTPUT_DIR"){
++            let mut e=crate::observation_live::Encoder::new([0x55;16],a.output_descriptors()).unwrap();
++            let mut wire=Vec::new();e.observation(&out,&mut wire).unwrap();
++            let mut bytes=e.header().to_vec();bytes.extend_from_slice(&wire);
++            std::fs::write(std::path::Path::new(&dir).join("avg-peak.gobs"),bytes).unwrap();
++        }
++        assert_eq!(a.stats.contributing_ffts,3);assert!(!a.finish(&mut out).unwrap());
++    }
++    #[test]fn gaps_dirty_epoch_descriptor_source_and_final_partial(){
++        let mut a=Accumulator::new(4,vec![desc(1,3),desc(2,1)]).unwrap();let mut out=output();
++        a.push(&frame(10,7,1,[1.,3.]),&mut out).unwrap();
++        assert!(a.push(&frame(12,7,1,[2.,4.]),&mut out).unwrap());assert_eq!((out.nint,out.first_tick),(1,250));
++        assert!(a.push(&frame(13,0,1,[99.,99.]),&mut out).unwrap());assert_eq!((out.seq,out.nint),(1,1));
++        assert!(!a.push(&frame(14,8,1,[6.,8.]),&mut out).unwrap());
++        assert!(a.push(&frame(15,9,2,[9.,10.]),&mut out).unwrap());assert_eq!((out.epoch,out.nint),(8,1));
++        assert!(a.finish(&mut out).unwrap());assert_eq!((out.descriptor_id,out.seq,out.nint),(2,3,1));
++        assert_eq!((a.stats.inputs,a.stats.accepted,a.stats.unusable,a.stats.input_gaps),(5,4,1,1));
++    }
++    #[test]fn explicit_one_window_duplicates_invalid_input_and_bounded_storage(){
++        let mut a=Accumulator::new(1,vec![desc(1,3)]).unwrap();let mut out=output();let storage=a.storage_bytes();
++        for seq in 0..10000{assert!(a.push(&frame(seq,7,1,[seq as f32,1.]),&mut out).unwrap());assert_eq!(out.nint,1);}
++        assert_eq!(a.storage_bytes(),storage);assert!(a.push(&frame(9999,7,1,[1.,1.]),&mut out).is_err());
++        let mut bad=frame(10000,7,1,[1.,1.]);bad.nint=2;assert!(a.push(&bad,&mut out).is_err());
++        assert_eq!(a.stats.groups,10000);assert!(Accumulator::new(0,vec![desc(1,3)]).is_err());
++    }
++    #[test]fn nan_window_ends_group_and_source_end_flushes(){
++        let mut a=Accumulator::new(4,vec![desc(1,3)]).unwrap();let mut out=output();
++        a.push(&frame(0,7,1,[2.,8.]),&mut out).unwrap();
++        assert!(a.push(&frame(1,7,1,[f32::NAN,5.]),&mut out).unwrap());
++        assert_eq!(out.nint,1);assert_eq!(out.power,vec![2.,8.,2.,8.]);
++        assert!(!a.finish(&mut output()).unwrap());assert_eq!(a.stats.unusable,1);
++        // A source lifetime is an accumulator instance; finish before replacement.
++        let mut next=Accumulator::new(4,vec![desc(1,3)]).unwrap();
++        next.push(&frame(0,9,1,[5.,6.]),&mut out).unwrap();
++        assert!(next.finish(&mut out).unwrap());assert_eq!((out.seq,out.epoch,out.nint),(0,9,1));
++    }
++}

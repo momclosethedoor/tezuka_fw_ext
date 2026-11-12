@@ -71,12 +71,22 @@ if arm_only:
     config_path=artifact/'native-config-example.json';config_path.write_text(json.dumps(config,indent=2)+'\n')
     smoke=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(config_path)],text=True,timeout=20)
     check('no hardware access' in smoke,'Offline ARM native config check did not complete')
-    bad=dict(config,externally_settled=False)
+    avg=dict(config,ram_load_test=True,accumulate_windows=4,derived_capture_id='33333333-3333-4333-8333-333333333333')
+    avg_path=artifact/'native-avg-peak-example.json';avg_path.write_text(json.dumps(avg,indent=2)+'\n')
+    avg_smoke=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(avg_path)],text=True,timeout=20)
+    check('no hardware access' in avg_smoke,'Offline ARM avg/peak config check did not complete')
+    invalid=[(dict(config,externally_settled=False),'settling'),
+             (dict(avg,series_windows=7),'eight-window'),
+             (dict(avg,derived_capture_id=config['capture_id']),'UUID'),
+             (dict(avg,accumulate_windows=0),'avg/peak'),
+             (dict(config,accumulate_windows=4),'avg/peak')]
     with tempfile.TemporaryDirectory() as tmp:
-        path=pathlib.Path(tmp)/'invalid.json';path.write_text(json.dumps(bad))
-        r=subprocess.run(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(path)],capture_output=True,text=True,timeout=20)
-        check(r.returncode!=0 and 'settling' in r.stderr,'Unsafe native config was not rejected')
-    (artifact/'native-arm-offline-check.txt').write_text(smoke+'\nNegative unset-settling case rejected. No hardware accessed.\n')
+        path=pathlib.Path(tmp)/'invalid.json'
+        for bad,reason in invalid:
+            path.write_text(json.dumps(bad))
+            r=subprocess.run(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(path)],capture_output=True,text=True,timeout=20)
+            check(r.returncode!=0 and reason in r.stderr,'Unsafe native config was not rejected: '+reason)
+    (artifact/'native-arm-offline-check.txt').write_text(smoke+'\n'+avg_smoke+'\nFive negative native/avg-peak cases rejected. No hardware accessed.\n')
     common['native_abi']={'id':'OBN1-r1','pl_commit':'370d03a02fface2a287d8d7cafb6cee7422217ee','pl_bit_sha256':'311b49bc1d82646ad2f73d33ff475b304318b0e4b0d9049b83f31b087a6b19f9','pl_bin_sha256':'089e9227e72593c546821ca79711caf46246fecff074f741925b7c783ed6ad12','abi_document_sha256':sha(ROOT/'doc/OBN1-ABI-r1.md'),'arm_qemu_offline_config_check':True,'hardware_accepted':False}
     common['synthetic_exerciser']={'sha256':sha(synthetic),'source':'explicit synthetic; not installed or automatically started','interpreter':synthetic_interp,'needed':re.findall(r'Shared library: \[(.*?)\]',synth_info)}
     (artifact/'manifest.json').write_text(json.dumps(common,indent=2)+'\n')

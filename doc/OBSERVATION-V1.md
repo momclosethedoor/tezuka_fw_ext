@@ -424,6 +424,103 @@ remaining limitations and possible small follow-up fixes are documented, not
 implemented in this no-rebuild repeat. No new real8 CLI/DDC source profile was
 added, and no marker was removed to bypass source lifetime checks.
 
+## OBS-004: explicit RAM instrumentation and derived avg/peak
+
+Implementation is prepared; local Python/host checks passed. **Changed Rust has
+not been compiled/executed on Pentium; no new ARM-only CI or hardware acceptance
+was run.** See [OBS-004](OBS-004.md) for the exact scope and continuation.
+Earlier software/hardware results above describe their historical versions.
+
+Gleb's 2026-11-12 clarification: the 544-word displacement occurs **only during
+RAM bitstream loading**; normal full programming has no displacement. This is an
+explicit project decision, not a new measurement by this software slice. OBN1-r1,
+GOBS1, normalization, bin order and installed system requirements stay unchanged.
+The default native path applies **no** compensation.
+
+`ram_load_test: true` explicitly selects the instrumental adapter before the
+strict native parser and requires `series_windows: 8`. Only a completed stable
+eight-slot, loss-free series starting at physical slot zero is supported here.
+All slots are cache-invalidated/copied before rearm; completion is rechecked.
+Records start at byte `(4096-544)*8 = 28416` in the contiguous eight-slot copy.
+Exactly seven whole records fit; the prefix and suffix (32768 bytes total) are
+excluded as one `ram_edge_records` per series, **separate from native lost**.
+The strict headers/order/context and final hardware last_seq must match for the
+whole series before publication. No suffix is retained between series and no
+ring-end/ring-start concatenation is attempted. Any incompatible completion or
+invalid record fails explicitly, without reset/fallback. Two accepted real
+records reproduce exactly with the Python counterpart; multiple live rearm
+cycles with the new ARM implementation remain NOT RUN.
+
+Native acquisition uses completion counters. `App::run` does not start the legacy
+IRQ reader or recorder-finish waiter in native mode. Native failures are logged
+inside Runtime before its Drop/transport teardown; bounded sender draining still
+has the existing 15-second limit. Normal/error exit and absence of uio_read hangs
+must be verified on the new ELF. Lifetime/boot/owner checks remain enabled.
+
+Accumulation configuration is independent of dwell, settling, selection rate
+and rendering rate:
+
+- Omit both `accumulate_windows` and `derived_capture_id` for the original raw
+  single-plane nint=1 stream, with its hardware seq/capture namespace.
+- Set explicit `accumulate_windows` in 1..65536 AND a nonzero
+  `derived_capture_id` different from `capture_id` for avg+peak. Target 1 still
+  produces paired planes; raw single-plane mode remains available separately.
+- Input is already normalized linear power, one FFT per observation. Accumulate
+  float64 sums and float32 maxima over exactly the same usable FFTs; output mean
+  rounded to float32, then peak. No additional normalization or K(Fs).
+- Seq gap, epoch/descriptor/grid/source change or unusable window ends a group.
+  Emit a nonempty partial group with its true nint, then start anew; exclude the
+  unusable window entirely. Epoch0 or any invalid-bin NaN makes the entire window
+  unusable for clean aggregation. Normal source end flushes a partial group.
+  Duplicate/out-of-order/reset input is rejected, not averaged again. A malformed
+  descriptor rebind within one epoch remains a contract error.
+- A source lifetime owns one accumulator and immutable descriptors (at most16).
+  On source replacement flush the old group and allocate a new accumulator,
+  encoder and derived capture UUID. Runtime currently has one static source;
+  there is no hot replacement/recovery protocol. Fatal acquisition errors are
+  fail-stop and may abandon a pending partial group, never fabricate its inputs.
+
+**Derived identity uses the existing wire contract:** GOBS capture UUID is the
+explicit derived_capture_id; seq is the ordinal of an emitted group starting at0
+before any output drops. It is not the first raw seq. `(capture UUID, seq)` cannot
+collide with raw identities. Mode3 is mean[N] then peak[N] in **one** observation.
+Source provenance is inherited (hardware stays source3, synthetic stays source1),
+not asserted from delivery. Epoch, descriptor grid and first_tick come from the
+first contributing raw observation and are shared by every included window.
+nint is the actual consecutive count. Config/READY log records raw-parent UUID,
+derived UUID and target; no parent ID or raw seq range is added to the wire.
+Changing the target requires a new derived source lifetime/UUID. No ABI extension
+or legacy waterfall converter is introduced.
+
+Storage is O(max bins): one reusable sum/peak pair, reused input/output and frame
+buffers, fixed eight-record fanout, at most two sender buffers. No group history
+or per-FFT vector collection. `native_recorded`, `native_lost`, `ram_edge_records`,
+decoded/usable windows, raw seq gaps, output groups/contention drops and individual
+client gaps remain separate. Raw seq gaps may include **unselected** FFTs and RAM
+edges, so neither is a DMA-loss estimate; derived seq gaps count missed groups
+whose missing input volume is unknown without producer accounting.
+
+Existing `tools/observation/live.py --profile avg-peak` checks paired records and
+counts a group once (`observations`) plus its actual input volume
+(`contributing_ffts`). Default `--profile single` keeps strict nint=1 behavior.
+Optional `--host-rows-root C:/proj/goofy_v2 --row-ring-rows 64` calls the installed
+`GobsRows` bridge in the same instrumental receive loop, before advancing the
+borrowed reader payload. It appends precomputed rows directly to existing
+RowHistory, with only 10log10 for display: no Maia K(Fs), reaggregation or DC edit.
+Repeated last-ID presentation is ignored; conflicting/older IDs are rejected.
+Rows retain source-clock seconds; GUI wall-clock anchoring and the normal
+DeviceLink/Source selector are not connected in this slice. Existing type5/row
+storage limits are explicit: nint<=65535, N<=32768, gen<=u32, epoch<=i64::MAX;
+the full GOBS reader retains its original wider limits. No truncation workaround.
+Row callbacks/cursors are available, but classifier/GUI end-to-end acceptance is
+not claimed. The stock PL-5b path stays selected by the existing source settings.
+
+real8/DDC are preserved. Future OBS-005–007 preview dwell includes measured RF
+settling, synchronization and acquisition of **one field**. FFT detection requests
+longer visits on subsequent scan passes, then scanning continues; paired fields
+are not required. Selecting a preview needs only its signal bandwidth plus margin
+in the spectrum. None of those timings are set by accumulation nint or UI fps.
+
 ## Code rollback
 
 Native-only rollback can use local checkpoint `obs-003-streaming-accepted` /

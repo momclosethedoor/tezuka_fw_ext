@@ -21,9 +21,13 @@
     {
       "name": "0005-native-owner-proc-pids.patch",
       "sha256": "a04894f900cdbac28cfe59e82a1460f60384adbbbab29113ad8cba5674b805a1"
+    },
+    {
+      "name": "0006-native-ram-avg-peak.patch",
+      "sha256": "295748494dd8ff5cb63a5e7d1ddd57d286ed17c9022bd2ad924865712e6e43f7"
     }
   ],
-  "maia_httpd_tree_sha256": "b745d637cc356059fd1ad33d4472e5412947441526ec15eda999720ba2793c28",
+  "maia_httpd_tree_sha256": "3b8e9f176d6a2734334c752c183fa3574a8e91b34f98a27bb5ef7fa0b9885385",
   "files": {
     "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
     "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
@@ -48,7 +52,7 @@
     "maia-httpd/maia-pac/README.md": "2e7e058a1a9bc4b88a66cedd896c04dd76819b85588f15592885f5d926b15ea4",
     "maia-httpd/maia-pac/src/lib.rs": "715aa4e24917cff459ca5f272b963901f2da7bc40bfffb36466bf289541d78ef",
     "maia-httpd/maia-pac/svd/maia-sdr.svd": "f5b26a623c6c88cf1b24fb35606dcf3c627e05373b6b75cb77ed45ef1d32a085",
-    "maia-httpd/src/app.rs": "c76f1531fdf7385e2227a11e7632f63c849bcbee29519f9ac693507e2fed859d",
+    "maia-httpd/src/app.rs": "a4611e972c03a4d9327c2c3e0c142a563a594f8e490fdd808d470da4fa51d548",
     "maia-httpd/src/args.rs": "79c8be2f82166b7d03381923fe9d9d833fd88c60582c5eb9b19d6944455d9ec3",
     "maia-httpd/src/bin/gobs-synthetic.rs": "ebce57e7848eeb2370ec4a55ef74f07974677137cfd30f8fb6bf2d5e6e14568a",
     "maia-httpd/src/ddc.rs": "c4afe7a6187b3391acc12c0a4e173c02525a542687aff64930d4979d8de5ff84",
@@ -68,11 +72,12 @@
     "maia-httpd/src/httpd/websocket.rs": "fe19d50c53dd02d89ce88a14cfbb518c7bfc803cf907871c6edc6df86dfe73d0",
     "maia-httpd/src/httpd/zeros.rs": "6a500dff4d4f761bb332c0551459bb7228afc3598ad2fd67115d302d991eb3a9",
     "maia-httpd/src/iio.rs": "74df718b885d674ae3904327c634e1fff29aac3b844dafdda1b4ae05180b2f7c",
-    "maia-httpd/src/lib.rs": "e10efa17eadd483f79d6e20112baef32d0c16c1c3f40162b5ab3cbb5fcfa6391",
+    "maia-httpd/src/lib.rs": "3c93f4f275a4254ffb28077a16ae8e1bc884d6197c11d22eebfc99df1e6412d1",
     "maia-httpd/src/main.rs": "9b67313f5d8ef898d2e7ed103aef7434cd96f0a72391b7ce2bf2ee438cc1d859",
-    "maia-httpd/src/native_observation.rs": "570fd1c915d1113e1dc8db1086cb9306f6dbf8184d8b9843f9022acbca395412",
-    "maia-httpd/src/native_runtime.rs": "24d16925aa898486060c68ab1b778518ee2229426af330b727df6bad0e561488",
-    "maia-httpd/src/observation.rs": "72c01345ce6e5f2ab0e85c06394dd021a22fdcc740da1c2510938ccb98c496a9",
+    "maia-httpd/src/native_observation.rs": "53bd5945b41ddefbfbb94b1d588c126adec8fd62d659d3c7f7087a91960fb2c4",
+    "maia-httpd/src/native_runtime.rs": "220847e847b7d6654aa3a69295fdf31895ff816bd4454d6d5d599869d202c64e",
+    "maia-httpd/src/observation.rs": "b9515b8aa4d8ce4259487c62c5cd72cec9d1bb97e376d520982d2f1f345decec",
+    "maia-httpd/src/observation_accumulator.rs": "feb45902f6eafa99388aac131152f6ef8dce117dae09fc3c3f359c07f9e2c76a",
     "maia-httpd/src/observation_live.rs": "e1bf363f450f92dbce1eee9d43a5701aea708cc7c4760d26e4c63be619fed8e7",
     "maia-httpd/src/observation_transport.rs": "dd88e7664b0e5707b9bb6cec3ff99f8007d6fec00d7e39b29b595507fbbe37cf",
     "maia-httpd/src/rxbuffer.rs": "2c770250d68279396424ce12673a88f0e7682c76218bcefa95b7f5499576a2cf",

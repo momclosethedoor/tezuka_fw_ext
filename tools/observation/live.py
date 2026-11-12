@@ -82,10 +82,12 @@ class LiveReader:
     Epoch IDs are opaque. Epoch zero does not erase the last known epoch.
     Lifetime non-reuse/binding is a producer obligation; no historical epoch map.
     """
-    def __init__(self,stream,expected_source=None,nint1=False):
+    def __init__(self,stream,expected_source=None,nint1=False,avg_peak=False):
         self.reader=RecordReader(stream)
         self.expected_source=expected_source
         self.nint1=nint1
+        self.avg_peak=avg_peak
+        self.contributing_ffts=0
         self.first_seq=self.last_seq=self.tick=None
         self.epoch=0;self.descriptor=0
         self.observations=self.gaps=self.epoch_boundaries=self.unattributed=0
@@ -95,6 +97,7 @@ class LiveReader:
         d=self.reader.descriptors[f.descriptor_id]
         if self.expected_source is not None and d.source!=self.expected_source:raise ValueError('source provenance mismatch; no synthetic fallback')
         if self.nint1 and (d.mode==3 or f.nint!=1 or d.source==2 or d.tick_hz==0):raise ValueError('live nint=1 one-plane profile')
+        if self.avg_peak and (d.mode!=3 or d.source==2 or not d.tick_hz or not f.epoch or not f.nint):raise ValueError('live attributed avg+peak profile')
         if self.last_seq is not None and f.seq<=self.last_seq:raise ValueError('non-increasing live seq; reset needs new capture')
         if f.epoch and f.epoch==self.epoch and f.descriptor_id!=self.descriptor:raise ValueError('live epoch binding')
         if f.first_tick!=UNKNOWN and self.tick is not None and f.first_tick<self.tick:raise ValueError('source counter reset needs new capture')
@@ -106,11 +109,12 @@ class LiveReader:
         else:self.unattributed+=1
         if f.first_tick!=UNKNOWN:self.tick=f.first_tick
         self.last_seq=f.seq;self.observations+=1
+        self.contributing_ffts+=f.nint
         return f
     def summary(self):
         return dict(capture_id=self.reader.session.hex(),observations=self.observations,
                     first_seq=self.first_seq,last_seq=self.last_seq,gaps=self.gaps,
-                    epoch_boundaries=self.epoch_boundaries,unattributed=self.unattributed,
+                    epoch_boundaries=self.epoch_boundaries,unattributed=self.unattributed,contributing_ffts=self.contributing_ffts,
                     payload_buffer_bytes=len(self.reader.buffer),descriptors=len(self.reader.descriptors))
 
 def verify_synthetic(f,d,context_every,unclean_every):
@@ -125,6 +129,9 @@ def main():
     p=argparse.ArgumentParser(description='Headless GOBS1 live reader; hardware by default, never a fallback source')
     p.add_argument('--connect',required=True,help='host:port')
     p.add_argument('--expect-source',choices=['hardware','synthetic'],default='hardware')
+    p.add_argument('--profile',choices=['single','avg-peak'],default='single')
+    p.add_argument('--host-rows-root',help='optional existing goofy_v2 root; direct precomputed rows, no GUI/server')
+    p.add_argument('--row-ring-rows',type=int,default=64)
     p.add_argument('--read-delay-ms',type=float,default=0)
     p.add_argument('--seconds',type=float,default=240,help='maximum reader scenario duration, <=270')
     p.add_argument('--verify-synthetic',action='store_true')
@@ -135,21 +142,32 @@ def main():
     a=p.parse_args()
     if not 0<a.seconds<=270 or not 0<=a.read_delay_ms<=1000 or a.context_every<=0 or a.unclean_every<0:p.error('duration/delay/context bounds')
     if a.verify_synthetic and a.expect_source!='synthetic':p.error('synthetic oracle requires explicit synthetic provenance')
+    if not 2<=a.row_ring_rows<=4096:p.error('row ring bounds 2..4096')
+    if a.host_rows_root and (a.profile!='avg-peak' or a.expect_source!='hardware'):p.error('host row bridge requires hardware avg-peak profile')
     if a.pid_file:
         import pathlib
         pathlib.Path(a.pid_file).write_text(str(os.getpid()),encoding='ascii')
     host,port=a.connect.rsplit(':',1);start=time.monotonic();cpu=time.process_time()
     with socket.create_connection((host,int(port)),timeout=10) as s:
         s.settimeout(min(10,a.seconds))
-        r=LiveReader(s,expected_source=1 if a.expect_source=='synthetic' else 3,nint1=True)
+        r=LiveReader(s,expected_source=1 if a.expect_source=='synthetic' else 3,nint1=a.profile=='single',avg_peak=a.profile=='avg-peak')
+        bridge=None
+        if a.host_rows_root:
+            import sys
+            sys.path.insert(0,a.host_rows_root)
+            from sdr.dsp.rows import RowHistory
+            from sdr.source.gobs_rows import GobsRows
+            bridge=GobsRows(RowHistory(ring_rows=a.row_ring_rows),r.reader.session)
         while time.monotonic()-start<a.seconds:
             f=r.next()
             if f is None:break
             if a.verify_synthetic:verify_synthetic(f,r.reader.descriptors[f.descriptor_id],a.context_every,a.unclean_every)
+            if bridge:bridge.accept(f,r.reader.descriptors[f.descriptor_id],f.descriptor_id)
             if a.read_delay_ms:time.sleep(a.read_delay_ms/1000)
         else:raise TimeoutError('scenario duration limit')
     result=dict(r.summary(),source=a.expect_source,pid=os.getpid(),seconds=time.monotonic()-start,cpu_seconds=time.process_time()-cpu,
                 synthetic_oracle=a.verify_synthetic,read_delay_ms=a.read_delay_ms)
+    if bridge:result['host_rows']=dict(bridge.rows.status(),measurements=bridge.measurements,repeated=bridge.repeated)
     if a.output:
         import pathlib
         pathlib.Path(a.output).write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')

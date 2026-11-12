@@ -1,0 +1,54 @@
+--- a/sdr/dsp/rows.py
++++ b/sdr/dsp/rows.py
+@@ -347,6 +347,51 @@
+             self._w_cost_max = c
+         return closed
+ 
++    def append_precomputed(self, avg, peak, t_start: float, t_end: float,
++                           center_hz: float, fs: float, gen: int, epoch: int, nint: int) -> None:
++        """One normalized avg/peak group -> one row. No K(Fs), /nint or DC edit.
++
++        Caller deduplicates capture/sequence and supplies a stable generation.
++        Display conversion is 10*log10 only; source seconds are not wall time.
++        Explicit limits reflect existing host row storage/type-5 header widths.
++        """
++        n = len(avg)
++        if self.k:
++            raise ValueError('close legacy row before switching to GOBS source')
++        if (np.ndim(avg) != 1 or np.shape(peak) != (n,) or not 2 <= n <= 32768
++                or n & (n - 1) or not 1 <= nint <= 65535
++                or not 0 <= gen <= 0xffffffff or not 1 <= epoch <= 0x7fffffffffffffff
++                or not all(math.isfinite(v) for v in (t_start, t_end, center_hz, fs))
++                or t_end < t_start or fs <= 0
++                or not np.isfinite(avg).all() or not np.isfinite(peak).all()
++                or np.any(avg < 0) or np.any(peak < avg)):
++            raise ValueError('precomputed row metadata/power/host width')
++        if n != self.n:
++            self._alloc(n)
++        seq = self.head + 1
++        i = seq % self.R
++        mx, av = self.mx[i], self.avg[i]
++        for src, dst in ((peak, mx), (avg, av)):
++            np.maximum(src, _C_TINY, out=dst)
++            np.log10(dst, out=dst)
++            np.multiply(dst, _C_TEN, out=dst)
++        self.seq[i] = seq
++        self.t_start[i], self.t_end[i] = t_start, t_end
++        self.frames[i], self.center[i], self.fs[i] = nint, center_hz, fs
++        self.gen[i], self.epoch[i] = gen, epoch
++        self.head = seq
++        self.frames_total += nint
++        self._w_frames += nint
++        self._w_rows += 1
++        self.closed['precomputed'] = self.closed.get('precomputed', 0) + 1
++        if self.on_row is not None:
++            self.on_row(mx, av, seq, t_start, t_end, nint, (gen, epoch, center_hz, fs, n))
++        if self.out is not None:
++            self.out.emit(mx, av, seq, t_start, t_end, center_hz, fs, nint, gen)
++            self.out_seq, self.out_gen = seq, gen
++        if self.on_close is not None:
++            self.on_close()
++
+     def feed_lin(self, p: np.ndarray, k_db: float, t: float, center_hz: float, fs: float, gen: int,
+                  epoch: int) -> bool:
+         """Кадр линейной мощности p (float32[n], > 0; dBFS = 10·lg p + k_db) в открытую строку: максимум и сумма —
