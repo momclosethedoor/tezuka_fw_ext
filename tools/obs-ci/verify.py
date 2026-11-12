@@ -83,7 +83,7 @@ itb=(images/'pluto.itb').read_bytes(); check(frm.read_bytes()==itb+hashlib.md5(i
 gcc=out/'host/bin/arm-linux-gcc'
 manifest={'scope':'full firmware; packed rootfs and FIT verified','head_sha':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT'],'sources':metadata(src),'target':'armv7-unknown-linux-gnueabihf','rust':run('rustc','+1.94.0','-Vv'),'gcc':run(gcc,'--version'),'sysroot':run(gcc,'-print-sysroot').strip(),'interpreter':interp,'needed':needed,'libraries':{str(p.relative_to(out/'target')):sha(p) for p in seen},'components':{n:sha(images/n) for n in ['rootfs.cpio.xz','system_top.bit','system_top.bit.bin','Image.lzma','nano.dtb','pluto.itb','flash/pluto.frm']},'xsa_sha256':sha(xsa),'maia_sha256':sha(elf),'cargo_lock_sha256':sha(src/'maia-httpd/Cargo.lock'),'checks':'compiled; source fingerprint; rootfs equality; ARM hard float; loader/libs/versions; XSA; PL-5b; FIT payloads; FRM; size'}
 (artifact/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
-(artifact/'SHA256SUMS').write_text(sha(elf)+'  maia-httpd\n')
+(artifact/'SHA256SUMS').write_text(sha(elf)+'  maia-httpd\n'+sha(synthetic)+'  gobs-synthetic\n')
 (artifact/'elf.txt').write_text(header+program+attrs+dynamic)
 shutil.copyfile('maia-build.log',artifact/'maia-build.log')
 print(json.dumps(manifest,indent=2))

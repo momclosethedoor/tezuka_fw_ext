@@ -124,10 +124,10 @@ index 4c90930..50d650d 100644
      if d.source==2 {
 diff --git a/maia-httpd/src/observation_live.rs b/maia-httpd/src/observation_live.rs
 new file mode 100644
-index 0000000..e6a2ae5
+index 0000000..bb41aa5
 --- /dev/null
 +++ b/maia-httpd/src/observation_live.rs
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,168 @@
 +//! Bounded GOBS1 stream codec and fanout. No native PL/DMA ABI is assumed here.
 +//! Offline Capture remains separate: live delivery is strictly producer ordered.
 +#![allow(missing_docs)]
@@ -179,7 +179,8 @@ index 0000000..e6a2ae5
 +    pub fn new_nint1(session:[u8;16],descriptors:Vec<Descriptor>)->Result<Self,String>{let mut e=Self::new(session,descriptors)?;e.require_nint1_profile()?;e.nint1=true;Ok(e)}
 +    /// First integration profile; the generic codec also supports old golden mode 3.
 +    pub fn require_nint1_profile(&self)->Result<(),String>{
-+        if self.descriptors.iter().any(|d|d.mode==3 || d.source==2 || d.tick_hz==0){return Err("live source requires one plane and explicit source counter".into());}Ok(())
++        let first=&self.descriptors[0];
++        if self.descriptors.iter().any(|d|d.mode==3 || d.source==2 || d.tick_hz==0 || d.tick_hz!=first.tick_hz || d.source!=first.source){return Err("live source requires one plane, one provenance and one source clock domain".into());}Ok(())
 +    }
 +    pub fn header(&self)->&[u8]{&self.header}
 +    pub fn max_record(&self)->usize{self.max}
@@ -241,21 +242,21 @@ index 0000000..e6a2ae5
 +
 +struct Ring {slots:Vec<Vec<u8>>,head:u64}
 +/// Fixed slots; acquisition never waits for a reader or its socket.
-+pub struct Fanout {ring:Mutex<Ring>,pub contention_drops:AtomicU64,max:usize}
++pub struct Fanout {ring:Mutex<Ring>,head:AtomicU64,pub contention_drops:AtomicU64,max:usize}
 +/// One bounded subscriber cursor; ordinal is internal and never replaces source seq.
 +#[derive(Default)]
 +pub struct Cursor {next:u64,pub missed:u64}
 +impl Fanout{
 +    pub fn new(capacity:usize,max:usize)->Result<Self,String>{
 +        if !(1..=1024).contains(&capacity) || !(40..=MAX_RECORD).contains(&max) || capacity*max>16*1024*1024{return Err("queue bounds (16 MiB maximum payload slots)".into());}
-+        Ok(Self{ring:Mutex::new(Ring{slots:(0..capacity).map(|_|Vec::with_capacity(max)).collect(),head:0}),contention_drops:AtomicU64::new(0),max})
++        Ok(Self{ring:Mutex::new(Ring{slots:(0..capacity).map(|_|Vec::with_capacity(max)).collect(),head:0}),head:AtomicU64::new(0),contention_drops:AtomicU64::new(0),max})
 +    }
 +    pub fn publish(&self,frame:&[u8])->Result<bool,String>{
 +        if frame.len()>self.max || frame.len()<40 || u32v(frame,0) as usize!=frame.len() || u16v(frame,4)!=2{return Err("publish requires one complete observation".into());}
 +        let mut r=match self.ring.try_lock(){Ok(r)=>r,Err(TryLockError::WouldBlock)=>{self.contention_drops.fetch_add(1,Ordering::Relaxed);return Ok(false)},Err(_)=>return Err("poisoned ring".into())};
-+        let i=r.head as usize%r.slots.len();r.slots[i].clear();r.slots[i].extend_from_slice(frame);r.head=r.head.checked_add(1).ok_or("ring ordinal exhausted")?;Ok(true)
++        let i=r.head as usize%r.slots.len();r.slots[i].clear();r.slots[i].extend_from_slice(frame);r.head=r.head.checked_add(1).ok_or("ring ordinal exhausted")?;self.head.store(r.head,Ordering::Release);Ok(true)
 +    }
-+    pub fn subscribe(&self)->Cursor{Cursor{next:self.ring.lock().unwrap().head,missed:0}}
++    pub fn subscribe(&self)->Cursor{Cursor{next:self.head.load(Ordering::Acquire),missed:0}}
 +    /// Copy before socket I/O. No reference to an overwritten slot escapes the lock.
 +    pub fn poll(&self,c:&mut Cursor,out:&mut Vec<u8>)->bool{
 +        let r=self.ring.lock().unwrap();let oldest=r.head.saturating_sub(r.slots.len() as u64);
@@ -263,7 +264,7 @@ index 0000000..e6a2ae5
 +        if c.next==r.head{return false;}
 +        out.clear();out.extend_from_slice(&r.slots[c.next as usize%r.slots.len()]);c.next+=1;true
 +    }
-+    pub fn published(&self)->u64{self.ring.lock().unwrap().head}
++    pub fn published(&self)->u64{self.head.load(Ordering::Acquire)}
 +    pub fn allocated_payload_bytes(&self)->usize{self.ring.lock().unwrap().slots.iter().map(|v|v.capacity()).sum()}
 +}
 +
