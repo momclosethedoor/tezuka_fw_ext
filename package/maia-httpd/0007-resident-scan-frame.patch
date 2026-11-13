@@ -1,0 +1,683 @@
+diff --git a/maia-httpd/src/app.rs b/maia-httpd/src/app.rs
+index cb01ffa..7bbe227 100644
+--- a/maia-httpd/src/app.rs
++++ b/maia-httpd/src/app.rs
+@@ -41,6 +41,7 @@ impl App {
+         let recorder = RecorderState::new(&ad9361, &ip_core).await?;
+         let state = AppState(Arc::new(State {
+             native_observations: native_config.is_some(),
++            scan: Default::default(),
+             ad9361,
+             ip_core,
+             geolocation: std::sync::Mutex::new(None),
+@@ -117,6 +118,7 @@ pub struct AppState(Arc<State>);
+ 
+ #[derive(Debug)]
+ struct State {
++    scan: crate::scan_runtime::Hub,
+     native_observations: bool,
+     ad9361: tokio::sync::Mutex<Ad9361>,
+     ip_core: Mutex<IpCore>,
+@@ -126,6 +128,8 @@ struct State {
+ }
+ 
+ impl AppState {
++    /// Bounded resident publication and command state in the existing application.
++    pub fn scan(&self)->&crate::scan_runtime::Hub{&self.0.scan}
+     /// The experimental native source freezes RF mutations and disables legacy waterfall.
+     pub fn native_observations(&self)->bool{self.0.native_observations}
+     /// Gives access to the [`Ad9361`] object of the application.
+diff --git a/maia-httpd/src/fpga.rs b/maia-httpd/src/fpga.rs
+index 38244a9..f11ca67 100644
+--- a/maia-httpd/src/fpga.rs
++++ b/maia-httpd/src/fpga.rs
+@@ -247,7 +247,7 @@ impl IpCore {
+             .await
+             .context("failed to map maia-sdr UIO")?;
+         let phys_addr = uio.map_addr(0).await?;
+-        if native_observations && uio.map_size(0).await? < 0x80 { anyhow::bail!("UIO native register window too small"); }
++        if native_observations && uio.map_size(0).await? < 0x100 { anyhow::bail!("UIO native register window too small"); }
+         let spectrometer = Dma::new("maia-sdr-spectrometer")
+             .await
+             .context("failed to open maia-sdr-spectrometer DMA buffer")?;
+@@ -499,14 +499,18 @@ impl IpCore {
+     }
+ 
+     fn native_read(&self,offset:usize)->u32{
+-        assert!(self.native_observations && (0x50..=0x7c).contains(&offset) && offset%4==0);
++        assert!(self.native_observations && (0x50..=0xd4).contains(&offset) && offset%4==0);
+         unsafe {std::ptr::read_volatile((self.registers.0.addr() as *const u8).add(offset) as *const u32)}
+     }
+     fn native_write(&self,offset:usize,value:u32){
+-        assert!(self.native_observations && [0x54,0x58,0x5c,0x60].contains(&offset));
++        assert!(self.native_observations && ([0x54,0x58,0x5c,0x60,0x84,0x88,0x8c,0x90,0x94,0x98,0x9c,0xa0,0xa4,0xa8].contains(&offset)));
+         unsafe {std::ptr::write_volatile((self.registers.0.addr() as *mut u8).add(offset) as *mut u32,value)};
+         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+     }
++    /// RCS1 access is only used after resident_schedule::check verified both IDs.
++    pub fn resident_read(&self,offset:usize)->u32{self.native_read(offset)}
++    /// Serialize all staged writes and command pulses through the existing mapping.
++    pub fn resident_write(&self,offset:usize,value:u32){self.native_write(offset,value)}
+     /// Counters, not IRQ count/pointer difference, determine completed observations.
+     pub fn native_snapshot(&self)->crate::native_observation::Snapshot{
+         use crate::native_observation::Snapshot;
+diff --git a/maia-httpd/src/httpd.rs b/maia-httpd/src/httpd.rs
+index bb02fd6..9758bd3 100644
+--- a/maia-httpd/src/httpd.rs
++++ b/maia-httpd/src/httpd.rs
+@@ -29,6 +29,7 @@ mod spectrometer;
+ mod time;
+ mod version;
+ mod websocket;
++mod scan;
+ mod zeros;
+ 
+ pub use recording::{RecorderFinishWaiter, RecorderState};
+@@ -105,6 +106,9 @@ impl Server {
+                     .patch(recording::patch_recording_metadata),
+             )
+             .route("/api/versions", get(version::get_versions))
++            .route("/api/resident",get(scan::status))
++            .route("/api/resident/stop",axum::routing::post(scan::stop))
++            .route("/ws/scan-frame",get(scan::handler))
+             .route("/recording", get(recording::get_recording))
+             .route("/version", get(version::get_version))
+             // IQEngine viewer for IQ recording
+diff --git a/maia-httpd/src/httpd/scan.rs b/maia-httpd/src/httpd/scan.rs
+new file mode 100644
+index 0000000..9470df8
+--- /dev/null
++++ b/maia-httpd/src/httpd/scan.rs
+@@ -0,0 +1,27 @@
++use crate::app::AppState;
++use axum::{extract::{State,ws::{Message,WebSocketUpgrade}},response::{Response,IntoResponse}};
++use std::{sync::atomic::Ordering,time::Duration};
++
++pub async fn status(State(state):State<AppState>)->Response {
++    let value=state.scan().status.lock().unwrap().clone();
++    ([(axum::http::header::CONTENT_TYPE,"application/json")],if value.is_empty(){"{\"version\":1,\"kind\":\"resident-status\",\"running\":false}".into()}else{value}).into_response()
++}
++pub async fn stop(State(state):State<AppState>)->Response {state.scan().stop.store(true,Ordering::Relaxed);(axum::http::StatusCode::ACCEPTED,"stop queued; poll resident status").into_response()}
++pub async fn handler(State(state):State<AppState>,ws:WebSocketUpgrade)->Response {
++    if !state.native_observations(){return (axum::http::StatusCode::CONFLICT,"resident source required").into_response();}
++    if state.scan().clients.fetch_add(1,Ordering::AcqRel)>=2{state.scan().clients.fetch_sub(1,Ordering::AcqRel);return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();}
++    struct Lease(AppState);impl Drop for Lease{fn drop(&mut self){self.0.scan().clients.fetch_sub(1,Ordering::AcqRel);}}
++    let lease=Lease(state.clone());
++    ws.on_upgrade(move |mut socket|async move {
++        let _lease=lease;let mut ordinal=0;let mut pending=Vec::with_capacity(112+64*8+8*32768);
++        loop {
++            if state.scan().poll(&mut ordinal,&mut pending){
++                // At most one in-flight message/client. No acquisition lock is
++                // held across send, and slow readers lose whole older frames.
++                let bytes=bytes::Bytes::copy_from_slice(&pending);
++                match tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Binary(bytes))).await {Ok(Ok(()))=>{state.scan().sent.fetch_add(1,Ordering::Relaxed);},_=>break}
++            }
++            tokio::select!{_=tokio::time::sleep(Duration::from_millis(5))=>{},message=socket.recv()=>{match message{None|Some(Err(_))|Some(Ok(Message::Close(_)))=>break,_=>{}}}}
++        }
++    })
++}
+diff --git a/maia-httpd/src/iio.rs b/maia-httpd/src/iio.rs
+index 0557bab..f0faa06 100644
+--- a/maia-httpd/src/iio.rs
++++ b/maia-httpd/src/iio.rs
+@@ -45,6 +45,35 @@ macro_rules! iio_getset {
+ }
+ 
+ impl Ad9361 {
++    /// Install only saved RX profiles, verify their bytes, then enable RX pins.
++    /// GPIO ownership/direction/zero is an explicit coordinated prerequisite.
++    pub async fn load_resident_profiles(&self,profiles:&[crate::scan_runtime::Profile],slot:u8)->Result<()> {
++        let name=self.iio_device_path.file_name().ok_or_else(||anyhow::anyhow!("IIO path"))?;
++        let debug=Path::new("/sys/kernel/debug/iio").join(name);
++        let rx=debug.join("adi,rx-fastlock-pincontrol-enable");let tx=debug.join("adi,tx-fastlock-pincontrol-enable");
++        fs::write(&rx,b"0").await?;fs::write(&tx,b"0").await?;
++        anyhow::ensure!(fs::read_to_string(&tx).await?.trim()=="0","TX pin-control readback");
++        for p in profiles {
++            let text=format!("{} {}",p.slot,p.bytes.iter().map(|v|v.to_string()).collect::<Vec<_>>().join(","));
++            fs::write(self.iio_device_path.join("out_altvoltage0_RX_LO_fastlock_load"),text).await?;
++            let save=self.iio_device_path.join("out_altvoltage0_RX_LO_fastlock_save");fs::write(&save,p.slot.to_string()).await?;
++            let actual=fs::read_to_string(&save).await?;let values=actual.split_whitespace().nth(1).ok_or_else(||anyhow::anyhow!("RX profile save format"))?.split(',').map(|s|s.parse::<u8>()).collect::<std::result::Result<Vec<_>,_>>()?;
++            anyhow::ensure!(values==p.bytes,"RX profile byte readback mismatch");
++        }
++        fs::write(&rx,b"1").await?;
++        fs::write(self.iio_device_path.join("out_altvoltage0_RX_LO_fastlock_recall"),slot.to_string()).await?;
++        anyhow::ensure!(fs::read_to_string(&rx).await?.trim()=="1" && fs::read_to_string(&tx).await?.trim()=="0","RX-only pin-control readback");
++        // Debug attributes are driver parameters. Verify actual setup register
++        // D1 as well, without changing any TX register/profile.
++        let access=debug.join("direct_reg_access");
++        for (address,enabled) in [(0x25a,true),(0x29a,false)]{
++            fs::write(&access,format!("0x{address:x}")).await?;
++            let text=fs::read_to_string(&access).await?;
++            let value=u32::from_str_radix(text.trim().trim_start_matches("0x"),16)?;
++            anyhow::ensure!((value&2!=0)==enabled,"actual fastlock pin select does not match RX-only ownership");
++        }
++        Ok(())
++    }
+     /// Opens an AD9361 IIO device.
+     ///
+     /// This function opens the first IIO device with name ad9361-phy that is
+diff --git a/maia-httpd/src/lib.rs b/maia-httpd/src/lib.rs
+index a0d0fc8..d301dd1 100644
+--- a/maia-httpd/src/lib.rs
++++ b/maia-httpd/src/lib.rs
+@@ -16,6 +16,9 @@ pub mod observation;
+ pub mod observation_live;
+ pub mod native_observation;
+ pub mod native_runtime;
++pub mod resident_schedule;
++pub mod scan_frame;
++pub mod scan_runtime;
+ pub mod observation_transport;
+ pub mod observation_accumulator;
+ pub mod rxbuffer;
+diff --git a/maia-httpd/src/native_observation.rs b/maia-httpd/src/native_observation.rs
+index 63f5114..2ae7d1f 100644
+--- a/maia-httpd/src/native_observation.rs
++++ b/maia-httpd/src/native_observation.rs
+@@ -13,6 +13,7 @@ pub const ENBW:f64=2.0050129965307675;
+ pub fn http_rejection(native:bool,method:&str,path:&str)->Option<u16>{
+     if !native{return None;}
+     if path=="/waterfall"{return Some(410);}
++    if method=="POST" && path=="/api/resident/stop"{return None;}
+     if method!="GET" && method!="HEAD"{return Some(423);}None
+ }
+ const MASK:u64=(1<<37)-1;
+@@ -36,17 +37,19 @@ pub fn validate(data:&[u8])->Result<Header,String>{
+ 
+ /// Immutable source/epoch bindings, installed before the first series.
+ /// This initial hardware profile is static raw input, one plane, nint=1.
+-pub struct Adapter{epochs:Vec<(u64,u16)>,dirty_id:u16}
++pub struct Adapter{epochs:Vec<(u64,u16)>,dirty_id:u16,resident:Option<crate::resident_schedule::Map>}
+ impl Adapter{
+     pub fn new(epochs:Vec<(u64,u16)>,dirty_id:u16)->Result<Self,String>{
+         if epochs.is_empty() || epochs.len()>16 || dirty_id==0{return Err("context table bounds".into());}
+         for (i,(e,d)) in epochs.iter().enumerate(){if *e==0 || *d==0 || epochs[..i].iter().any(|(old,_)|old==e){return Err("immutable context definitions".into());}}
+-        Ok(Self{epochs,dirty_id})
++        Ok(Self{epochs,dirty_id,resident:None})
+     }
++    pub fn resident(map:crate::resident_schedule::Map)->Self{Self{epochs:Vec::new(),dirty_id:1,resident:Some(map)}}
+     pub fn descriptor(id:u16,source:u16,fs:f64,lo:f64)->Descriptor{Descriptor{id,sample_rate:fs,bin0_hz:lo-fs/2.,enbw_bins:ENBW,tick_hz:TICK_HZ,bins:BINS as u32,mode:1,source}}
+     pub fn check_context(&self,h:Header)->Result<u16,String>{
+         if h.use_ddc{return Err("first native live profile requires raw input; DDC gain/grid not installed".into());}
+         if h.epoch==0{return Ok(self.dirty_id);}
++        if let Some(map)=&self.resident{return Ok(map.resolve(h.epoch)?.descriptor);}
+         self.epochs.iter().find(|(epoch,_)|*epoch==h.epoch).map(|(_,id)|*id).ok_or_else(||"unknown carried epoch; cannot use current RF state".into())
+     }
+     /// Reuse Observation.power. Native data is normalized and reordered exactly once.
+@@ -74,6 +77,18 @@ pub struct Series{base:Snapshot,count:u32}
+ pub struct Complete{pub recorded:u32,pub lost:u32,pub first_slot:usize,pub last_seq:u64}
+ /// Implementations invalidate CPU cache and copy a stable completed DMA slot.
+ pub trait CompletedDma{fn copy_slot(&self,slot:usize,out:&mut[u8])->Result<(),String>;}
++/// RAM instrumentation only: copy/quarantine exactly the proven completed
++/// slots of a non-full/misaligned series. Never decode stale slots, join a
++/// wrap, carry fragments, reset counters, or change the RCS1 schedule.
++/// Return how many ordinary selected windows would next align the DMA pointer
++/// to slot0 (zero means already aligned). Their records are also quarantined.
++pub fn quarantine_ram<D:CompletedDma>(dma:&D,done:Complete,raw:&mut[u8])->Result<u32,String>{
++    if raw.len()!=8*BYTES || done.first_slot>=8 || done.recorded>8 || done.lost>8 || done.recorded+done.lost>8{return Err("RAM quarantine completion/storage bounds".into());}
++    if done.recorded==8 && done.lost==0 && done.first_slot==0{return Err("full aligned RAM series must use the normal decoder".into());}
++    for i in 0..done.recorded as usize{dma.copy_slot((done.first_slot+i)%8,&mut raw[i*BYTES..(i+1)*BYTES])?;}
++    let next=(done.first_slot+done.recorded as usize)%8;
++    Ok(((8-next)%8) as u32)
++}
+ /// Acceptance-only RAM reload correction. Each call is ONE proven contiguous,
+ /// completed physical extent. No retained suffix, modulo wrap or cross-series join.
+ pub fn assemble_ram_extent(raw:&[u8],out:&mut[Vec<u8>])->Result<usize,String>{
+@@ -124,6 +139,25 @@ pub fn is_other_process(name:&std::ffi::OsStr,current:u32)->bool{
+ 
+ #[cfg(test)]
+ mod tests{
++    #[test]fn ram_loss_quarantine_then_ordinary_rearm_aligns_without_reset_or_stale_reads(){
++        use std::cell::RefCell;
++        struct Mock{slots:RefCell<Vec<usize>>}
++        impl CompletedDma for Mock{fn copy_slot(&self,s:usize,out:&mut[u8])->Result<(),String>{self.slots.borrow_mut().push(s);out.fill(s as u8);Ok(())}}
++        let dma=Mock{slots:RefCell::new(Vec::new())};let mut raw=vec![0;8*BYTES];
++        let loss=Complete{recorded:7,lost:1,first_slot:0,last_seq:100};
++        assert_eq!(quarantine_ram(&dma,loss,&mut raw).unwrap(),1);assert_eq!(*dma.slots.borrow(),vec![0,1,2,3,4,5,6]);
++        dma.slots.borrow_mut().clear();let align=Complete{recorded:1,lost:0,first_slot:7,last_seq:101};
++        assert_eq!(quarantine_ram(&dma,align,&mut raw).unwrap(),0);assert_eq!(*dma.slots.borrow(),vec![7]);
++        let ready=Complete{recorded:8,lost:0,first_slot:0,last_seq:109};assert!(quarantine_ram(&dma,ready,&mut raw).is_err());
++    }
++    #[test]fn ram_quarantine_wrap_zero_record_and_bounds_are_explicit(){
++        struct Mock;impl CompletedDma for Mock{fn copy_slot(&self,_:usize,_:&mut[u8])->Result<(),String>{Ok(())}}
++        let mut raw=vec![0;8*BYTES];
++        assert_eq!(quarantine_ram(&Mock,Complete{recorded:3,lost:5,first_slot:6,last_seq:1},&mut raw).unwrap(),7);
++        assert_eq!(quarantine_ram(&Mock,Complete{recorded:0,lost:8,first_slot:7,last_seq:1},&mut raw).unwrap(),1);
++        assert!(quarantine_ram(&Mock,Complete{recorded:7,lost:2,first_slot:0,last_seq:1},&mut raw).is_err());
++        assert!(quarantine_ram(&Mock,Complete{recorded:1,lost:0,first_slot:8,last_seq:1},&mut raw).is_err());
++    }
+     #[test]fn ram_extent_does_not_carry_edges_or_join_modulo_slots(){
+         let mut out=vec![vec![0;BYTES];8];
+         assert_eq!(assemble_ram_extent(&vec![0;BYTES],&mut out).unwrap(),0);
+diff --git a/maia-httpd/src/native_runtime.rs b/maia-httpd/src/native_runtime.rs
+index bbd6418..fcb1488 100644
+--- a/maia-httpd/src/native_runtime.rs
++++ b/maia-httpd/src/native_runtime.rs
+@@ -24,6 +24,7 @@ pub struct Config{
+     pub ram_load_test:bool,
+     pub accumulate_windows:Option<u32>,
+     pub derived_capture_id:Option<String>,
++    pub resident:Option<crate::scan_runtime::Config>,
+ }
+ fn uuid(s:&str)->Result<[u8;16]>{
+     let s=s.replace('-',"");ensure!(s.len()==32 && s.is_ascii(),"UUID format");let mut id=[0;16];for (i,x) in id.iter_mut().enumerate(){*x=u8::from_str_radix(&s[2*i..2*i+2],16)?;}ensure!(id!=[0;16],"zero UUID");Ok(id)
+@@ -32,6 +33,7 @@ impl Config{
+     pub fn load(path:&Path)->Result<Self>{let c:Self=serde_json::from_slice(&std::fs::read(path)?)?;c.validate()?;Ok(c)}
+     fn validate(&self)->Result<()>{
+         uuid(&self.capture_id)?;uuid(&self.coordinated_boot_id)?;
++        if let Some(r)=&self.resident{let map=r.map()?;crate::scan_frame::Assembler::new(map,self.sample_rate).map_err(anyhow::Error::msg)?;ensure!(self.accumulate_windows.is_none() && self.diagnostic_after_series.is_none(),"resident scan and static accumulator/diagnostic are separate modes");}
+         ensure!(self.externally_settled,"operator must establish static RF settling before asserting validity");
+         ensure!(self.sample_rate>0 && self.rx_lo_hz>0 && self.epoch!=0 && (1..=8).contains(&self.series_windows),"native static profile parameters");
+         ensure!(self.run_seconds.is_finite() && (0.01..=240.).contains(&self.run_seconds),"source duration must be <=240 seconds");
+@@ -54,6 +56,12 @@ impl Guard{
+         for entry in std::fs::read_dir("/proc")?{
+             let p=entry?.path();if !native::is_other_process(p.file_name().unwrap(),std::process::id()){continue;}
+             if let Ok(name)=std::fs::read_to_string(p.join("comm")){ensure!(name.trim()!="maia-httpd","stop the stock DMA owner and its auto-restart before native startup");}
++            if c.resident.is_some(){
++                if let Ok(args)=std::fs::read(p.join("cmdline")){
++                    let controller=args.split(|b|*b==0).any(|arg|std::str::from_utf8(arg).ok().is_some_and(|s|["api_controller.sh","pl_video_ctl.sh","sweep.sh","sweep_stop.sh"].iter().any(|name|s.rsplit('/').next()==Some(*name))));
++                    if controller {let status=std::fs::read_to_string(p.join("status"))?;let paused=status.lines().find_map(|line|line.strip_prefix("State:")).and_then(|s|s.trim().chars().next()).is_some_and(|s|matches!(s,'T'|'t'|'Z'));ensure!(paused,"active legacy RF controller competes with RCS1; use the established coordinated loader/quiescence procedure");}
++                }
++            }
+         }
+         let lease=OpenOptions::new().read(true).write(true).create(true).truncate(false).open("/run/maia-observation.lock")?;
+         ensure!(unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0,"native DMA owner already holds lease");
+@@ -64,7 +72,7 @@ impl Guard{
+         writeln!(f,"OBN1-r1 capture={} coordinated_boot={}",c.capture_id,c.coordinated_boot_id)?;f.sync_all()?;Ok(())
+     }
+ }
+-pub struct Runtime{state:AppState,config:Config,_guard:Guard,adapter:Adapter,encoder:Encoder,q:Arc<Fanout>,server:Server,accumulator:Option<Accumulator>}
++pub struct Runtime{state:AppState,config:Config,_guard:Guard,adapter:Adapter,encoder:Encoder,q:Arc<Fanout>,server:Server,accumulator:Option<Accumulator>,resident:Option<crate::scan_runtime::Resident>}
+ impl std::fmt::Debug for Runtime{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("NativeRuntime").field("config",&self.config).finish_non_exhaustive()}}
+ impl Runtime{
+     pub async fn new(state:AppState,c:Config,guard:Guard)->Result<Self>{
+@@ -73,15 +81,16 @@ impl Runtime{
+         ensure!(base.idle().map_err(anyhow::Error::msg)? && base.selected==0 && base.recorded==0 && base.lost==0,"native attach requires unused counters after coordinated full reset; never reset SDR-only AXI here");
+         let mut contexts=vec![(c.epoch,1)];let mut ds=vec![Adapter::descriptor(1,3,c.sample_rate as f64,c.rx_lo_hz as f64)];
+         if let Some(epoch)=c.diagnostic_next_epoch{contexts.push((epoch,2));ds.push(Adapter::descriptor(2,3,c.sample_rate as f64,c.rx_lo_hz as f64));}
+-        let adapter=Adapter::new(contexts,1).map_err(anyhow::Error::msg)?;
++        let adapter=if let Some(r)=&c.resident{let map=r.map()?;ds=map.entries.iter().enumerate().map(|(i,e)|Adapter::descriptor(i as u16+1,3,c.sample_rate as f64,e.lo as f64)).collect();Adapter::resident(map)}else{Adapter::new(contexts,1).map_err(anyhow::Error::msg)?};
+         let accumulator=c.accumulate_windows.map(|n|Accumulator::new(n,ds.clone())).transpose().map_err(anyhow::Error::msg)?;
+         let encoder=if let Some(a)=&accumulator{Encoder::new(uuid(c.derived_capture_id.as_ref().unwrap())?,a.output_descriptors())}else{Encoder::new_nint1(uuid(&c.capture_id)?,ds)}.map_err(anyhow::Error::msg)?;
+         let q=Arc::new(Fanout::new(8,encoder.max_record()).map_err(anyhow::Error::msg)?);
+         let server=Server::bind(c.bind,q.clone(),encoder.header().to_vec(),encoder.max_record(),2)?;
+         guard.claim(&c)?;
+         state.ip_core().lock().unwrap().native_invalid();
+-        tracing::info!(abi="OBN1-r1",expected_pl_commit="370d03a02fface2a287d8d7cafb6cee7422217ee",capture=%c.capture_id,derived_capture=?c.derived_capture_id,accumulate_windows=?c.accumulate_windows,ram_load_test=c.ram_load_test,boot=%c.coordinated_boot_id,fs=c.sample_rate,lo=c.rx_lo_hz,enbw=native::ENBW,address=%server.address()?,"native hardware source READY; static raw input, external settling assertion, not RF calibration");
+-        Ok(Self{state,config:c,_guard:guard,adapter,encoder,q,server,accumulator})
++        let resident=if let Some(r)=&c.resident{Some(crate::scan_runtime::Resident::new(&state,r,c.sample_rate,uuid(&c.capture_id)?).await?)}else{None};
++        tracing::info!(abi="OBN1-r1",expected_pl_commit=if c.resident.is_some(){"c117a1f90774098da49bd73022e01c72c712435e"}else{"370d03a02fface2a287d8d7cafb6cee7422217ee"},capture=%c.capture_id,derived_capture=?c.derived_capture_id,accumulate_windows=?c.accumulate_windows,ram_load_test=c.ram_load_test,boot=%c.coordinated_boot_id,fs=c.sample_rate,lo=c.rx_lo_hz,enbw=native::ENBW,address=%server.address()?,"native hardware source READY; raw input, frozen static/resident context, not RF calibration");
++        Ok(Self{state,config:c,_guard:guard,adapter,encoder,q,server,accumulator,resident})
+     }
+     fn snapshot(&self)->Snapshot{self.state.ip_core().lock().unwrap().native_snapshot()}
+     pub async fn run(mut self)->Result<()>{
+@@ -96,14 +105,20 @@ impl Runtime{
+         let mut reduced=Observation{descriptor_id:1,seq:0,epoch:0,first_tick:0,nint:1,tag:NO_TAG,power:Vec::with_capacity(if self.accumulator.is_some(){2*native::BINS}else{0})};
+         let mut frame=Vec::with_capacity(self.encoder.max_record());let mut source_order=Order::default();
+         let start=Instant::now();let mut base=self.snapshot();let initial=base;let mut series_count=0u64;let mut recorded=0u64;let mut lost=0u64;let mut ram_edges=0u64;let mut decoded=0u64;let mut output_records=0u64;
++        let mut stopping=false;let mut wait_us=0u128;let mut drain_us=0u128;let mut decode_us=0u128;
++        let mut ram_align_count=0u32;let mut ram_quarantined=0u64;let mut ram_align_recorded=0u64;let mut ram_discard_series=0u64;let mut consecutive_discard=0u32;
++        if let Some(r)=&self.resident{r.start(&self.state)?;}
+         loop{
+             self.server.poll_accept()?;
++            if let Some(r)=self.resident.as_mut(){if r.poll(&self.state)? && !stopping{r.stop(&self.state)?;stopping=true;}}
+             let epoch=if self.config.diagnostic_after_series.is_some_and(|n|series_count>=n){self.config.diagnostic_next_epoch.unwrap()}else{self.config.epoch};
+-            let series=Series::new(base,self.config.series_windows).map_err(anyhow::Error::msg)?;
+-            self.state.ip_core().lock().unwrap().native_arm(epoch,self.config.series_windows)?;
++            let capture_count=if self.config.ram_load_test && ram_align_count>0{ram_align_count}else{self.config.series_windows};
++            let series=Series::new(base,capture_count).map_err(anyhow::Error::msg)?;
++            self.state.ip_core().lock().unwrap().native_arm(epoch,capture_count)?;
+             let waiting=Instant::now();
+             let (complete,next)=loop{
+                 self.server.poll_accept()?;
++                if let Some(r)=self.resident.as_mut(){if (r.poll(&self.state)? || start.elapsed().as_secs_f64()>=self.config.run_seconds) && !stopping{r.stop(&self.state)?;stopping=true;}}
+                 let a=self.snapshot();
+                 if let Some(done)=series.completion(a).map_err(anyhow::Error::msg)?{
+                     // Completion counters and last_seq can cross RegisterCDC independently.
+@@ -112,17 +127,33 @@ impl Runtime{
+                 ensure!(waiting.elapsed()<Duration::from_secs(5),"native series timeout; no reset/rearm, coordinate system recovery");
+                 tokio::time::sleep(Duration::from_millis(1)).await;
+             };
++            wait_us+=waiting.elapsed().as_micros();let drain_start=Instant::now();
+             // Never re-arm until ALL previous records have been invalidated/copied.
++            let quarantine=self.config.ram_load_test && !(complete.recorded==8 && complete.lost==0 && complete.first_slot==0);
+             let checked={let core=self.state.ip_core().lock().unwrap();
+-                if self.config.ram_load_test{native::drain_ram(&*core,complete,&mut ram,&mut copied,&self.adapter,&source_order)}
++                if quarantine{
++                    ram_align_count=native::quarantine_ram(&*core,complete,&mut ram).map_err(anyhow::Error::msg)?;
++                    if capture_count==8{ram_quarantined+=complete.recorded as u64;}else{ram_align_recorded+=complete.recorded as u64;}
++                    ram_discard_series+=1;consecutive_discard+=1;ensure!(consecutive_discard<=16,"RAM alignment unable to recover after 16 bounded series; no reset attempted");
++                    tracing::warn!(selected=capture_count,recorded=complete.recorded,lost=complete.lost,first_slot=complete.first_slot,next_alignment_windows=ram_align_count,"RAM-only whole series quarantined; no stale-slot decode, schedule/counters retained");
++                    Ok(source_order.clone())
++                }
++                else if self.config.ram_load_test{ram_align_count=0;consecutive_discard=0;native::drain_ram(&*core,complete,&mut ram,&mut copied,&self.adapter,&source_order)}
+                 else{native::drain(&*core,complete,&mut copied,&self.adapter,&source_order)}
+             }.map_err(anyhow::Error::msg)?;
+             let after=self.snapshot();ensure!(next.completion_eq(&after),"DMA completion changed while draining; competing owner/reset");
+             source_order=checked;
+-            let count=if self.config.ram_load_test{ram_edges+=1;7}else{complete.recorded as usize};
++            drain_us+=drain_start.elapsed().as_micros();let decode_start=Instant::now();
++            let count=if quarantine{0}else if self.config.ram_load_test{ram_edges+=1;7}else{complete.recorded as usize};
+             for bytes in copied.iter().take(count){
+                 self.adapter.convert(bytes,&mut observation).map_err(anyhow::Error::msg)?;
+                 decoded+=1;
++                if let Some(r)=self.resident.as_mut(){r.consume(&observation,&self.state)?;
++                    // An unclean moving-RF window has no authenticated grid.
++                    // Keep/count it at the native diagnostic boundary, never
++                    // publish it using the first visit's RF descriptor.
++                    if observation.epoch==0{continue;}
++                }
+                 if let Some(a)=self.accumulator.as_mut(){
+                     if a.push(&observation,&mut reduced).map_err(anyhow::Error::msg)?{
+                         self.encoder.observation(&reduced,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
+@@ -132,10 +163,15 @@ impl Runtime{
+                 }
+             }
+             series_count+=1;recorded+=complete.recorded as u64;lost+=complete.lost as u64;base=after;
++            decode_us+=decode_start.elapsed().as_micros();
+             if series_count==1 || series_count%1000==0{tracing::info!(series=series_count,native_recorded=recorded,native_lost=lost,last_seq=base.last_seq,"native bounded acquisition");}
+-            if start.elapsed().as_secs_f64()>=self.config.run_seconds{break;}
++            if stopping || start.elapsed().as_secs_f64()>=self.config.run_seconds{
++                if let Some(r)=self.resident.as_mut(){r.stop(&self.state)?;r.poll(&self.state)?;ensure!(self.state.ip_core().lock().unwrap().resident_read(0xac)&1==0,"stop not acknowledged");r.close(&self.state,false,observation.first_tick);tracing::info!(internal_clean_test_consumer=r.clean_consumer,scan=?r.assembler.stats,scan_storage=r.assembler.storage_bytes(),scan_wire=r.wire.len(),publish_skipped=r.publish_skipped,route_requests=r.link.requests,route_stale=r.link.stale,route_failed=r.link.failed,"resident accounting; test hook is not a classifier; FFT input times are not exact pass boundaries");}
++                break;
++            }
+         }
+         self.state.ip_core().lock().unwrap().native_invalid();
++        tracing::info!(capture_wait_us=wait_us,drain_copy_us=drain_us,decode_publish_us=decode_us,ram_quarantined_recorded=ram_quarantined,ram_alignment_recorded=ram_align_recorded,ram_discard_series,ws_sent=self.state.scan().sent.load(Ordering::Relaxed),ws_missed=self.state.scan().missed.load(Ordering::Relaxed),ws_contention=self.state.scan().contention.load(Ordering::Relaxed),"bounded phase and scan transport accounting");
+         if let Some(a)=self.accumulator.as_mut(){if a.finish(&mut reduced).map_err(anyhow::Error::msg)?{
+             self.encoder.observation(&reduced,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
+         }}
+@@ -146,7 +182,7 @@ impl Runtime{
+     }
+ }
+ impl native::CompletedDma for crate::fpga::IpCore{fn copy_slot(&self,slot:usize,out:&mut[u8])->Result<(),String>{self.native_copy(slot,out).map_err(|e|e.to_string())}}
+-impl Drop for Runtime{fn drop(&mut self){if let Ok(core)=self.state.ip_core().lock(){core.native_invalid();tracing::info!(snapshot=?core.native_snapshot(),"native validity disabled; no SDR-only reset attempted");}}}
++impl Drop for Runtime{fn drop(&mut self){if let Ok(core)=self.state.ip_core().lock(){if let Some(r)=&self.resident{let _=crate::resident_schedule::stop(&*core,r.map.repeat);}core.native_invalid();tracing::info!(snapshot=?core.native_snapshot(),"native validity disabled; no SDR-only reset attempted");}}}
+ 
+ #[cfg(test)]
+ mod tests{
+diff --git a/maia-httpd/src/resident_schedule.rs b/maia-httpd/src/resident_schedule.rs
+new file mode 100644
+index 0000000..30e7ab3
+--- /dev/null
++++ b/maia-httpd/src/resident_schedule.rs
+@@ -0,0 +1,78 @@
++//! RCS1 frozen resident map. No MMIO position is used to label a result.
++#![allow(missing_docs)]
++pub const ABI:u32=0x31534352;
++#[derive(Clone,Debug)]
++pub struct Entry {pub slot:u8,pub marker:bool,pub last:u8,pub route:u32,pub settle:u32,pub dwell:u32,pub context:u32,pub lo:u64}
++impl Entry {pub fn words(&self)->[u32;4]{[self.slot as u32|((self.marker as u32)<<3)|((self.last as u32)<<4)|(self.route<<8),self.settle,self.dwell,self.context]}}
++#[derive(Clone,Debug)]
++pub struct Map {pub run:u32,pub map_id:u64,pub initial_slot:u8,pub initial_route:u32,pub repeat:bool,pub entries:Vec<Entry>}
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub struct Context {pub visit:u32,pub phase:u8,pub position:usize,pub lap:u64,pub route:u32,pub descriptor:u16}
++impl Map {
++    pub fn validate(&self,last_run:u32,slot:u8)->Result<(),String>{
++        let n=self.entries.len();
++        if self.run==0 || self.run<=last_run || self.map_id==0 || !(1..=8).contains(&n) || slot>7 || slot!=self.initial_slot || self.initial_route>0xffffff {return Err("run/map/length/initial physical slot".into());}
++        let mut prev=slot;let mut zone=None;
++        for (i,e) in self.entries.iter().enumerate(){
++            if e.slot>7 || !(e.slot==prev || e.slot==(prev+1)%8) || e.lo==0 || e.context==0 || e.route>0xffffff || e.last>7 {return Err("slot must hold/+1 modulo8; RF context/route".into());}
++            if e.marker {if (e.last as usize)<i || e.last as usize>=n || zone.is_some_and(|z|i<=z){return Err("overlapping/backwards external transition zone".into());}zone=Some(e.last as usize);}
++            else if e.last!=0 || e.route!=0 {return Err("non-marker reserved zone/route must be zero".into());}
++            prev=e.slot;
++        }
++        if self.repeat && !(self.entries[0].slot==prev || self.entries[0].slot==(prev+1)%8){return Err("repeat closure must hold/+1 modulo8".into());}
++        Ok(())
++    }
++    pub fn resolve(&self,epoch:u64)->Result<Context,String>{
++        let visit=((epoch as u32)>>1) as u32;let phase=(epoch&1) as u8;
++        if (epoch>>32)!=self.run as u64 || visit==0 {return Err("unknown run/visit epoch".into());}
++        let n=self.entries.len();let position=(visit as usize-1)%n;let lap=(visit as u64-1)/n as u64;
++        if !self.repeat && lap!=0{return Err("visit beyond one-shot map".into());}
++        // A phase1 can only result from a marker in this lap/zone, at or before position.
++        if phase!=0 && !self.entries.iter().enumerate().any(|(i,e)|e.marker && i<=position && position<=e.last as usize){return Err("phase1 outside a response zone".into());}
++        let mut route=self.initial_route;
++        if lap>0 {if let Some(e)=self.entries.iter().rev().find(|e|e.marker){route=e.route;}}
++        for e in self.entries.iter().take(position+1){if e.marker {route=e.route;}}
++        Ok(Context{visit,phase,position,lap,route,descriptor:position as u16+1})
++    }
++}
++pub trait Registers {fn read(&self,offset:usize)->u32;fn write(&self,offset:usize,value:u32);}
++pub fn check<R:Registers>(r:&R)->Result<(),String>{if r.read(0x50)!=crate::native_observation::ABI{return Err("OBN1 required before RCS1".into());}if r.read(0x80)!=ABI{return Err("RCS1 ID mismatch".into());}Ok(())}
++pub fn load<R:Registers>(r:&R,map:&Map)->Result<(),String>{
++    check(r)?;let status=r.read(0xac);if status&0x13!=0{return Err("load requires stopped/nonfaulted RCS1".into());}
++    map.validate(r.read(0xd4),((status>>6)&7) as u8)?;
++    for (i,e) in map.entries.iter().enumerate(){r.write(0x90,i as u32);for (j,w) in e.words().iter().enumerate(){r.write(0x94+4*j,*w);}r.write(0x84,9);}
++    r.write(0x88,map.entries.len() as u32);r.write(0x8c,map.run);Ok(())
++}
++pub fn start<R:Registers>(r:&R,map:&Map)->Result<(),String>{check(r)?;map.validate(r.read(0xd4),((r.read(0xac)>>6)&7) as u8)?;r.write(0x84,3|if map.repeat{64}else{0});Ok(())}
++pub fn stop<R:Registers>(r:&R,repeat:bool)->Result<(),String>{check(r)?;r.write(0x84,5|if repeat{64}else{0});Ok(())}
++pub fn pending<R:Registers>(r:&R)->Result<Option<(u64,u32)>,String>{
++    check(r)?;if r.read(0xac)&2==0{return Ok(None);}
++    let lo=r.read(0xc0);let hi=r.read(0xc4);let info=r.read(0xc8);
++    if r.read(0xac)&2==0{return Ok(None);}Ok(Some(((hi as u64)<<32|lo as u64,info)))
++}
++pub fn response<R:Registers>(r:&R,id:u64,ok:bool,repeat:bool)->Result<(),String>{
++    if pending(r)?.map(|e|e.0)!=Some(id){return Err("stale/duplicate applied ID".into());}
++    r.write(0xa4,id as u32);r.write(0xa8,(id>>32) as u32);r.write(0x84,17|if ok{32}else{0}|if repeat{64}else{0});Ok(())
++}
++#[cfg(test)] mod tests {
++    use super::*;
++    fn map()->Map{Map{run:7,map_id:u64::MAX,initial_slot:0,initial_route:3,repeat:true,entries:(1..=8).map(|i|Entry{slot:i%8,marker:i==1,last:if i==1{1}else{0},route:if i==1{9}else{0},settle:10,dwell:20,context:i as u32,lo:100+i as u64}).collect()}}
++    #[test] fn circle_hold_and_initial_slot(){let mut m=map();m.validate(6,0).unwrap();assert!(m.validate(7,0).is_err());assert!(m.validate(6,1).is_err());m.entries.truncate(3);assert!(m.validate(0,0).is_err());m.repeat=false;m.validate(0,0).unwrap();m.entries[1].slot=1;m.entries[2].slot=2;m.validate(0,0).unwrap();m.entries[2].slot=7;assert!(m.validate(0,0).is_err());}
++    #[test] fn immutable_context_late_lap_and_phase(){let m=map();let c=m.resolve((7u64<<32)|19).unwrap();assert_eq!((c.visit,c.lap,c.position,c.phase,c.route),(9,1,0,1,9));assert_eq!(m.resolve((7u64<<32)|2).unwrap().lap,0);assert!(m.resolve((8u64<<32)|2).is_err());assert!(m.resolve((7u64<<32)|7).is_err());}
++    #[test] fn zones(){let mut m=map();m.entries[1].marker=true;m.entries[1].last=2;assert!(m.validate(0,0).is_err());}
++    #[test] fn register_commands_ids_stop_and_stale(){
++        use std::cell::RefCell;
++        struct Mock{data:RefCell<[u32;64]>,writes:RefCell<Vec<(usize,u32)>>}
++        impl Registers for Mock{fn read(&self,o:usize)->u32{self.data.borrow()[o/4]}fn write(&self,o:usize,v:u32){self.writes.borrow_mut().push((o,v));}}
++        let r=Mock{data:RefCell::new([0;64]),writes:RefCell::new(Vec::new())};let m=map();
++        assert!(load(&r,&m).is_err());assert!(r.writes.borrow().is_empty());
++        r.data.borrow_mut()[0x50/4]=crate::native_observation::ABI;assert!(load(&r,&m).is_err());
++        r.data.borrow_mut()[0x80/4]=ABI;load(&r,&m).unwrap();start(&r,&m).unwrap();assert_eq!(r.writes.borrow().last(),Some(&(0x84,0x43)));
++        let id=(7u64<<32)|2;r.data.borrow_mut()[0xac/4]=6; // pending/HOLD model
++        r.data.borrow_mut()[0xc0/4]=id as u32;r.data.borrow_mut()[0xc4/4]=(id>>32) as u32;
++        let count=r.writes.borrow().len();assert!(response(&r,id+2,true,true).is_err());assert_eq!(count,r.writes.borrow().len());
++        response(&r,id,false,true).unwrap();assert_eq!(r.writes.borrow().last(),Some(&(0x84,0x51)));
++        response(&r,id,true,true).unwrap();assert_eq!(r.writes.borrow().last(),Some(&(0x84,0x71))); // late valid applied releases held model
++        r.data.borrow_mut()[0xac/4]=0;assert!(response(&r,id,true,true).is_err());stop(&r,true).unwrap();assert_eq!(r.writes.borrow().last(),Some(&(0x84,0x45)));
++    }
++}
+diff --git a/maia-httpd/src/scan_frame.rs b/maia-httpd/src/scan_frame.rs
+new file mode 100644
+index 0000000..cc09fe1
+--- /dev/null
++++ b/maia-httpd/src/scan_frame.rs
+@@ -0,0 +1,91 @@
++//! One bounded assembly buffer and one wire scratch buffer. No GOBS epoch fusion.
++#![allow(missing_docs)]
++use crate::{observation::Observation,resident_schedule::Map};
++use std::sync::{Mutex,atomic::{AtomicBool,AtomicU64,AtomicUsize,Ordering}};
++#[derive(Debug,Default)]
++struct Publication {bytes:Vec<u8>,ordinal:u64}
++#[derive(Debug,Default)]
++pub struct Hub {latest:Mutex<Publication>,pub stop:AtomicBool,pub clients:AtomicUsize,pub missed:AtomicU64,pub sent:AtomicU64,pub contention:AtomicU64,pub status:Mutex<String>}
++impl Hub {
++    pub fn prepare(&self,max:usize){self.latest.lock().unwrap().bytes=Vec::with_capacity(max);}
++    pub fn publish(&self,bytes:&[u8]){if let Ok(mut p)=self.latest.try_lock(){p.bytes.clear();p.bytes.extend_from_slice(bytes);p.ordinal+=1;}else{self.contention.fetch_add(1,Ordering::Relaxed);}}
++    pub fn poll(&self,last:&mut u64,out:&mut Vec<u8>)->bool {let p=self.latest.lock().unwrap();if p.ordinal==*last{return false;}self.missed.fetch_add(p.ordinal.saturating_sub(*last+1),Ordering::Relaxed);*last=p.ordinal;out.clear();out.extend_from_slice(&p.bytes);true}
++}
++#[derive(Clone,Debug)]
++pub struct Layout {pub bin0:f64,pub step:f64,pub owners:Vec<(usize,usize)>}
++impl Layout {
++    pub fn new(map:&Map,fs:u32)->Result<Self,String>{
++        if fs==0 || map.entries.is_empty(){return Err("scan layout parameters".into());}
++        let step=fs as f64/4096.;let bin0=map.entries.iter().map(|e|e.lo).min().unwrap() as f64-fs as f64/2.;
++        let offsets:Vec<usize>=map.entries.iter().map(|e|{
++            let offset=(e.lo as f64-fs as f64/2.-bin0)/step;
++            if (offset-offset.round()).abs()>1e-6 || offset<0. || offset>32768. {return Err("resident centers must share the FFT grid; maximum scan span 32768 bins".to_string());}Ok(offset.round() as usize)
++        }).collect::<Result<_,_>>()?;
++        let n=offsets.iter().max().unwrap()+4096;if n>32768{return Err("scan span exceeds 32768 bins".into());}
++        let mut owners=vec![(usize::MAX,0);n];
++        // Lower table position owns overlap, independent of data arrival/validity.
++        for (pos,offset) in offsets.into_iter().enumerate(){for k in 0..4096 {if owners[offset+k].0==usize::MAX{owners[offset+k]=(pos,k);}}}
++        Ok(Self{bin0,step,owners})
++    }
++}
++#[derive(Clone,Copy,Debug,Default)]
++pub struct Part {pub valid:bool,pub seq:u64,pub epoch:u64,pub tick:u64}
++#[derive(Default,Debug)]
++pub struct Stats {pub clean:u64,pub dirty:u64,pub selected:u64,pub duplicates:u64,pub late:u64,pub frames:u64,pub skipped_laps:u64}
++pub struct Assembler {pub map:Map,pub layout:Layout,pub lap:Option<u64>,pub parts:Vec<Part>,pub power:Vec<f32>,pub stats:Stats,pub first_tick:u64,pub end_tick:u64,fs:u32}
++impl Assembler {
++    pub fn new(map:Map,fs:u32)->Result<Self,String>{let layout=Layout::new(&map,fs)?;Ok(Self{parts:vec![Part::default();map.entries.len()],power:vec![f32::NAN;layout.owners.len()],map,layout,lap:None,stats:Stats::default(),first_tick:0,end_tick:0,fs})}
++    /// Caller closes the old lap BEFORE accepting a newer carried epoch. Native
++    /// results are ordered; only this FFT-input watermark, or a fully drained
++    /// stop, proves that late DMA for the old lap cannot still arrive.
++    pub fn incoming_lap(&self,o:&Observation)->Result<Option<u64>,String>{if o.epoch==0{return Ok(None);}Ok(Some(self.map.resolve(o.epoch)?.lap))}
++    pub fn begin(&mut self,lap:u64){if let Some(old)=self.lap{self.stats.skipped_laps+=lap.saturating_sub(old+1);}self.lap=Some(lap);self.parts.fill(Part::default());self.power.fill(f32::NAN);self.first_tick=0;self.end_tick=0;}
++    pub fn accept(&mut self,o:&Observation)->Result<(),String>{
++        if o.epoch==0{self.stats.dirty+=1;return Ok(());}
++        let c=self.map.resolve(o.epoch)?;
++        if o.nint!=1 || o.power.len()!=4096 || o.power.iter().any(|v|!v.is_finite()||*v<0.){return Err("scan requires suitable nint1 power".into());}
++        self.stats.clean+=1;
++        match self.lap {None=>self.begin(c.lap),Some(l) if c.lap<l=>{self.stats.late+=1;return Ok(());},Some(l) if c.lap>l=>return Err("close previous lap at ordered input watermark first".into()),_=>{}}
++        let end=o.first_tick.checked_add((4096.*62_500_000./self.fs as f64).ceil() as u64).ok_or("tick overflow")?;
++        if self.first_tick==0 || o.first_tick<self.first_tick{self.first_tick=o.first_tick;}self.end_tick=self.end_tick.max(end);
++        if self.parts[c.position].valid{self.stats.duplicates+=1;return Ok(());}
++        self.parts[c.position]=Part{valid:true,seq:o.seq,epoch:o.epoch,tick:o.first_tick};
++        for (k,(owner,src)) in self.layout.owners.iter().enumerate(){if *owner==c.position{self.power[k]=o.power[*src];}}
++        self.stats.selected+=1;Ok(())
++    }
++    /// SCN1 v1: fixed header, <=8 part records, one f32 power plane. All IDs
++    /// remain binary u64; holes are canonical NaN and part validity is explicit.
++    pub fn encode(&mut self,capture:[u8;16],closed:bool,watermark:u64,out:&mut Vec<u8>){
++        out.clear();out.extend_from_slice(b"SCN1");out.extend_from_slice(&1u16.to_le_bytes());out.extend_from_slice(&112u16.to_le_bytes());
++        out.extend_from_slice(&capture);out.extend_from_slice(&self.map.map_id.to_le_bytes());out.extend_from_slice(&(self.map.run as u64).to_le_bytes());
++        let lap=self.lap.unwrap_or(0);out.extend_from_slice(&lap.to_le_bytes());out.extend_from_slice(&lap.to_le_bytes());
++        out.extend_from_slice(&self.first_tick.to_le_bytes());out.extend_from_slice(&self.end_tick.to_le_bytes());out.extend_from_slice(&watermark.to_le_bytes());
++        out.extend_from_slice(&self.layout.bin0.to_le_bytes());out.extend_from_slice(&self.layout.step.to_le_bytes());
++        out.extend_from_slice(&(self.power.len() as u32).to_le_bytes());out.extend_from_slice(&(self.parts.len() as u32).to_le_bytes());
++        out.extend_from_slice(&(closed as u32).to_le_bytes());out.extend_from_slice(&62_500_000u32.to_le_bytes());
++        for (i,p) in self.parts.iter().enumerate(){
++            out.extend_from_slice(&(p.valid as u32).to_le_bytes());out.extend_from_slice(&(i as u32).to_le_bytes());out.extend_from_slice(&p.seq.to_le_bytes());out.extend_from_slice(&p.epoch.to_le_bytes());out.extend_from_slice(&p.tick.to_le_bytes());
++            let e=&self.map.entries[i];let route=if p.valid{self.map.resolve(p.epoch).unwrap().route}else{0};
++            for v in [e.context,e.slot as u32,route,e.settle,e.dwell,0]{out.extend_from_slice(&v.to_le_bytes());}out.extend_from_slice(&e.lo.to_le_bytes());
++        }
++        for (owner,src) in &self.layout.owners {out.extend_from_slice(&(*owner as u16).to_le_bytes());out.extend_from_slice(&(*src as u16).to_le_bytes());}
++        for v in &self.power {out.extend_from_slice(&v.to_le_bytes());}self.stats.frames+=1;
++    }
++    pub fn max_wire(&self)->usize{112+64*self.parts.len()+8*self.power.len()}
++    pub fn storage_bytes(&self)->usize{self.parts.capacity()*std::mem::size_of::<Part>()+self.power.capacity()*4+self.layout.owners.capacity()*std::mem::size_of::<(usize,usize)>()}
++}
++#[cfg(test)] mod tests {
++    use super::*;use crate::resident_schedule::Entry;
++    fn assembler()->Assembler {Assembler::new(Map{run:0xf0000000,map_id:u64::MAX,initial_slot:0,initial_route:0,repeat:true,entries:(0..2).map(|i|Entry{slot:0,marker:false,last:0,route:0,settle:0,dwell:100,context:i+1,lo:100_000_000+2048*i as u64}).collect()},4096).unwrap()}
++    fn obs(visit:u64,value:f32)->Observation {Observation{descriptor_id:1,seq:visit,epoch:(0xf0000000u64<<32)|(visit<<1),first_tick:visit*100,nint:1,tag:crate::observation::NO_TAG,power:vec![value;4096]}}
++    #[test] fn first_fft_overlap_no_arithmetic_and_missing(){let mut a=assembler();a.accept(&obs(1,3.)).unwrap();a.accept(&obs(1,99.)).unwrap();a.accept(&obs(2,5.)).unwrap();assert!(a.power[..4096].iter().all(|p|*p==3.));assert!(a.power[4096..].iter().all(|p|*p==5.));assert_eq!(a.stats.selected,2);let mut wire=Vec::new();a.encode([1;16],true,300,&mut wire);assert_eq!(wire.len(),a.max_wire());assert_eq!(&wire[24..32],&u64::MAX.to_le_bytes());a.begin(1);a.accept(&obs(3,7.)).unwrap();assert!(a.power[4096..].iter().all(|p|p.is_nan()));assert!(!a.parts[1].valid);a.accept(&obs(1,9.)).unwrap();assert_eq!(a.stats.late,1);}
++    #[test] fn dirty_and_next_lap_require_watermark(){let mut a=assembler();let mut o=obs(1,2.);o.epoch=0;a.accept(&o).unwrap();assert!(a.lap.is_none());a.accept(&obs(1,2.)).unwrap();assert!(a.accept(&obs(3,4.)).is_err());assert_eq!(a.incoming_lap(&obs(3,4.)).unwrap(),Some(1));let capacity=a.storage_bytes();for lap in 1..10000{a.begin(lap);a.accept(&obs(lap*2+1,2.)).unwrap();}assert_eq!(capacity,a.storage_bytes());}
++    #[test] fn cross_language_wire(){let mut a=assembler();a.accept(&obs(1,3.)).unwrap();a.accept(&obs(2,5.)).unwrap();let mut wire=Vec::with_capacity(a.max_wire());a.encode([0x55;16],true,400,&mut wire);if let Ok(dir)=std::env::var("OBS_NATIVE_OUTPUT_DIR"){std::fs::write(std::path::Path::new(&dir).join("scan-frame.scn"),wire).unwrap();}}
++    #[test] fn scan_publication_slow_cursor_repeat_and_contention_are_bounded(){
++        let h=Hub::default();h.prepare(64);let mut frame=vec![0;64];let mut last=0;let mut out=Vec::with_capacity(64);
++        for id in 0..10000u64{frame[..8].copy_from_slice(&id.to_le_bytes());h.publish(&frame);}
++        assert!(h.poll(&mut last,&mut out));assert_eq!(u64::from_le_bytes(out[..8].try_into().unwrap()),9999);
++        assert_eq!(h.missed.load(Ordering::Relaxed),9999);assert!(!h.poll(&mut last,&mut out));assert_eq!(h.latest.lock().unwrap().bytes.capacity(),64);assert_eq!(out.capacity(),64);
++        let lock=h.latest.lock().unwrap();h.publish(&frame);drop(lock);assert_eq!(h.contention.load(Ordering::Relaxed),1);
++    }
++}
+diff --git a/maia-httpd/src/scan_runtime.rs b/maia-httpd/src/scan_runtime.rs
+new file mode 100644
+index 0000000..8ec7982
+--- /dev/null
++++ b/maia-httpd/src/scan_runtime.rs
+@@ -0,0 +1,98 @@
++//! Resident mode plumbing in the existing ARM application. Host GPIO is external.
++#![allow(missing_docs)]
++use crate::{app::AppState,observation::Observation,resident_schedule::{self as rcs,Registers,Map,Entry},scan_frame::Assembler};
++use anyhow::{Result,ensure};
++use serde::Deserialize;
++use std::{io::{Read,Write},net::{SocketAddr,TcpListener,TcpStream},sync::atomic::Ordering,time::{Duration,Instant}};
++
++#[derive(Debug,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Profile {pub slot:u8,pub lo_hz:u64,pub bytes:[u8;16]}
++#[derive(Debug,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Record {pub slot:u8,pub marker:bool,pub last:u8,pub route:u32,pub settling_ticks:u32,pub dwell_ticks:u32,pub context:u32}
++#[derive(Debug,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Config {
++    pub run_id:u32,pub map_id:u64,pub initial_slot:u8,pub initial_route:u32,pub repeat:bool,
++    pub profiles:Vec<Profile>,pub entries:Vec<Record>,pub route_bind:SocketAddr,pub publish_period_ms:u64,
++    pub exclusive_controllers_quiesced:bool,pub ps_fastlock_outputs_zero:bool,pub coordinated_external_slot:bool,
++}
++impl Config {
++    pub fn map(&self)->Result<Map>{
++        ensure!(self.exclusive_controllers_quiesced && self.ps_fastlock_outputs_zero && self.coordinated_external_slot,"quiesce legacy controller/PS OR outputs and establish external sweeper slot before RCS1");
++        ensure!((1..=8).contains(&self.profiles.len()) && (10..=60_000).contains(&self.publish_period_ms),"profile count/publication period");
++        for (i,p) in self.profiles.iter().enumerate(){ensure!(p.slot<8 && p.lo_hz>0 && !self.profiles[..i].iter().any(|q|q.slot==p.slot),"unique resident profiles");}
++        let entries=self.entries.iter().map(|e|Ok(Entry{slot:e.slot,marker:e.marker,last:e.last,route:e.route,settle:e.settling_ticks,dwell:e.dwell_ticks,context:e.context,lo:self.profiles.iter().find(|p|p.slot==e.slot).ok_or_else(||anyhow::anyhow!("table references unloaded profile"))?.lo_hz})).collect::<Result<Vec<_>>>()?;
++        ensure!(self.profiles.iter().any(|p|p.slot==self.initial_slot),"load the initial physical slot too");
++        let map=Map{run:self.run_id,map_id:self.map_id,initial_slot:self.initial_slot,initial_route:self.initial_route,repeat:self.repeat,entries};map.validate(0,self.initial_slot).map_err(anyhow::Error::msg)?;Ok(map)
++    }
++}
++pub use crate::scan_frame::Hub;
++impl Registers for crate::fpga::IpCore {
++    fn read(&self,offset:usize)->u32 {self.resident_read(offset)}
++    fn write(&self,offset:usize,value:u32){self.resident_write(offset,value)}
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Applied {version:u32,kind:String,id:String,applied:bool,model:bool}
++pub struct RouteLink {listener:TcpListener,socket:Option<TcpStream>,pending:Vec<u8>,offset:usize,input:Vec<u8>,last_event:Option<u64>,pub stale:u64,pub failed:u64,pub requests:u64}
++impl RouteLink {
++    pub fn new(bind:SocketAddr)->Result<Self>{let listener=TcpListener::bind(bind)?;listener.set_nonblocking(true)?;Ok(Self{listener,socket:None,pending:Vec::with_capacity(512),offset:0,input:Vec::with_capacity(512),last_event:None,stale:0,failed:0,requests:0})}
++    pub fn poll(&mut self,state:&AppState,map:&Map)->Result<()> {
++        if self.socket.is_none(){match self.listener.accept(){Ok((s,_))=>{s.set_nonblocking(true)?;self.socket=Some(s);},Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{},Err(e)=>return Err(e.into())}}
++        let event={let core=state.ip_core().lock().unwrap();rcs::pending(&*core).map_err(anyhow::Error::msg)?};
++        if let Some((id,bits))=event {if self.last_event!=Some(id){
++            ensure!(self.offset==self.pending.len(),"previous route request not delivered before another marker");
++            self.pending.clear();self.pending.extend_from_slice(format!("{{\"version\":1,\"kind\":\"route-request\",\"id\":\"{id}\",\"route\":{},\"marker\":{},\"last\":{},\"model_required\":true}}\n",bits>>8,bits&7,(bits>>3)&7).as_bytes());self.offset=0;self.last_event=Some(id);self.requests+=1;
++        }}
++        let Some(socket)=self.socket.as_mut() else{return Ok(());};
++        if self.offset<self.pending.len(){match socket.write(&self.pending[self.offset..]){Ok(0)=>anyhow::bail!("route TCP closed; no partial request replay"),Ok(n)=>self.offset+=n,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{},Err(e)=>return Err(e.into())}}
++        let mut buf=[0;512];match socket.read(&mut buf){
++            Ok(0)=>anyhow::bail!("route TCP closed; quiesce before a new run, no request replay"),
++            Ok(n)=>{ensure!(self.input.len()+n<=512,"bounded applied message exceeded");self.input.extend_from_slice(&buf[..n]);
++                while let Some(end)=self.input.iter().position(|b|*b==b'\n'){
++                    let reply=serde_json::from_slice::<Applied>(&self.input[..end]);
++                    match reply {
++                        Ok(a) if a.version==1 && a.kind=="applied" && a.model=>{
++                            if let Ok(id)=a.id.parse::<u64>() {let core=state.ip_core().lock().unwrap();
++                                if rcs::response(&*core,id,a.applied,map.repeat).is_err(){self.stale+=1;}else if !a.applied{self.failed+=1;}
++                            }else{self.stale+=1;}
++                        },_=>self.stale+=1,
++                    }
++                    self.input.drain(..=end);
++                }
++            },Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{},Err(e)=>return Err(e.into())
++        }Ok(())
++    }
++}
++pub struct Resident {pub map:Map,pub assembler:Assembler,pub wire:Vec<u8>,pub link:RouteLink,pub clean_consumer:u64,pub publish_skipped:u64,last_publish:Instant,period:Duration,pub capture:[u8;16]}
++impl Resident {
++    pub async fn new(state:&AppState,config:&Config,fs:u32,capture:[u8;16])->Result<Self>{
++        let map=config.map()?;let assembler=Assembler::new(map.clone(),fs).map_err(anyhow::Error::msg)?;
++        {let core=state.ip_core().lock().unwrap();rcs::check(&*core).map_err(anyhow::Error::msg)?;ensure!(core.read(0xac)&0x13==0 && core.read(0xd4)==0 && ((core.read(0xac)>>6)&7)==map.initial_slot as u32,"fresh coordinated sweeper lifetime required");}
++        state.ad9361().lock().await.load_resident_profiles(&config.profiles,map.initial_slot).await?;
++        let wire=Vec::with_capacity(assembler.max_wire());state.scan().prepare(assembler.max_wire());
++        let link=RouteLink::new(config.route_bind)?;
++        {let core=state.ip_core().lock().unwrap();rcs::load(&*core,&map).map_err(anyhow::Error::msg)?;}
++        Ok(Self{map,assembler,wire,link,clean_consumer:0,publish_skipped:0,last_publish:Instant::now()-Duration::from_secs(60),period:Duration::from_millis(config.publish_period_ms),capture})
++    }
++    pub fn start(&self,state:&AppState)->Result<()>{let core=state.ip_core().lock().unwrap();rcs::start(&*core,&self.map).map_err(anyhow::Error::msg)}
++    pub fn poll(&mut self,state:&AppState)->Result<bool>{
++        self.link.poll(state,&self.map)?;
++        let core=state.ip_core().lock().unwrap();let status=core.read(0xac);ensure!(status&16==0,"RCS1 fault");
++        *state.scan().status.lock().unwrap()=format!("{{\"version\":1,\"kind\":\"resident-status\",\"run_id\":\"{}\",\"map_id\":\"{}\",\"status\":{},\"visit\":{},\"laps\":{},\"hold_ticks\":{},\"slot\":{},\"route_model\":true}}",self.map.run,self.map.map_id,status,core.read(0xb8),core.read(0xbc),core.read(0xcc),(status>>6)&7);
++        Ok(state.scan().stop.load(Ordering::Relaxed))
++    }
++    /// Internal consumer hook runs on EACH decoded clean FFT, before display
++    /// selection. This counter is a test consumer, not a classifier algorithm.
++    pub fn consume(&mut self,o:&Observation,state:&AppState)->Result<()> {
++        if o.epoch!=0{self.map.resolve(o.epoch).map_err(anyhow::Error::msg)?;self.clean_consumer+=1;}
++        if let Some(lap)=self.assembler.incoming_lap(o).map_err(anyhow::Error::msg)? {
++            if self.assembler.lap.is_some_and(|old|lap>old){self.close(state,true,o.first_tick);self.assembler.begin(lap);}
++        }
++        self.assembler.accept(o).map_err(anyhow::Error::msg)
++    }
++    pub fn close(&mut self,state:&AppState,closed:bool,watermark:u64){if self.assembler.lap.is_none(){return;}self.assembler.encode(self.capture,closed,watermark,&mut self.wire);if self.last_publish.elapsed()>=self.period{state.scan().publish(&self.wire);self.last_publish=Instant::now();}else{self.publish_skipped+=1;}}
++    pub fn stop(&self,state:&AppState)->Result<()>{let core=state.ip_core().lock().unwrap();rcs::stop(&*core,self.map.repeat).map_err(anyhow::Error::msg)}
++}

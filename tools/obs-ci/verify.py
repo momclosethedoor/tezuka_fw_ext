@@ -75,6 +75,15 @@ if arm_only:
     avg_path=artifact/'native-avg-peak-example.json';avg_path.write_text(json.dumps(avg,indent=2)+'\n')
     avg_smoke=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(avg_path)],text=True,timeout=20)
     check('no hardware access' in avg_smoke,'Offline ARM avg/peak config check did not complete')
+    resident=dict(config,resident={'run_id':1,'map_id':18446744073709551615,'initial_slot':0,'initial_route':0,'repeat':True,'profiles':[{'slot':0,'lo_hz':5190000000,'bytes':[0]*16}],'entries':[{'slot':0,'marker':False,'last':0,'route':0,'settling_ticks':0,'dwell_ticks':1000000,'context':1}],'route_bind':'127.0.0.1:9010','publish_period_ms':100,'exclusive_controllers_quiesced':True,'ps_fastlock_outputs_zero':True,'coordinated_external_slot':True})
+    resident_path=artifact/'native-resident-example.json';resident_path.write_text(json.dumps(resident,indent=2)+'\n')
+    resident_smoke=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(resident_path)],text=True,timeout=20)
+    check('no hardware access' in resident_smoke,'Offline ARM resident config check did not complete')
+    for mode in ('scan_ws','sink'):
+        diag=dict(resident,ram_load_test=True,series_windows=8,diagnostics={'mode':mode,'trace':True})
+        diag_path=artifact/('native-diagnostic-'+mode+'.json');diag_path.write_text(json.dumps(diag,indent=2)+'\n')
+        diagnostic_smoke=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(diag_path)],text=True,timeout=20)
+        check('no hardware access' in diagnostic_smoke,'Offline diagnostic schema did not complete')
     invalid=[(dict(config,externally_settled=False),'settling'),
              (dict(avg,series_windows=7),'eight-window'),
              (dict(avg,derived_capture_id=config['capture_id']),'UUID'),
@@ -87,6 +96,18 @@ if arm_only:
             r=subprocess.run(['qemu-arm','-L',str(out/'target'),str(elf),'--check-native-observations',str(path)],capture_output=True,text=True,timeout=20)
             check(r.returncode!=0 and reason in r.stderr,'Unsafe native config was not rejected: '+reason)
     (artifact/'native-arm-offline-check.txt').write_text(smoke+'\n'+avg_smoke+'\nFive negative native/avg-peak cases rejected. No hardware accessed.\n')
+    continuous=dict(capture_id='66666666-6666-4666-8666-666666666666',coordinated_boot_id='22222222-2222-4222-8222-222222222222',externally_settled=True,controllers_quiesced=True,sample_rate=61440000,rx_lo_hz=2400000000,epoch=7,k=2,peak=False,publish_stride=250,run_seconds=60)
+    continuous_path=artifact/'continuous-config-example.json';continuous_path.write_text(json.dumps(continuous,indent=2)+'\n')
+    smoke2=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-continuous-observations',str(continuous_path)],text=True,timeout=20)
+    check('no hardware access' in smoke2,'Offline OBN2 config check failed')
+    obn2_results=[]
+    for golden in sorted((src/'maia-httpd/tests/observation-continuous').glob('*.bin')):
+        text2=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-obn2-record',str(golden)],text=True,timeout=20)
+        check('bins=4096' in text2 and 'no hardware access' in text2,'ARM OBN2 golden decode failed')
+        obn2_results.append({'file':golden.name,'sha256':sha(golden),'result':text2.strip()})
+    check(len(obn2_results)==4,'Missing i5 OBN2 golden records')
+    (artifact/'obn2-arm-offline.json').write_text(json.dumps(obn2_results,indent=2)+'\n')
+    common['continuous_abi']={'id':'OBN2-r2/encoding2','contract_commit':'449b79e839010089836e8202cdae9c6b77d12492','hardware_accepted':False,'static_config':smoke2.strip(),'layout_goldens':obn2_results}
     common['native_abi']={'id':'OBN1-r1','pl_commit':'370d03a02fface2a287d8d7cafb6cee7422217ee','pl_bit_sha256':'311b49bc1d82646ad2f73d33ff475b304318b0e4b0d9049b83f31b087a6b19f9','pl_bin_sha256':'089e9227e72593c546821ca79711caf46246fecff074f741925b7c783ed6ad12','abi_document_sha256':sha(ROOT/'doc/OBN1-ABI-r1.md'),'arm_qemu_offline_config_check':True,'hardware_accepted':False}
     common['synthetic_exerciser']={'sha256':sha(synthetic),'source':'explicit synthetic; not installed or automatically started','interpreter':synthetic_interp,'needed':re.findall(r'Shared library: \[(.*?)\]',synth_info)}
     (artifact/'manifest.json').write_text(json.dumps(common,indent=2)+'\n')

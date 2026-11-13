@@ -1,0 +1,310 @@
+diff --git a/maia-httpd/src/gap_diagnostics.rs b/maia-httpd/src/gap_diagnostics.rs
+new file mode 100644
+index 0000000..03515d9
+--- /dev/null
++++ b/maia-httpd/src/gap_diagnostics.rs
+@@ -0,0 +1,28 @@
++//! Opt-in bounded metadata instrumentation, no RF attribution from live MMIO.
++#![allow(missing_docs)]
++use std::{time::Instant,io::Write,path::Path};
++pub const STAGES:[&str;13]=["arm","capture_wait","dma_copy","ram_assemble","validate_drain","validate_convert","normalize","scan_accept","scan_encode","scan_publish","gobs_encode","gobs_publish","rcs_tcp"];
++pub struct Stamp(Instant,u64);
++pub struct Diagnostic {start:Instant,cpu:fn()->u64,pub sink:bool,pub tracing:bool,records:Vec<[u64;8]>,used:usize,pub dropped:u64,pub wall:[u64;13],pub cpu_ns:[u64;13],pub calls:[u64;13],last_rcs:[u64;6],pub probe_ns:u64}
++impl Diagnostic {
++    pub fn new(sink:bool,tracing:bool,cpu:fn()->u64)->Self {
++        let mut d=Self{start:Instant::now(),cpu,sink,tracing,records:vec![[0;8];65536],used:0,dropped:0,wall:[0;13],cpu_ns:[0;13],calls:[0;13],last_rcs:[u64::MAX;6],probe_ns:0};
++        let probe=Instant::now();for _ in 0..1000{let s=d.stamp();d.finish(0,s);d.event(0,[0;6]);}d.probe_ns=probe.elapsed().as_nanos() as u64;
++        d.used=0;d.wall=[0;13];d.cpu_ns=[0;13];d.calls=[0;13];d.start=Instant::now();d
++    }
++    pub fn stamp(&self)->Stamp {Stamp(Instant::now(),(self.cpu)())}
++    pub fn finish(&mut self,stage:usize,s:Stamp){self.wall[stage]+=s.0.elapsed().as_nanos() as u64;self.cpu_ns[stage]+=(self.cpu)().saturating_sub(s.1);self.calls[stage]+=1;}
++    pub fn event(&mut self,kind:u64,data:[u64;6]){if !self.tracing{return;}if self.used==self.records.len(){self.dropped+=1;return;}self.records[self.used]=[self.start.elapsed().as_nanos() as u64,kind,data[0],data[1],data[2],data[3],data[4],data[5]];self.used+=1;}
++    pub fn rcs(&mut self,data:[u64;6]){if data!=self.last_rcs{self.event(5,data);self.last_rcs=data;}}
++    pub fn write(&self,path:&Path)->std::io::Result<()> {
++        std::fs::create_dir_all(path)?;let mut out=std::io::BufWriter::new(std::fs::File::create(path.join("trace.bin"))?);
++        for row in &self.records[..self.used]{for v in row{out.write_all(&v.to_le_bytes())?;}}out.flush()?;
++        let mut summary=std::fs::File::create(path.join("timings.json"))?;
++        write!(summary,"{{\"version\":1,\"sink\":{},\"trace\":{},\"record_bytes\":64,\"capacity\":65536,\"used\":{},\"dropped\":{},\"probe_1000_stamp_finish_event_ns\":{},\"elapsed_ns\":{},\"cpu_clock\":\"CLOCK_PROCESS_CPUTIME_ID; concurrent server threads included by wall interval\",\"stages\":{{",self.sink,self.tracing,self.used,self.dropped,self.probe_ns,self.start.elapsed().as_nanos())?;
++        for (i,name) in STAGES.iter().enumerate(){write!(summary,"{}\"{}\":{{\"wall_ns\":{},\"cpu_ns\":{},\"calls\":{}}}",if i==0{""}else{","},name,self.wall[i],self.cpu_ns[i],self.calls[i])?;}write!(summary,"}}}}\n")
++    }
++}
++#[cfg(test)] mod tests {use super::*;
++    #[test] fn trace_is_fixed_and_overflow_visible(){let mut d=Diagnostic::new(false,true,||0);let bytes=d.records.len()*64;for i in 0..70000{d.event(4,[i,0,0,0,0,0]);}assert_eq!(d.used,65536);assert_eq!(d.dropped,4464);assert_eq!(d.records.len()*64,bytes);}
++    #[test] fn disabled_trace_preserves_stage_timing(){let mut d=Diagnostic::new(true,false,||10);let s=d.stamp();d.finish(2,s);d.event(4,[0;6]);assert_eq!(d.used,0);assert_eq!(d.calls[2],1);assert_eq!(d.cpu_ns[2],0);}
++}
+diff --git a/maia-httpd/src/lib.rs b/maia-httpd/src/lib.rs
+index d301dd1..533ca55 100644
+--- a/maia-httpd/src/lib.rs
++++ b/maia-httpd/src/lib.rs
+@@ -18,6 +18,7 @@ pub mod native_observation;
+ pub mod native_runtime;
+ pub mod resident_schedule;
+ pub mod scan_frame;
++pub mod gap_diagnostics;
+ pub mod scan_runtime;
+ pub mod observation_transport;
+ pub mod observation_accumulator;
+diff --git a/maia-httpd/src/native_observation.rs b/maia-httpd/src/native_observation.rs
+index 2ae7d1f..2aea919 100644
+--- a/maia-httpd/src/native_observation.rs
++++ b/maia-httpd/src/native_observation.rs
+@@ -54,7 +54,11 @@ impl Adapter{
+     }
+     /// Reuse Observation.power. Native data is normalized and reordered exactly once.
+     pub fn convert(&self,data:&[u8],out:&mut Observation)->Result<Header,String>{
+-        let h=validate(data)?;let id=self.check_context(h)?;
++        self.convert_observed(data,out,|_,_|{})
++    }
++    pub fn convert_observed<F:FnMut(usize,bool)>(&self,data:&[u8],out:&mut Observation,mut observe:F)->Result<Header,String>{
++        observe(5,true);let h=validate(data)?;let id=self.check_context(h)?;observe(5,false);
++        observe(6,true);
+         if out.power.len()!=BINS{return Err("preallocate 4096 output bins".into());}
+         let scale=1.0/(COEFFICIENT_SUM*COEFFICIENT_SUM) as f64;
+         for k in 0..BINS{
+@@ -62,7 +66,7 @@ impl Adapter{
+             let w=u64v(data,8*j);let value=(w&MASK)<<(2*((w>>37)&7));
+             out.power[k]=(value as f64*scale) as f32;
+         }
+-        out.descriptor_id=id;out.seq=h.seq;out.epoch=h.epoch;out.first_tick=h.first_tick;out.nint=1;out.tag=NO_TAG;Ok(h)
++        out.descriptor_id=id;out.seq=h.seq;out.epoch=h.epoch;out.first_tick=h.first_tick;out.nint=1;out.tag=NO_TAG;observe(6,false);Ok(h)
+     }
+ }
+ #[derive(Debug,Clone,Copy,PartialEq,Eq)]
+@@ -102,16 +106,19 @@ pub fn assemble_ram_extent(raw:&[u8],out:&mut[Vec<u8>])->Result<usize,String>{
+ /// All eight physical slots belong to the current complete series. Its last
+ /// seven records fit linearly; the fragmented edge window is counted separately.
+ pub fn drain_ram<D:CompletedDma>(dma:&D,done:Complete,raw:&mut[u8],buffers:&mut[Vec<u8>],adapter:&Adapter,order:&crate::observation_live::Order)->Result<crate::observation_live::Order,String>{
++    drain_ram_observed(dma,done,raw,buffers,adapter,order,|_,_|{})
++}
++pub fn drain_ram_observed<D:CompletedDma,F:FnMut(usize,bool)>(dma:&D,done:Complete,raw:&mut[u8],buffers:&mut[Vec<u8>],adapter:&Adapter,order:&crate::observation_live::Order,mut observe:F)->Result<crate::observation_live::Order,String>{
+     if done.recorded!=8 || done.lost!=0 || done.first_slot!=0 || raw.len()!=8*BYTES{return Err("RAM mode requires one full loss-free completed ring starting at slot zero".into());}
+-    for slot in 0..8{dma.copy_slot(slot,&mut raw[slot*BYTES..(slot+1)*BYTES])?;}
+-    let count=assemble_ram_extent(raw,buffers)?;
+-    let mut checked=order.clone();let mut previous=None;
++    observe(2,true);for slot in 0..8{dma.copy_slot(slot,&mut raw[slot*BYTES..(slot+1)*BYTES])?;}observe(2,false);
++    observe(3,true);let count=assemble_ram_extent(raw,buffers)?;observe(3,false);
++    observe(4,true);let mut checked=order.clone();let mut previous=None;
+     for b in buffers.iter().take(count){
+         let h=validate(b)?;let id=adapter.check_context(h)?;
+         if previous.is_some_and(|v:u64|v.checked_add(1)!=Some(h.seq)){return Err("nonconsecutive records inside one RAM series".into());}
+         checked.accept(h.seq,h.epoch,id,h.first_tick)?;previous=Some(h.seq);
+     }
+-    if previous!=Some(done.last_seq){return Err("RAM completion/header last_seq mismatch".into());}Ok(checked)
++    if previous!=Some(done.last_seq){return Err("RAM completion/header last_seq mismatch".into());}observe(4,false);Ok(checked)
+ }
+ /// Copy ALL slots before any consumer can publish or re-arm. Validate the whole
+ /// series transactionally; the caller's order is unchanged if any record is bad.
+@@ -139,6 +146,12 @@ pub fn is_other_process(name:&std::ffi::OsStr,current:u32)->bool{
+ 
+ #[cfg(test)]
+ mod tests{
++    #[test] fn observer_preserves_exact_native_power_and_metadata(){
++        let adapter=Adapter::new(vec![(7,1)],1).unwrap();let b=fixture("seq-0");let mut a=obs();let mut z=obs();
++        adapter.convert(&b,&mut a).unwrap();let mut phases=Vec::new();adapter.convert_observed(&b,&mut z,|stage,begin|phases.push((stage,begin))).unwrap();
++        assert_eq!((a.seq,a.epoch,a.first_tick,a.descriptor_id),(z.seq,z.epoch,z.first_tick,z.descriptor_id));assert_eq!(a.power,z.power);
++        assert_eq!(phases,[(5,true),(5,false),(6,true),(6,false)]);
++    }
+     #[test]fn ram_loss_quarantine_then_ordinary_rearm_aligns_without_reset_or_stale_reads(){
+         use std::cell::RefCell;
+         struct Mock{slots:RefCell<Vec<usize>>}
+diff --git a/maia-httpd/src/native_runtime.rs b/maia-httpd/src/native_runtime.rs
+index fcb1488..22d5304 100644
+--- a/maia-httpd/src/native_runtime.rs
++++ b/maia-httpd/src/native_runtime.rs
+@@ -25,6 +25,14 @@ pub struct Config{
+     pub accumulate_windows:Option<u32>,
+     pub derived_capture_id:Option<String>,
+     pub resident:Option<crate::scan_runtime::Config>,
++    pub diagnostics:Option<DiagnosticConfig>,
++}
++#[derive(Debug,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct DiagnosticConfig {pub mode:String,pub trace:bool}
++fn process_cpu_ns()->u64 {let mut t:libc::timespec=unsafe{std::mem::zeroed()};let ok=unsafe{libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID,&mut t)};if ok!=0{return 0;}t.tv_sec as u64*1_000_000_000+t.tv_nsec as u64}
++fn observer<'a>(diag:&'a mut Option<crate::gap_diagnostics::Diagnostic>)->impl FnMut(usize,bool)+'a {
++    let mut stamp=None;move |stage,begin|{if let Some(d)=diag.as_mut(){if begin{stamp=Some(d.stamp());}else if let Some(s)=stamp.take(){d.finish(stage,s);}}}
+ }
+ fn uuid(s:&str)->Result<[u8;16]>{
+     let s=s.replace('-',"");ensure!(s.len()==32 && s.is_ascii(),"UUID format");let mut id=[0;16];for (i,x) in id.iter_mut().enumerate(){*x=u8::from_str_radix(&s[2*i..2*i+2],16)?;}ensure!(id!=[0;16],"zero UUID");Ok(id)
+@@ -33,6 +41,7 @@ impl Config{
+     pub fn load(path:&Path)->Result<Self>{let c:Self=serde_json::from_slice(&std::fs::read(path)?)?;c.validate()?;Ok(c)}
+     fn validate(&self)->Result<()>{
+         uuid(&self.capture_id)?;uuid(&self.coordinated_boot_id)?;
++        if let Some(d)=&self.diagnostics{ensure!(matches!(d.mode.as_str(),"scan_ws"|"sink") && self.resident.is_some() && self.ram_load_test,"diagnostics require resident RAM mode scan_ws or sink");}
+         if let Some(r)=&self.resident{let map=r.map()?;crate::scan_frame::Assembler::new(map,self.sample_rate).map_err(anyhow::Error::msg)?;ensure!(self.accumulate_windows.is_none() && self.diagnostic_after_series.is_none(),"resident scan and static accumulator/diagnostic are separate modes");}
+         ensure!(self.externally_settled,"operator must establish static RF settling before asserting validity");
+         ensure!(self.sample_rate>0 && self.rx_lo_hz>0 && self.epoch!=0 && (1..=8).contains(&self.series_windows),"native static profile parameters");
+@@ -72,7 +81,7 @@ impl Guard{
+         writeln!(f,"OBN1-r1 capture={} coordinated_boot={}",c.capture_id,c.coordinated_boot_id)?;f.sync_all()?;Ok(())
+     }
+ }
+-pub struct Runtime{state:AppState,config:Config,_guard:Guard,adapter:Adapter,encoder:Encoder,q:Arc<Fanout>,server:Server,accumulator:Option<Accumulator>,resident:Option<crate::scan_runtime::Resident>}
++pub struct Runtime{state:AppState,config:Config,_guard:Guard,adapter:Adapter,encoder:Encoder,q:Arc<Fanout>,server:Server,accumulator:Option<Accumulator>,resident:Option<crate::scan_runtime::Resident>,diag:Option<crate::gap_diagnostics::Diagnostic>}
+ impl std::fmt::Debug for Runtime{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("NativeRuntime").field("config",&self.config).finish_non_exhaustive()}}
+ impl Runtime{
+     pub async fn new(state:AppState,c:Config,guard:Guard)->Result<Self>{
+@@ -88,9 +97,15 @@ impl Runtime{
+         let server=Server::bind(c.bind,q.clone(),encoder.header().to_vec(),encoder.max_record(),2)?;
+         guard.claim(&c)?;
+         state.ip_core().lock().unwrap().native_invalid();
+-        let resident=if let Some(r)=&c.resident{Some(crate::scan_runtime::Resident::new(&state,r,c.sample_rate,uuid(&c.capture_id)?).await?)}else{None};
++        let mut resident=if let Some(r)=&c.resident{Some(crate::scan_runtime::Resident::new(&state,r,c.sample_rate,uuid(&c.capture_id)?).await?)}else{None};
+         tracing::info!(abi="OBN1-r1",expected_pl_commit=if c.resident.is_some(){"c117a1f90774098da49bd73022e01c72c712435e"}else{"370d03a02fface2a287d8d7cafb6cee7422217ee"},capture=%c.capture_id,derived_capture=?c.derived_capture_id,accumulate_windows=?c.accumulate_windows,ram_load_test=c.ram_load_test,boot=%c.coordinated_boot_id,fs=c.sample_rate,lo=c.rx_lo_hz,enbw=native::ENBW,address=%server.address()?,"native hardware source READY; raw input, frozen static/resident context, not RF calibration");
+-        Ok(Self{state,config:c,_guard:guard,adapter,encoder,q,server,accumulator,resident})
++        let diag=c.diagnostics.as_ref().map(|d|crate::gap_diagnostics::Diagnostic::new(d.mode=="sink",d.trace,process_cpu_ns));
++        if let Some(r)=resident.as_mut(){r.suppress_publication=diag.as_ref().is_some_and(|d|d.sink);}
++        Ok(Self{state,config:c,_guard:guard,adapter,encoder,q,server,accumulator,resident,diag})
++    }
++    fn poll_resident(&mut self)->Result<bool>{
++        let stamp=self.diag.as_ref().map(|d|d.stamp());let stop=if let Some(r)=self.resident.as_mut(){r.poll(&self.state)?}else{false};
++        if let Some(d)=self.diag.as_mut(){d.finish(12,stamp.unwrap());if let Some(r)=&self.resident{let q=&r.link;d.rcs([r.diagnostic_status[0] as u64,r.diagnostic_status[1] as u64,q.requests,q.diagnostic_event(),q.last_reply.0,(q.last_reply.1 as u64)|((q.last_reply.2 as u64)<<1)]);}}Ok(stop)
+     }
+     fn snapshot(&self)->Snapshot{self.state.ip_core().lock().unwrap().native_snapshot()}
+     pub async fn run(mut self)->Result<()>{
+@@ -110,15 +125,18 @@ impl Runtime{
+         if let Some(r)=&self.resident{r.start(&self.state)?;}
+         loop{
+             self.server.poll_accept()?;
+-            if let Some(r)=self.resident.as_mut(){if r.poll(&self.state)? && !stopping{r.stop(&self.state)?;stopping=true;}}
++            if self.poll_resident()? && !stopping{self.resident.as_ref().unwrap().stop(&self.state)?;stopping=true;}
+             let epoch=if self.config.diagnostic_after_series.is_some_and(|n|series_count>=n){self.config.diagnostic_next_epoch.unwrap()}else{self.config.epoch};
+             let capture_count=if self.config.ram_load_test && ram_align_count>0{ram_align_count}else{self.config.series_windows};
+             let series=Series::new(base,capture_count).map_err(anyhow::Error::msg)?;
+-            self.state.ip_core().lock().unwrap().native_arm(epoch,capture_count)?;
++            if let Some(d)=self.diag.as_mut(){d.event(1,[series_count,base.produced as u64,base.last_seq,capture_count as u64,0,0]);}
++            let arm_stamp=self.diag.as_ref().map(|d|d.stamp());self.state.ip_core().lock().unwrap().native_arm(epoch,capture_count)?;
++            if let Some(d)=self.diag.as_mut(){d.finish(0,arm_stamp.unwrap());d.event(7,[series_count,0,0,0,0,0]);}
++            let wait_stamp=self.diag.as_ref().map(|d|d.stamp());
+             let waiting=Instant::now();
+             let (complete,next)=loop{
+                 self.server.poll_accept()?;
+-                if let Some(r)=self.resident.as_mut(){if (r.poll(&self.state)? || start.elapsed().as_secs_f64()>=self.config.run_seconds) && !stopping{r.stop(&self.state)?;stopping=true;}}
++                if self.resident.is_some() && (self.poll_resident()? || start.elapsed().as_secs_f64()>=self.config.run_seconds) && !stopping{self.resident.as_ref().unwrap().stop(&self.state)?;stopping=true;}
+                 let a=self.snapshot();
+                 if let Some(done)=series.completion(a).map_err(anyhow::Error::msg)?{
+                     // Completion counters and last_seq can cross RegisterCDC independently.
+@@ -127,6 +145,7 @@ impl Runtime{
+                 ensure!(waiting.elapsed()<Duration::from_secs(5),"native series timeout; no reset/rearm, coordinate system recovery");
+                 tokio::time::sleep(Duration::from_millis(1)).await;
+             };
++            if let Some(d)=self.diag.as_mut(){d.finish(1,wait_stamp.unwrap());d.event(2,[series_count,complete.recorded as u64,complete.lost as u64,complete.first_slot as u64,complete.last_seq,next.produced as u64]);}
+             wait_us+=waiting.elapsed().as_micros();let drain_start=Instant::now();
+             // Never re-arm until ALL previous records have been invalidated/copied.
+             let quarantine=self.config.ram_load_test && !(complete.recorded==8 && complete.lost==0 && complete.first_slot==0);
+@@ -138,28 +157,34 @@ impl Runtime{
+                     tracing::warn!(selected=capture_count,recorded=complete.recorded,lost=complete.lost,first_slot=complete.first_slot,next_alignment_windows=ram_align_count,"RAM-only whole series quarantined; no stale-slot decode, schedule/counters retained");
+                     Ok(source_order.clone())
+                 }
+-                else if self.config.ram_load_test{ram_align_count=0;consecutive_discard=0;native::drain_ram(&*core,complete,&mut ram,&mut copied,&self.adapter,&source_order)}
++                else if self.config.ram_load_test{ram_align_count=0;consecutive_discard=0;native::drain_ram_observed(&*core,complete,&mut ram,&mut copied,&self.adapter,&source_order,observer(&mut self.diag))}
+                 else{native::drain(&*core,complete,&mut copied,&self.adapter,&source_order)}
+             }.map_err(anyhow::Error::msg)?;
+             let after=self.snapshot();ensure!(next.completion_eq(&after),"DMA completion changed while draining; competing owner/reset");
+             source_order=checked;
+             drain_us+=drain_start.elapsed().as_micros();let decode_start=Instant::now();
+             let count=if quarantine{0}else if self.config.ram_load_test{ram_edges+=1;7}else{complete.recorded as usize};
++            if let Some(d)=self.diag.as_mut(){d.event(3,[series_count,count as u64,quarantine as u64,ram_align_count as u64,0,0]);}
+             for bytes in copied.iter().take(count){
+-                self.adapter.convert(bytes,&mut observation).map_err(anyhow::Error::msg)?;
++                self.adapter.convert_observed(bytes,&mut observation,observer(&mut self.diag)).map_err(anyhow::Error::msg)?;
+                 decoded+=1;
+-                if let Some(r)=self.resident.as_mut(){r.consume(&observation,&self.state)?;
++                if let Some(r)=self.resident.as_mut(){let before=r.assembler.stats.selected;let old_lap=r.assembler.lap;let old_frames=r.assembler.stats.frames;
++                    r.consume_observed(&observation,&self.state,observer(&mut self.diag))?;
++                    if let Some(d)=self.diag.as_mut(){let outcome=if observation.epoch==0{3}else if r.assembler.stats.selected>before{1}else{2};d.event(4,[series_count,observation.seq,observation.epoch,observation.first_tick,outcome,0]);if r.assembler.stats.frames!=old_frames{d.event(6,[old_lap.unwrap_or(u64::MAX),r.assembler.stats.frames,0,0,0,0]);}}
++
+                     // An unclean moving-RF window has no authenticated grid.
+                     // Keep/count it at the native diagnostic boundary, never
+                     // publish it using the first visit's RF descriptor.
+                     if observation.epoch==0{continue;}
+                 }
++                if self.diag.as_ref().is_some_and(|d|d.sink){continue;}
+                 if let Some(a)=self.accumulator.as_mut(){
+                     if a.push(&observation,&mut reduced).map_err(anyhow::Error::msg)?{
+                         self.encoder.observation(&reduced,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
+                     }
+                 }else{
+-                    self.encoder.observation(&observation,&mut frame).map_err(anyhow::Error::msg)?;self.q.publish(&frame).map_err(anyhow::Error::msg)?;output_records+=1;
++                    let enc=self.diag.as_ref().map(|d|d.stamp());self.encoder.observation(&observation,&mut frame).map_err(anyhow::Error::msg)?;if let Some(d)=self.diag.as_mut(){d.finish(10,enc.unwrap());}
++                    let pub_s=self.diag.as_ref().map(|d|d.stamp());self.q.publish(&frame).map_err(anyhow::Error::msg)?;if let Some(d)=self.diag.as_mut(){d.finish(11,pub_s.unwrap());}output_records+=1;
+                 }
+             }
+             series_count+=1;recorded+=complete.recorded as u64;lost+=complete.lost as u64;base=after;
+@@ -178,6 +203,7 @@ impl Runtime{
+         tracing::info!(native_decoded=decoded,ram_edge_records=ram_edges,ram_edge_bytes=ram_edges*native::BYTES as u64,ram_copy_capacity=ram.len(),accumulator_bytes=self.accumulator.as_ref().map(|a|a.storage_bytes()).unwrap_or(0),reduced_power_capacity=reduced.power.capacity(),output_records,accumulator=?self.accumulator.as_ref().map(|a|&a.stats),"native input/reduction accounting; RAM edge exclusion is not native lost");
+         let net=self.server.finish();
+         tracing::info!(series=series_count,produced_delta=base.produced.wrapping_sub(initial.produced),selected=recorded+lost,native_recorded=recorded,native_lost=lost,published=self.q.published(),contention_drops=self.q.contention_drops.load(Ordering::Relaxed),client_missed=net.missed,sent=net.sent,sender_errors=net.errors,partial_disconnects=net.partial_disconnects,queue_capacity=self.q.allocated_payload_bytes(),native_copy_capacity=8*native::BYTES,power_capacity=observation.power.capacity(),frame_capacity=frame.capacity(),elapsed=start.elapsed().as_secs_f64(),"native source stopped; retained lifetime marker requires coordinated new boot for another capture");
++        if let Some(d)=self.diag.as_ref(){let path=Path::new("/tmp/obs005-gap-diagnostics");d.write(path)?;std::fs::write(path.join("config.json"),serde_json::to_vec_pretty(&serde_json::json!({"capture":self.config.capture_id,"boot":self.config.coordinated_boot_id,"config_source":"externally saved exact native.json","trace_schema":{"1":"before arm: series,prev produced,prev selected seq,count","7":"after arm: series","2":"completion: series,recorded,lost,first_slot,lastseq,produced","3":"drained: series,decodecount,quarantine,alignment","4":"decoded: series,seq,epoch,inputtick,outcome1selected2repeat3dirty","5":"RCS sampled: status,visit,requests,eventid,replyid,reply_ok+accepted*2; never record RF attribution","6":"closed frame: oldlap,frames"}}))?)?;}
+         Ok(())
+     }
+ }
+diff --git a/maia-httpd/src/scan_runtime.rs b/maia-httpd/src/scan_runtime.rs
+index 8ec7982..8231c70 100644
+--- a/maia-httpd/src/scan_runtime.rs
++++ b/maia-httpd/src/scan_runtime.rs
+@@ -36,9 +36,10 @@ impl Registers for crate::fpga::IpCore {
+ #[derive(Deserialize)]
+ #[serde(deny_unknown_fields)]
+ struct Applied {version:u32,kind:String,id:String,applied:bool,model:bool}
+-pub struct RouteLink {listener:TcpListener,socket:Option<TcpStream>,pending:Vec<u8>,offset:usize,input:Vec<u8>,last_event:Option<u64>,pub stale:u64,pub failed:u64,pub requests:u64}
++pub struct RouteLink {listener:TcpListener,socket:Option<TcpStream>,pending:Vec<u8>,offset:usize,input:Vec<u8>,last_event:Option<u64>,pub stale:u64,pub failed:u64,pub requests:u64,pub last_reply:(u64,bool,bool)}
+ impl RouteLink {
+-    pub fn new(bind:SocketAddr)->Result<Self>{let listener=TcpListener::bind(bind)?;listener.set_nonblocking(true)?;Ok(Self{listener,socket:None,pending:Vec::with_capacity(512),offset:0,input:Vec::with_capacity(512),last_event:None,stale:0,failed:0,requests:0})}
++    pub fn diagnostic_event(&self)->u64{self.last_event.unwrap_or(0)}
++    pub fn new(bind:SocketAddr)->Result<Self>{let listener=TcpListener::bind(bind)?;listener.set_nonblocking(true)?;Ok(Self{listener,socket:None,pending:Vec::with_capacity(512),offset:0,input:Vec::with_capacity(512),last_event:None,stale:0,failed:0,requests:0,last_reply:(0,false,false)})}
+     pub fn poll(&mut self,state:&AppState,map:&Map)->Result<()> {
+         if self.socket.is_none(){match self.listener.accept(){Ok((s,_))=>{s.set_nonblocking(true)?;self.socket=Some(s);},Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{},Err(e)=>return Err(e.into())}}
+         let event={let core=state.ip_core().lock().unwrap();rcs::pending(&*core).map_err(anyhow::Error::msg)?};
+@@ -56,7 +57,7 @@ impl RouteLink {
+                     match reply {
+                         Ok(a) if a.version==1 && a.kind=="applied" && a.model=>{
+                             if let Ok(id)=a.id.parse::<u64>() {let core=state.ip_core().lock().unwrap();
+-                                if rcs::response(&*core,id,a.applied,map.repeat).is_err(){self.stale+=1;}else if !a.applied{self.failed+=1;}
++                                let accepted=rcs::response(&*core,id,a.applied,map.repeat).is_ok();self.last_reply=(id,a.applied,accepted);if !accepted{self.stale+=1;}else if !a.applied{self.failed+=1;}
+                             }else{self.stale+=1;}
+                         },_=>self.stale+=1,
+                     }
+@@ -66,7 +67,7 @@ impl RouteLink {
+         }Ok(())
+     }
+ }
+-pub struct Resident {pub map:Map,pub assembler:Assembler,pub wire:Vec<u8>,pub link:RouteLink,pub clean_consumer:u64,pub publish_skipped:u64,last_publish:Instant,period:Duration,pub capture:[u8;16]}
++pub struct Resident {pub map:Map,pub assembler:Assembler,pub wire:Vec<u8>,pub link:RouteLink,pub clean_consumer:u64,pub publish_skipped:u64,last_publish:Instant,period:Duration,pub capture:[u8;16],pub diagnostic_status:[u32;4],pub suppress_publication:bool}
+ impl Resident {
+     pub async fn new(state:&AppState,config:&Config,fs:u32,capture:[u8;16])->Result<Self>{
+         let map=config.map()?;let assembler=Assembler::new(map.clone(),fs).map_err(anyhow::Error::msg)?;
+@@ -75,24 +76,29 @@ impl Resident {
+         let wire=Vec::with_capacity(assembler.max_wire());state.scan().prepare(assembler.max_wire());
+         let link=RouteLink::new(config.route_bind)?;
+         {let core=state.ip_core().lock().unwrap();rcs::load(&*core,&map).map_err(anyhow::Error::msg)?;}
+-        Ok(Self{map,assembler,wire,link,clean_consumer:0,publish_skipped:0,last_publish:Instant::now()-Duration::from_secs(60),period:Duration::from_millis(config.publish_period_ms),capture})
++        Ok(Self{map,assembler,wire,link,clean_consumer:0,publish_skipped:0,last_publish:Instant::now()-Duration::from_secs(60),period:Duration::from_millis(config.publish_period_ms),capture,diagnostic_status:[0;4],suppress_publication:false})
+     }
+     pub fn start(&self,state:&AppState)->Result<()>{let core=state.ip_core().lock().unwrap();rcs::start(&*core,&self.map).map_err(anyhow::Error::msg)}
+     pub fn poll(&mut self,state:&AppState)->Result<bool>{
+         self.link.poll(state,&self.map)?;
+         let core=state.ip_core().lock().unwrap();let status=core.read(0xac);ensure!(status&16==0,"RCS1 fault");
+-        *state.scan().status.lock().unwrap()=format!("{{\"version\":1,\"kind\":\"resident-status\",\"run_id\":\"{}\",\"map_id\":\"{}\",\"status\":{},\"visit\":{},\"laps\":{},\"hold_ticks\":{},\"slot\":{},\"route_model\":true}}",self.map.run,self.map.map_id,status,core.read(0xb8),core.read(0xbc),core.read(0xcc),(status>>6)&7);
++        self.diagnostic_status=[status,core.read(0xb8),core.read(0xbc),core.read(0xcc)];
++        *state.scan().status.lock().unwrap()=format!("{{\"version\":1,\"kind\":\"resident-status\",\"run_id\":\"{}\",\"map_id\":\"{}\",\"status\":{},\"visit\":{},\"laps\":{},\"hold_ticks\":{},\"slot\":{},\"route_model\":true}}",self.map.run,self.map.map_id,status,self.diagnostic_status[1],self.diagnostic_status[2],self.diagnostic_status[3],(status>>6)&7);
+         Ok(state.scan().stop.load(Ordering::Relaxed))
+     }
+     /// Internal consumer hook runs on EACH decoded clean FFT, before display
+     /// selection. This counter is a test consumer, not a classifier algorithm.
+     pub fn consume(&mut self,o:&Observation,state:&AppState)->Result<()> {
++        self.consume_observed(o,state,|_,_|{})
++    }
++    pub fn consume_observed<F:FnMut(usize,bool)>(&mut self,o:&Observation,state:&AppState,mut observe:F)->Result<()> {
+         if o.epoch!=0{self.map.resolve(o.epoch).map_err(anyhow::Error::msg)?;self.clean_consumer+=1;}
+         if let Some(lap)=self.assembler.incoming_lap(o).map_err(anyhow::Error::msg)? {
+-            if self.assembler.lap.is_some_and(|old|lap>old){self.close(state,true,o.first_tick);self.assembler.begin(lap);}
++            if self.assembler.lap.is_some_and(|old|lap>old){self.close_observed(state,true,o.first_tick,&mut observe);self.assembler.begin(lap);}
+         }
+-        self.assembler.accept(o).map_err(anyhow::Error::msg)
++        observe(7,true);let result=self.assembler.accept(o).map_err(anyhow::Error::msg);observe(7,false);result
+     }
+-    pub fn close(&mut self,state:&AppState,closed:bool,watermark:u64){if self.assembler.lap.is_none(){return;}self.assembler.encode(self.capture,closed,watermark,&mut self.wire);if self.last_publish.elapsed()>=self.period{state.scan().publish(&self.wire);self.last_publish=Instant::now();}else{self.publish_skipped+=1;}}
++    pub fn close(&mut self,state:&AppState,closed:bool,watermark:u64){self.close_observed(state,closed,watermark,&mut |_,_|{});}
++    pub fn close_observed<F:FnMut(usize,bool)>(&mut self,state:&AppState,closed:bool,watermark:u64,observe:&mut F){if self.assembler.lap.is_none(){return;}observe(8,true);self.assembler.encode(self.capture,closed,watermark,&mut self.wire);observe(8,false);observe(9,true);if self.last_publish.elapsed()>=self.period{if !self.suppress_publication{state.scan().publish(&self.wire);}self.last_publish=Instant::now();}else{self.publish_skipped+=1;}observe(9,false);}
+     pub fn stop(&self,state:&AppState)->Result<()>{let core=state.ip_core().lock().unwrap();rcs::stop(&*core,self.map.repeat).map_err(anyhow::Error::msg)}
+ }

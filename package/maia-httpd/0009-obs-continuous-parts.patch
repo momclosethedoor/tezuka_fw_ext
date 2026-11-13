@@ -1,0 +1,2028 @@
+diff --git a/maia-httpd/src/app.rs b/maia-httpd/src/app.rs
+index 7bbe227..dba2e4d 100644
+--- a/maia-httpd/src/app.rs
++++ b/maia-httpd/src/app.rs
+@@ -26,6 +26,7 @@ pub struct App {
+     recorder_finish: RecorderFinishWaiter,
+     spectrometer: Option<Spectrometer>,
+     native: Option<crate::native_runtime::Runtime>,
++    continuous: Option<crate::continuous_live::Runtime>,
+ }
+ 
+ impl App {
+@@ -34,12 +35,16 @@ impl App {
+     pub async fn new(args: &Args) -> Result<App> {
+         // Initialize and build application state
+         let native_config=args.native_observations.as_deref().map(crate::native_runtime::Config::load).transpose()?;
++        let continuous_config=args.continuous_observations.as_deref().map(crate::continuous_live::Config::load).transpose()?;
++        let continuous_guard=continuous_config.as_ref().map(crate::continuous_live::Guard::acquire).transpose()?;
+         let native_guard=native_config.as_ref().map(crate::native_runtime::Guard::acquire).transpose()?;
+-        let (ip_core, interrupt_handler) = if native_config.is_some(){IpCore::take_native().await?}else{IpCore::take().await?};
++        let (ip_core, interrupt_handler) = if continuous_config.is_some(){IpCore::take_continuous().await?}else if native_config.is_some(){IpCore::take_native().await?}else{IpCore::take().await?};
+         let ip_core = std::sync::Mutex::new(ip_core);
+         let ad9361 = tokio::sync::Mutex::new(Ad9361::new().await?);
+         let recorder = RecorderState::new(&ad9361, &ip_core).await?;
+         let state = AppState(Arc::new(State {
++            continuous_observations: continuous_config.is_some(),
++            parts: Mutex::new(None),
+             native_observations: native_config.is_some(),
+             scan: Default::default(),
+             ad9361,
+@@ -57,13 +62,14 @@ impl App {
+         // Build application objects
+ 
+         let (waterfall_sender, _) = broadcast::channel(16);
+-        let spectrometer = if native_config.is_none(){Some(Spectrometer::new(
++        let spectrometer = if native_config.is_none()&&continuous_config.is_none(){Some(Spectrometer::new(
+             state.clone(),
+             interrupt_handler.waiter_spectrometer(),
+             waterfall_sender.clone(),
+         ))}else{None};
+ 
+         let native=if let Some(config)=native_config{Some(crate::native_runtime::Runtime::new(state.clone(),config,native_guard.unwrap()).await?)}else{None};
++        let continuous=if let Some(config)=continuous_config{Some(crate::continuous_live::Runtime::new(state.clone(),config,continuous_guard.unwrap()).await?)}else{None};
+ 
+         let recorder_finish =
+             RecorderFinishWaiter::new(state.clone(), interrupt_handler.waiter_recorder());
+@@ -80,6 +86,7 @@ impl App {
+         .await?;
+ 
+         Ok(App {
++            continuous,
+             httpd,
+             interrupt_handler,
+             recorder_finish,
+@@ -93,6 +100,9 @@ impl App {
+     /// This only returns if one of the objects that form the application fails.
+     #[tracing::instrument(name = "App::run", level = "debug", skip_all)]
+     pub async fn run(self) -> Result<()> {
++        if let Some(continuous)=self.continuous{
++            return tokio::select!{ret=self.httpd.run()=>ret,ret=self.interrupt_handler.run_polling()=>ret,ret=self.recorder_finish.run()=>ret,ret=continuous.run()=>ret};
++        }
+         if let Some(native)=self.native{
+             // Native uses completion counters; neither legacy IRQ blocking read
+             // nor recorder-finish waiter is needed (mutating native HTTP is locked).
+@@ -118,6 +128,8 @@ pub struct AppState(Arc<State>);
+ 
+ #[derive(Debug)]
+ struct State {
++    continuous_observations: bool,
++    parts: Mutex<Option<Arc<Mutex<crate::continuous::PartsHub>>>>,
+     scan: crate::scan_runtime::Hub,
+     native_observations: bool,
+     ad9361: tokio::sync::Mutex<Ad9361>,
+@@ -128,6 +140,12 @@ struct State {
+ }
+ 
+ impl AppState {
++    /// The OBN2 static source has its own RF policy and recorder lifecycle.
++    pub fn continuous_observations(&self)->bool{self.0.continuous_observations}
++    /// Attach the continuous hub only after validating the hardware contract.
++    pub fn set_parts(&self,hub:Arc<Mutex<crate::continuous::PartsHub>>){*self.0.parts.lock().unwrap()=Some(hub);}
++    /// Continuous shared transport, independent of the legacy whole-frame hub.
++    pub fn parts(&self)->Option<Arc<Mutex<crate::continuous::PartsHub>>>{self.0.parts.lock().unwrap().clone()}
+     /// Bounded resident publication and command state in the existing application.
+     pub fn scan(&self)->&crate::scan_runtime::Hub{&self.0.scan}
+     /// The experimental native source freezes RF mutations and disables legacy waterfall.
+diff --git a/maia-httpd/src/args.rs b/maia-httpd/src/args.rs
+index 6ec2074..5acaa3c 100644
+--- a/maia-httpd/src/args.rs
++++ b/maia-httpd/src/args.rs
+@@ -10,6 +10,15 @@ use std::{net::SocketAddr, path::PathBuf};
+ #[derive(Parser, Debug, Clone, Eq, PartialEq, Hash)]
+ #[clap(author, version, about, long_about = None)]
+ pub struct Args {
++    /// Static OBN2 r2 continuous source. Requires the matching PL, no fallback.
++    #[clap(long,conflicts_with_all=["native_observations","check_native_observations"])]
++    pub continuous_observations: Option<PathBuf>,
++    /// Validate OBN2 static configuration offline, without opening hardware.
++    #[clap(long,conflicts_with_all=["continuous_observations","native_observations","check_native_observations"])]
++    pub check_continuous_observations: Option<PathBuf>,
++    /// Decode and normalize an OBN2 golden record offline, no hardware access.
++    #[clap(long,conflicts_with_all=["continuous_observations","native_observations"])]
++    pub check_obn2_record: Option<PathBuf>,
+     /// Experimental static raw OBN1 source config; requires a coordinated A/1R1T RAM boot.
+     #[clap(long)]
+     pub native_observations: Option<PathBuf>,
+@@ -46,6 +55,9 @@ pub struct Args {
+ impl Default for Args {
+     fn default() -> Args {
+         Args {
++            continuous_observations: None,
++            check_continuous_observations: None,
++            check_obn2_record: None,
+             native_observations: None,
+             check_native_observations: None,
+             listen: "0.0.0.0:8000".parse().unwrap(),
+diff --git a/maia-httpd/src/continuous.rs b/maia-httpd/src/continuous.rs
+new file mode 100644
+index 0000000..98b83c7
+--- /dev/null
++++ b/maia-httpd/src/continuous.rs
+@@ -0,0 +1,137 @@
++//! Continuous owned-copy reader. Hardware binding requires the versioned PL contract.
++//! OBN2 r2/encoding2 contract: goofy_docs 449b79e8. Golden acceptance is separate.
++#![allow(missing_docs)]
++use std::collections::VecDeque;
++pub const BYTES:usize=32768;
++pub const BINS:usize=4096;
++pub const SLOTS:usize=8;
++pub const ABI:u32=0x324e424f;
++pub const TICK_HZ:u64=62_500_000;
++fn u16v(b:&[u8],i:usize)->u16{u16::from_le_bytes(b[i..i+2].try_into().unwrap())}
++fn u32v(b:&[u8],i:usize)->u32{u32::from_le_bytes(b[i..i+4].try_into().unwrap())}
++fn u64v(b:&[u8],i:usize)->u64{u64::from_le_bytes(b[i..i+8].try_into().unwrap())}
++#[derive(Debug,Clone,Copy,PartialEq,Eq)]
++pub struct Header{pub first_seq:u64,pub last_seq:u64,pub epoch:u64,pub first_tick:u64,pub k:u32,pub flags:u32,pub ordinal:u64}
++impl Header{pub fn clean(self)->bool{self.flags&1!=0}pub fn peak(self)->bool{self.flags&4!=0}}
++/// Cheap metadata validation, before payload normalization or serialization.
++pub fn header(b:&[u8])->Result<Header,String>{
++    if b.len()!=BYTES{return Err("OBN2 slot length".into())}
++    let mut h=[0u8;64];for j in 0..64{h[j]=b[j*8+7];}
++    if u32v(&h,0)!=ABI || u16v(&h,4)!=2 || u16v(&h,6)!=64 || u32v(&h,32)!=4096 || u32v(&h,40)!=TICK_HZ as u32 || u32v(&h,48)!=2 || u32v(&h,52)!=BYTES as u32{return Err("OBN2 ABI/revision/encoding/constants".into())}
++    let k=u32v(&h,36);if !(1..=1023).contains(&k){return Err("OBN2 actualK".into())}
++    let first_seq=u64v(&h,8);let last_seq=first_seq.checked_add(k as u64-1).ok_or("OBN2 sequence exhaustion")?;
++    let x=Header{first_seq,epoch:u64v(&h,16),first_tick:u64v(&h,24),k,flags:u32v(&h,44),last_seq,ordinal:u64v(&h,56)};
++    if x.flags&!7!=0 || !x.clean() || x.epoch==0 || x.first_tick==u64::MAX{return Err("OBN2 count/flags/continuous clean group".into())}
++    Ok(x)
++}
++/// All bins in encoding2 are already natural fftshifted. No bit reversal.
++pub fn normalize(b:&[u8],h:Header,scale:f64,out:&mut[f32])->Result<(),String>{
++    if b.len()!=BYTES || out.len()!=BINS || !scale.is_finite() || scale<=0.{return Err("OBN2 conversion bounds/scale".into())}
++    // Validate the complete payload before changing the prepared product.
++    for (j,w) in b.chunks_exact(8).enumerate(){let w=u64v(w,0);if (w>>47)&7>4 || (w>>50)&63!=0 || j>=64 && w>>56!=0{return Err("OBN2 M47E3/reserved".into())}}
++    let scale=scale/if h.peak(){1.}else{h.k as f64};
++    for (dst,w) in out.iter_mut().zip(b.chunks_exact(8)){let w=u64v(w,0);*dst=(((w&((1u64<<47)-1)) as f64)*(1u64<<(2*((w>>47)&7))) as f64*scale) as f32;if !dst.is_finite(){return Err("OBN2 power overflow".into())}}
++    Ok(())
++}
++#[derive(Clone,Copy,Debug)]
++pub struct Snapshot{pub cookie:u32,pub committed:u64,pub reserved:u64,pub released:u64,pub selected:u64,pub dropped:u64,pub running:bool,pub dma_busy:bool,pub drained:bool,pub fault:bool}
++/// Implement only from i5's final CONTRACT. copy_slot includes cache invalidation.
++pub trait RingIo{fn start(&mut self)->Result<(),String>;fn snapshot(&mut self)->Result<Snapshot,String>;fn copy_slot(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;fn release(&mut self,cookie:u32,tail:u64)->Result<(),String>;fn stop(&mut self)->Result<(),String>;}
++#[derive(Default,Debug)]pub struct ReaderStats{pub copied:u64,pub serviced:u64,pub high_water:u64}
++pub struct Reader{cookie:u32,next:u64,stopping:bool,previous:Snapshot,scratch:Vec<u8>,pub stats:ReaderStats}
++impl Reader{
++    pub fn attach(s:Snapshot)->Result<Self,String>{if s.cookie==0 || s.fault || s.released>s.committed || s.committed-s.released>SLOTS as u64{return Err("ring attach snapshot".into())}Ok(Self{cookie:s.cookie,next:s.released,stopping:false,previous:s,scratch:vec![0;BYTES],stats:Default::default()})}
++    fn checked(&self,s:Snapshot)->Result<(),String>{
++        if s.cookie!=self.cookie || s.released!=self.next || s.committed<self.previous.committed || s.selected<self.previous.selected || s.dropped<self.previous.dropped || s.committed<s.released || s.reserved<s.committed || s.reserved-s.released>SLOTS as u64{return Err("ring lifetime/cursor/ownership/fault".into())}Ok(())
++    }
++    /// Drain what is ready now, never wait for a full ring/batch. Release each
++    /// owned record before queueing; processing receives no borrowed DMA memory.
++    pub fn service<I:RingIo>(&mut self,io:&mut I,q:&mut OwnedQueue)->Result<Snapshot,String>{
++        let s=io.snapshot()?;self.checked(s)?;self.stats.high_water=self.stats.high_water.max(s.committed-self.next);
++        for tail in self.next..s.committed{
++            io.copy_slot((tail%SLOTS as u64) as usize,&mut self.scratch)?;
++            if header(&self.scratch)?.ordinal!=tail{return Err("committed slot ordinal mismatch; no release".into())}
++            io.release(self.cookie,tail+1)?;self.next=tail+1;
++            q.push_swap(&mut self.scratch);self.stats.copied+=1;
++        }
++        self.previous=s;self.stats.serviced+=1;if s.fault{return Err("PL fatal after draining valid committed prefix".into())}Ok(s)
++    }
++    pub fn stop<I:RingIo>(&mut self,io:&mut I)->Result<(),String>{if !self.stopping{io.stop()?;self.stopping=true;}Ok(())}
++    pub fn drained(&self,s:Snapshot)->bool{self.stopping&&s.drained&&!s.running&&!s.dma_busy&&self.next==s.committed&&s.reserved==s.committed}
++}
++/// Fixed pool; overwrite only an owned, unprocessed record, with visible loss.
++pub struct OwnedQueue{slots:Vec<Vec<u8>>,head:usize,len:usize,pub dropped:u64}
++impl OwnedQueue{
++    pub fn new(cap:usize)->Result<Self,String>{if !(1..=8).contains(&cap){return Err("owned queue capacity".into())}Ok(Self{slots:(0..cap).map(|_|vec![0;BYTES]).collect(),head:0,len:0,dropped:0})}
++    fn push_swap(&mut self,b:&mut Vec<u8>){if self.len==self.slots.len(){self.head=(self.head+1)%self.slots.len();self.len-=1;self.dropped+=1;}let i=(self.head+self.len)%self.slots.len();std::mem::swap(&mut self.slots[i],b);self.len+=1;}
++    pub fn pop_swap(&mut self,out:&mut Vec<u8>)->bool{assert_eq!(out.len(),BYTES);if self.len==0{return false}std::mem::swap(out,&mut self.slots[self.head]);self.head=(self.head+1)%self.slots.len();self.len-=1;true}
++    pub fn storage_bytes(&self)->usize{self.slots.iter().map(|s|s.capacity()).sum()}
++}
++#[derive(Clone,Debug)]pub struct Context{pub epoch:u64,pub position:u32,pub flags:u32,pub scale:f64}
++#[derive(Default,Debug)]pub struct PrepareStats{pub dirty:u64,pub duplicate:u64,pub unselected:u64,pub normalized:u64,pub gaps:u64}
++/// The selector updates acceptance only after full validation/normalization.
++/// tick_period limits publication, not K. Zero means no temporal thinning.
++pub struct Prepare{contexts:Vec<Context>,last:Option<Header>,last_selected:Vec<Option<Header>>,pub stats:PrepareStats,pub tick_period:u64}
++pub struct PreparedPart<'a>{pub header:Header,pub position:u32,pub power:&'a[f32]}
++impl Prepare{
++    pub fn new(contexts:Vec<Context>,tick_period:u64)->Result<Self,String>{
++        if contexts.is_empty()||contexts.len()>8{return Err("context bound".into())}
++        for(i,c)in contexts.iter().enumerate(){if c.epoch==0||c.position as usize!=i||c.flags&!6!=0||!c.scale.is_finite()||c.scale<=0.||contexts[..i].iter().any(|p|p.epoch==c.epoch){return Err("immutable context".into())}}
++        let n=contexts.len();Ok(Self{contexts,last:None,last_selected:vec![None;n],stats:Default::default(),tick_period})
++    }
++    pub fn accept<'a>(&mut self,b:&[u8],power:&'a mut[f32])->Result<Option<PreparedPart<'a>>,String>{
++        self.accept_if(b,power,|_,_|true)
++    }
++    pub fn accept_if<'a,F:FnOnce(Header,&Context)->bool>(&mut self,b:&[u8],power:&'a mut[f32],selected:F)->Result<Option<PreparedPart<'a>>,String>{
++        let h=header(b)?;
++        if let Some(prev)=self.last{
++            if h==prev{self.stats.duplicate+=1;return Ok(None)}
++            if h.first_seq<=prev.last_seq||h.first_tick<=prev.first_tick{return Err("input group reset/order/conflicting repeat".into())}
++            self.stats.gaps+=h.first_seq-prev.last_seq-1;
++        }
++        self.last=Some(h);
++        if !h.clean(){self.stats.dirty+=1;return Ok(None)}
++        let c=self.contexts.iter().find(|c|c.epoch==h.epoch).ok_or("unknown carried epoch")?;
++        if h.flags&6!=c.flags{return Err("carried source/mode differs from descriptor".into())}
++        let i=c.position as usize;
++        if !selected(h,c){self.stats.unselected+=1;return Ok(None)}
++        if self.last_selected[i].is_some_and(|p|h.first_tick-p.first_tick<self.tick_period){self.stats.unselected+=1;return Ok(None)}
++        normalize(b,h,c.scale,power)?;self.last_selected[i]=Some(h);self.stats.normalized+=1;
++        Ok(Some(PreparedPart{header:h,position:c.position,power}))
++    }
++}
++
++/// Shared bounded batch hub. Descriptor is a mandatory reconnect preamble;
++/// it is not evicted by data. No acquisition lock is held during socket sends.
++#[derive(Debug)]pub struct PartsHub{generation:u64,descriptor:Vec<u8>,batches:VecDeque<(u64,Vec<u8>)>,next:u64,capacity:usize,max:usize,pub evicted:u64}
++#[derive(Default)]pub struct Cursor{generation:u64,last:u64,pub missed:u64}
++impl PartsHub{
++    pub fn new(capacity:usize,max:usize)->Result<Self,String>{if !(1..=8).contains(&capacity)||max>262144||max<64{return Err("batch hub bound".into())}Ok(Self{generation:0,descriptor:Vec::new(),batches:VecDeque::with_capacity(capacity),next:0,capacity,max,evicted:0})}
++    pub fn descriptor(&mut self,data:&[u8])->Result<(),String>{if data.len()>self.max{return Err("descriptor maximum".into())}self.generation=self.generation.checked_add(1).ok_or("generation exhaustion")?;self.descriptor.clear();self.descriptor.extend_from_slice(data);self.batches.clear();Ok(())}
++    pub fn publish(&mut self,data:&[u8])->Result<(),String>{if self.generation==0||data.len()>self.max{return Err("missing descriptor/batch maximum".into())}self.next=self.next.checked_add(1).ok_or("batch exhaustion")?;if self.batches.len()==self.capacity{self.batches.pop_front();self.evicted+=1;}self.batches.push_back((self.next,data.to_vec()));Ok(())}
++    pub fn poll(&self,c:&mut Cursor,out:&mut Vec<u8>)->bool{
++        if c.generation!=self.generation{if self.generation==0{return false}c.generation=self.generation;c.last=self.batches.front().map(|x|x.0-1).unwrap_or(self.next);out.clear();out.extend_from_slice(&self.descriptor);return true}
++        if let Some((n,b))=self.batches.iter().find(|(n,_)|*n>c.last){c.missed+=n.saturating_sub(c.last+1);c.last=*n;out.clear();out.extend_from_slice(b);return true}false
++    }
++    pub fn storage_bytes(&self)->usize{self.descriptor.capacity()+self.batches.iter().map(|(_,b)|b.capacity()).sum::<usize>()}
++}
++
++#[cfg(test)]mod tests{
++    use super::*;
++    #[test]fn exact_i5_golden_all_bins(){
++        let root=std::env::var("OBS_OBN2_VECTOR_ROOT").unwrap_or_else(|_|"maia-httpd/tests/observation-continuous".into());
++        for(i,(k,peak,name))in [(1,false,"layout-k1-sum.bin"),(2,false,"layout-k2-sum.bin"),(3,true,"layout-k3-peak.bin"),(1023,false,"layout-k1023-sum.bin")].into_iter().enumerate(){
++            let b=std::fs::read(std::path::Path::new(&root).join(name)).unwrap();let h=header(&b).unwrap();assert_eq!(h.k,k);assert_eq!(h.peak(),peak);assert_eq!(h.ordinal,0x100000000+i as u64);assert_eq!(h.first_seq,0x1234567800000000+i as u64*1024);assert_eq!(h.last_seq,h.first_seq+k as u64-1);
++            let mut p=vec![0.;4096];normalize(&b,h,1./750668f64.powi(2),&mut p).unwrap();
++            for j in 0..4096{let m=if j==0{0}else if j==1{(1u64<<47)-1}else{((j as u64+1)*0x123456789ab+i as u64*0xffeeddccbb)&((1u64<<47)-1)};let e=(j+i)%5;let want=((m as f64*(1u64<<(2*e))as f64)/750668f64.powi(2)/if peak{1.}else{k as f64})as f32;assert!((p[j]-want).abs()<=want.abs()*f32::EPSILON,"bin {j} {name}");}
++            if let Ok(dir)=std::env::var("OBS_CONTINUOUS_OUTPUT_DIR"){std::fs::create_dir_all(&dir).unwrap();let bytes:Vec<u8>=p.iter().flat_map(|v|v.to_le_bytes()).collect();std::fs::write(std::path::Path::new(&dir).join(format!("{name}.f32")),bytes).unwrap();}
++        }
++    }
++    fn record(seq:u64,epoch:u64,k:u32,peak:bool)->Vec<u8>{let mut h=[0u8;64];h[0..4].copy_from_slice(&ABI.to_le_bytes());h[4..6].copy_from_slice(&2u16.to_le_bytes());h[6..8].copy_from_slice(&64u16.to_le_bytes());for(o,v)in[(8,seq),(16,epoch),(24,1000+seq*100),(56,seq)]{h[o..o+8].copy_from_slice(&v.to_le_bytes())}for(o,v)in[(32,4096),(36,k),(40,TICK_HZ as u32),(44,(epoch!=0)as u32|((peak as u32)<<2)),(48,2),(52,BYTES as u32)]{h[o..o+4].copy_from_slice(&v.to_le_bytes())}let mut b=vec![0;BYTES];for j in 0..BINS{let e=j%5;let w=(j as u64*19+7)|((e as u64)<<47)|if j<64{(h[j]as u64)<<56}else{0};b[j*8..j*8+8].copy_from_slice(&w.to_le_bytes());}b}
++    #[test]fn all_bins_sum_peak_and_selection(){let scale=1./750668f64.powi(2);for k in[1,2,3,1023]{for peak in[false,true]{let b=record(1,7,k,peak);let h=header(&b).unwrap();let mut p=vec![0.;4096];normalize(&b,h,scale,&mut p).unwrap();for j in 0..4096{assert_eq!(p[j],((j as u64*19+7)as f64*(1u64<<(2*(j%5)))as f64*scale/if peak{1.}else{k as f64})as f32)}}}let b=record(1,7,2,false);let mut p=vec![0.;4096];let mut prep=Prepare::new(vec![Context{epoch:7,position:0,flags:0,scale}],1000).unwrap();assert!(prep.accept(&b,&mut p).unwrap().is_some());assert!(prep.accept(&b,&mut p).unwrap().is_none());let mut skip=record(3,7,2,false);skip[4095*8+6]=255;assert!(prep.accept(&skip,&mut p).unwrap().is_none());assert_eq!(prep.stats.normalized,1);assert!(prep.accept(&record(5,0,2,false),&mut p).is_err());assert!(prep.accept(&record(7,8,2,false),&mut p).is_err());}
++    struct Mock{data:Vec<Vec<u8>>,snap:Snapshot,copies:u64,releases:u64,stops:u64}
++    impl RingIo for Mock{fn start(&mut self)->Result<(),String>{self.snap.running=true;Ok(())}fn snapshot(&mut self)->Result<Snapshot,String>{Ok(self.snap)}fn copy_slot(&mut self,s:usize,b:&mut[u8])->Result<(),String>{b.copy_from_slice(&self.data[s]);self.copies+=1;Ok(())}fn release(&mut self,c:u32,t:u64)->Result<(),String>{assert_eq!(c,self.snap.cookie);assert!(t<=self.snap.committed);self.snap.released=t;self.releases+=1;Ok(())}fn stop(&mut self)->Result<(),String>{self.stops+=1;self.snap.running=false;self.snap.drained=true;Ok(())}}
++    #[test]fn wrap_full_release_before_processing_stop_reset(){let s=Snapshot{cookie:7,committed:0,reserved:0,released:0,selected:0,dropped:0,running:true,dma_busy:false,drained:false,fault:false};let mut io=Mock{data:(0..8).map(|_|vec![0;BYTES]).collect(),snap:s,copies:0,releases:0,stops:0};let mut r=Reader::attach(s).unwrap();let mut q=OwnedQueue::new(3).unwrap();for batch in 0..100{for j in 0..8{io.data[j]=record((batch*8+j)as u64,7,1,false)}io.snap.committed+=8;io.snap.reserved=io.snap.committed;io.snap.selected+=8;r.service(&mut io,&mut q).unwrap();assert_eq!(io.snap.released,io.snap.committed);}assert_eq!(r.stats.copied,800);assert_eq!(q.dropped,797);assert_eq!(q.storage_bytes(),3*BYTES);let mut out=vec![0;BYTES];assert!(q.pop_swap(&mut out));assert_eq!(header(&out).unwrap().ordinal,797);r.stop(&mut io).unwrap();r.stop(&mut io).unwrap();let s=r.service(&mut io,&mut q).unwrap();assert!(r.drained(s));assert_eq!(io.stops,1);io.snap.cookie+=1;assert!(r.service(&mut io,&mut q).is_err());}
++    #[test]fn slow_client_gets_descriptor_then_visible_gap(){let mut h=PartsHub::new(2,64).unwrap();h.descriptor(&[1;64]).unwrap();let mut slow=Cursor::default();let mut o=Vec::new();assert!(h.poll(&mut slow,&mut o));for i in 0..10000{h.publish(&[i as u8;64]).unwrap();}assert!(h.storage_bytes()<=3*64);assert!(h.poll(&mut slow,&mut o));assert_eq!(slow.missed,9998);let mut reconnect=Cursor::default();assert!(h.poll(&mut reconnect,&mut o));assert_eq!(o,[1;64]);h.descriptor(&[2;64]).unwrap();assert!(h.poll(&mut slow,&mut o));assert_eq!(o,[2;64]);}
++    #[test]fn reject_reserved_payload_and_malformed_groups(){let mut b=record(4,7,2,false);b[600*8+6]=4;let mut out=vec![0.;4096];assert!(normalize(&b,header(&b).unwrap(),1.,&mut out).is_err());let mut b=record(4,7,2,false);b[36*8+7]=0;assert!(header(&b).is_err());}
++}
+diff --git a/maia-httpd/src/continuous_live.rs b/maia-httpd/src/continuous_live.rs
+new file mode 100644
+index 0000000..249124f
+--- /dev/null
++++ b/maia-httpd/src/continuous_live.rs
+@@ -0,0 +1,46 @@
++//! Static OBN2 r2 binding, contract 449b79e839010089836e8202cdae9c6b77d12492.
++//! No PL load, RF hop, automatic RF retune or production RAM correction.
++#![allow(missing_docs)]
++use crate::{app::AppState,continuous::{self as c,RingIo,Snapshot},continuous_runtime::{self,CountingConsumer,StaticPass},scan_parts::{Descriptor,Entry,Identity}};
++use anyhow::{Result,ensure};
++use serde::Deserialize;
++use std::{path::Path,fs::{File,OpenOptions},os::fd::AsRawFd,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::Duration};
++#[derive(Clone,Debug,Deserialize)]#[serde(deny_unknown_fields)]pub struct Config{
++    pub capture_id:String,pub coordinated_boot_id:String,pub sample_rate:u32,pub rx_lo_hz:u64,pub epoch:u64,
++    #[serde(default="two")]pub k:u32,#[serde(default)]pub peak:bool,#[serde(default="stride")]pub publish_stride:u32,
++    pub externally_settled:bool,pub controllers_quiesced:bool,pub run_seconds:f64,
++}
++fn two()->u32{2}fn stride()->u32{250}
++pub fn http_rejection(method:&str,path:&str)->bool{!matches!(method,"GET"|"HEAD")&&(path.starts_with("/api/ad9361")||path.starts_with("/api/spectrometer"))}
++pub fn uuid(s:&str)->Result<[u8;16]>{let s=s.replace('-',"");ensure!(s.len()==32&&s.is_ascii(),"UUID format");let mut id=[0;16];for(i,b)in id.iter_mut().enumerate(){*b=u8::from_str_radix(&s[i*2..i*2+2],16)?;}ensure!(id!=[0;16],"zero UUID");Ok(id)}
++impl Config{pub fn load(p:&Path)->Result<Self>{let c:Self=serde_json::from_slice(&std::fs::read(p)?)?;c.validate()?;Ok(c)}pub fn validate(&self)->Result<()>{uuid(&self.capture_id)?;uuid(&self.coordinated_boot_id)?;ensure!(self.externally_settled&&self.controllers_quiesced,"static RF/owner prerequisites must be established");ensure!(self.sample_rate>0&&self.rx_lo_hz>0&&self.epoch!=0&&(1..=1023).contains(&self.k)&&self.publish_stride>0,"static OBN2 configuration");ensure!(self.run_seconds.is_finite()&&(0.01..=240.).contains(&self.run_seconds),"bounded capture duration");Ok(())}}
++/// Same device lease as the older diagnostic reader, without a per-boot marker.
++pub struct Guard{_file:File}
++impl Guard{pub fn acquire(c:&Config)->Result<Self>{ensure!(uuid(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim())?==uuid(&c.coordinated_boot_id)?,"coordinated boot mismatch");for p in std::fs::read_dir("/proc")?{let p=p?.path();if !crate::native_observation::is_other_process(p.file_name().unwrap(),std::process::id()){continue}if let Ok(name)=std::fs::read_to_string(p.join("comm")){ensure!(name.trim()!="maia-httpd","another maia-httpd owns the hardware");}if let Ok(args)=std::fs::read(p.join("cmdline")){let controller=args.split(|b|*b==0).any(|a|std::str::from_utf8(a).ok().is_some_and(|s|["api_controller.sh","pl_video_ctl.sh","sweep.sh","sweep_stop.sh"].iter().any(|n|s.rsplit('/').next()==Some(*n))));if controller{let status=std::fs::read_to_string(p.join("status"))?;let paused=status.lines().find_map(|l|l.strip_prefix("State:")).and_then(|l|l.trim().chars().next()).is_some_and(|s|matches!(s,'T'|'t'|'Z'));ensure!(paused,"legacy RF controller still active");}}}let file=OpenOptions::new().read(true).write(true).create(true).truncate(false).open("/run/maia-observation.lock")?;ensure!(unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0,"spectral owner lease busy");Ok(Self{_file:file})}}
++pub struct Hardware{state:AppState,config:Config,control:u32,active:bool,pub last:Option<Snapshot>}
++impl Drop for Hardware{fn drop(&mut self){if self.active{if let Ok(core)=self.state.ip_core().lock(){core.stream_write(0x54,4);}}}}
++impl Hardware{
++    fn snapshot_locked(&self)->Result<Snapshot,String>{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;core.stream_write(0x54,self.control|32);let read64=|a|core.stream_read(a)as u64|((core.stream_read(a+4)as u64)<<32);let status=core.stream_read(0x154);if status&8!=0{return Err("OBN2 rejected command sticky".into())}Ok(Snapshot{cookie:core.stream_read(0x150),committed:read64(0x100),reserved:read64(0x108),released:read64(0x110),selected:read64(0x130),dropped:core.stream_read(0x140)as u64+core.stream_read(0x144)as u64+core.stream_read(0x160)as u64,running:status&1!=0,dma_busy:status&2!=0,drained:status&16!=0,fault:status&4!=0})}
++}
++impl RingIo for Hardware{
++    fn snapshot(&mut self)->Result<Snapshot,String>{let s=self.snapshot_locked()?;self.last=Some(s);Ok(s)}
++    fn start(&mut self)->Result<(),String>{let before=self.snapshot_locked()?;if before.fault||before.running||before.dma_busy||!before.drained||before.reserved!=before.committed||before.released!=before.committed{return Err("OBN2 START needs stopped drained released nonfatal source".into())}if before.cookie==u32::MAX{return Err("run counter exhausted".into())}{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;let mode=(self.config.k<<1)|((self.config.peak as u32)<<15);core.stream_write(0x20,mode);core.stream_write(0x58,self.config.epoch as u32);core.stream_write(0x5c,(self.config.epoch>>32)as u32);core.stream_write(0x60,self.config.publish_stride);self.control=1;self.active=true;core.stream_write(0x54,self.control|2);}let after=self.snapshot()?;if after.cookie!=before.cookie+1||!after.running{return Err("OBN2 START not accepted".into())}Ok(())}
++    fn copy_slot(&mut self,s:usize,b:&mut[u8])->Result<(),String>{self.state.ip_core().lock().map_err(|_|"IpCore lock")?.native_copy(s,b).map_err(|e|e.to_string())}
++    fn release(&mut self,cookie:u32,tail:u64)->Result<(),String>{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;core.stream_write(0xe8,tail as u32);core.stream_write(0xec,(tail>>32)as u32);core.stream_write(0xf0,cookie);core.stream_write(0x54,self.control|64);if core.stream_read(0x64)&8!=0{return Err("OBN2 release rejected".into())}Ok(())}
++    fn stop(&mut self)->Result<(),String>{self.control=0;self.state.ip_core().lock().map_err(|_|"IpCore lock")?.stream_write(0x54,4);self.active=false;Ok(())}
++}
++pub struct Runtime{state:AppState,config:Config,_guard:Guard}
++impl std::fmt::Debug for Runtime{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("ContinuousRuntime").field("config",&self.config).finish_non_exhaustive()}}
++impl Runtime{
++    pub async fn new(state:AppState,config:Config,guard:Guard)->Result<Self>{let a=state.ad9361().lock().await;ensure!(a.get_sampling_frequency().await?==config.sample_rate&&a.get_rx_lo_frequency().await?==config.rx_lo_hz,"immutable RF descriptor differs from actual IIO");drop(a);Ok(Self{state,config,_guard:guard})}
++    pub async fn run(self)->Result<()>{
++        let c=&self.config;let flags=if c.peak{4}else{0};let descriptor=Descriptor{identity:Identity{capture:uuid(&c.capture_id)?,map:1,run:1},fs:c.sample_rate as f64,bin0:c.rx_lo_hz as f64-c.sample_rate as f64/2.,step:c.sample_rate as f64/4096.,bins:4096,tick_hz:c::TICK_HZ,enbw:crate::native_observation::ENBW,entries:vec![Entry{epoch:c.epoch,lo:c.rx_lo_hz,offset:0,context:1,route:0,flags}]};
++        let prepare=c::Prepare::new(vec![c::Context{epoch:c.epoch,position:0,flags,scale:1./750668f64.powi(2)}],0).map_err(anyhow::Error::msg)?;
++        let hub=Arc::new(Mutex::new(c::PartsHub::new(2,crate::scan_parts::MAX_WIRE).map_err(anyhow::Error::msg)?));self.state.set_parts(hub.clone());self.state.scan().stop.store(false,Ordering::Release);
++        let io=Hardware{state:self.state.clone(),config:c.clone(),control:0,active:false,last:None};let stop=Arc::new(AtomicBool::new(false));let timer_stop=stop.clone();let state=self.state.clone();let duration=Duration::from_secs_f64(c.run_seconds);
++        let timer=tokio::spawn(async move{let start=std::time::Instant::now();loop{if start.elapsed()>=duration||state.scan().stop.load(Ordering::Acquire){timer_stop.store(true,Ordering::Release);break}tokio::time::sleep(Duration::from_millis(1)).await;}});
++        *self.state.scan().status.lock().unwrap()=format!("{{\"version\":2,\"kind\":\"static-continuous\",\"running\":true,\"k\":{},\"stride\":{},\"autonomous_rf\":false}}",c.k,c.publish_stride);
++        let result=continuous_runtime::run(io,prepare,descriptor,hub,stop,CountingConsumer::default(),StaticPass::default()).await;timer.abort();
++        match result{Ok(outcome)=>{tracing::info!(?outcome,"OBN2 stopped/drained; static passes, no RF acceptance");*self.state.scan().status.lock().unwrap()=format!("{{\"version\":2,\"kind\":\"static-continuous\",\"running\":false,\"copied\":{},\"normalized\":{},\"owned_drop\":{},\"network_drop\":{},\"high_water\":{}}}",outcome.reader.copied,outcome.prepare.normalized,outcome.owned_dropped,outcome.network_dropped,outcome.reader.high_water);Ok(())},Err(e)=>{tracing::error!(error=%e,"OBN2 error; no implicit AXI reset or RAM correction");Err(anyhow::anyhow!(e))}}
++    }
++}
+diff --git a/maia-httpd/src/continuous_runtime.rs b/maia-httpd/src/continuous_runtime.rs
+new file mode 100644
+index 0000000..0ba61ee
+--- /dev/null
++++ b/maia-httpd/src/continuous_runtime.rs
+@@ -0,0 +1,70 @@
++//! Runtime for the continuous source, separate acquisition and preparation tasks.
++//! No register addresses are guessed here. An accepted RingIo implementation and
++//! pass resolver are supplied by the final PL integration.
++#![allow(missing_docs)]
++use crate::{continuous::{self as c,RingIo,Reader,OwnedQueue,Prepare,PartsHub,PreparedPart},scan_parts::{self as wire,Descriptor}};
++use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
++use std::time::Duration;
++struct StopOnDrop(Arc<AtomicBool>);impl Drop for StopOnDrop{fn drop(&mut self){self.0.store(true,Ordering::Release);}}
++
++pub trait Consumer:Send{fn consume(&mut self,p:&PreparedPart<'_>)->Result<(),String>;}
++/// Current consumer is a hook, not a classifier. A future algorithm must own
++/// its bounded state/queue; it must not hold DMA slots or network locks.
++#[derive(Default)]pub struct CountingConsumer{pub parts:u64,pub contributing_ffts:u64}
++impl Consumer for CountingConsumer{fn consume(&mut self,p:&PreparedPart<'_>)->Result<(),String>{self.parts+=1;self.contributing_ffts+=p.header.k as u64;Ok(())}}
++pub trait PassResolver:Send{fn candidate(&mut self,h:c::Header)->Result<Option<u64>,String>;fn accepted(&mut self,h:c::Header,pass:u64);fn closed_through(&self)->u64;}
++/// Explicit static-only pass assignment: one selected group is one row. It is
++/// not a model of autonomous hops or measured RF pass boundaries.
++#[derive(Default)]pub struct StaticPass{next:u64}
++impl PassResolver for StaticPass{fn candidate(&mut self,_:c::Header)->Result<Option<u64>,String>{if self.next==u64::MAX{return Err("static pass exhaustion".into())}Ok(Some(self.next))}fn accepted(&mut self,_:c::Header,_:u64){self.next+=1;}fn closed_through(&self)->u64{self.next}}
++#[derive(Debug)]pub struct Outcome{pub reader:c::ReaderStats,pub prepare:c::PrepareStats,pub owned_dropped:u64,pub network_dropped:u64,pub stopped:bool}
++
++pub async fn run<I:RingIo+Send+'static,C:Consumer,R:PassResolver>(mut io:I,mut prepare:Prepare,mut descriptor:Descriptor,hub:Arc<Mutex<PartsHub>>,stop:Arc<AtomicBool>,mut consumer:C,mut resolver:R)->Result<Outcome,String>{
++    descriptor.validate()?;let mut frame=Vec::with_capacity(wire::MAX_WIRE);
++    let _cancel=StopOnDrop(stop.clone());
++    io.start()?;
++    let reader_result=io.snapshot().and_then(|s|{descriptor.identity.run=s.cookie as u64;Reader::attach(s)});
++    let mut reader=match reader_result{Ok(r)=>r,Err(e)=>{let _=io.stop();return Err(e)}};
++    wire::descriptor(&descriptor,0,&mut frame)?;hub.lock().map_err(|_|"hub lock")?.descriptor(&frame)?;
++    let queue=Arc::new(Mutex::new(OwnedQueue::new(8)?));let done=Arc::new(AtomicBool::new(false));
++    let (q,s,d)=(queue.clone(),stop.clone(),done.clone());
++    // This task owns the hardware reader. No normalization/consumer/WS work.
++    let acquire=tokio::spawn(async move{
++        let result=async{
++            let mut stop_started=None;
++            loop{
++                if s.load(Ordering::Acquire){reader.stop(&mut io)?;let start=stop_started.get_or_insert_with(std::time::Instant::now);if start.elapsed()>Duration::from_secs(5){return Err("continuous stop/drain timeout; no automatic AXI reset".into())}}
++                let snap={let mut q=q.lock().map_err(|_|"owned queue lock")?;reader.service(&mut io,&mut q)?};
++                if reader.drained(snap){break}
++                tokio::time::sleep(Duration::from_millis(1)).await;
++            }Ok::<_,String>(reader.stats)
++        }.await;
++        if result.is_err(){let _=io.stop();}
++        d.store(true,Ordering::Release);result
++    });
++    let mut raw=vec![0;c::BYTES];let mut power=vec![0.;c::BINS];let mut seq=0u64;let mut network_dropped=0u64;
++    let processing=async{
++        loop{
++            let got=queue.lock().map_err(|_|"owned queue lock")?.pop_swap(&mut raw);
++            if !got{if done.load(Ordering::Acquire){break}tokio::time::sleep(Duration::from_millis(1)).await;continue}
++            let h=c::header(&raw)?;
++            let candidate=if h.clean(){resolver.candidate(h)?}else{None};
++            if let Some(p)=prepare.accept_if(&raw,&mut power,|_,_|candidate.is_some())?{
++                let pass=candidate.unwrap();resolver.accepted(h,pass);
++                consumer.consume(&p)?; // the same product, before WS serialization
++                seq=seq.checked_add(1).ok_or("wire sequence exhaustion")?;
++                wire::part(&descriptor,seq,pass,&p,&mut frame)?;
++                match hub.try_lock(){Ok(mut hub)=>hub.publish(&frame)?,Err(_)=>network_dropped+=1}
++            }
++            tokio::task::yield_now().await;
++        }Ok::<_,String>(())
++    }.await;
++    if processing.is_err(){stop.store(true,Ordering::Release)}
++    let reader=acquire.await.map_err(|e|e.to_string())??;
++    processing?;
++    seq=seq.checked_add(1).ok_or("wire sequence exhaustion")?;
++    wire::progress(descriptor.identity,seq,resolver.closed_through(),true,&mut frame);
++    hub.lock().map_err(|_|"hub lock")?.publish(&frame)?;
++    let owned_dropped=queue.lock().map_err(|_|"owned queue lock")?.dropped;
++    Ok(Outcome{reader,prepare:prepare.stats,owned_dropped,network_dropped,stopped:true})
++}
+diff --git a/maia-httpd/src/fpga.rs b/maia-httpd/src/fpga.rs
+index f11ca67..c63ad7a 100644
+--- a/maia-httpd/src/fpga.rs
++++ b/maia-httpd/src/fpga.rs
+@@ -15,6 +15,7 @@ use tokio::sync::Notify;
+ /// and DMA buffers.
+ #[derive(Debug)]
+ pub struct IpCore {
++    continuous_observations: bool,
+     native_observations: bool,
+     registers: Registers,
+     phys_addr: usize,
+@@ -230,15 +231,17 @@ impl IpCore {
+     /// On success, the `IpCore` and the corresponding [`InterruptHandler`] are
+     /// returned.
+     pub async fn take() -> Result<(IpCore, InterruptHandler)> {
+-        Self::take_mode(false).await
++        Self::take_mode(false,false).await
+     }
+ 
+     /// Open only the matching OBN1 producer; skip all legacy DDC/integration writes.
+     pub async fn take_native() -> Result<(IpCore, InterruptHandler)> {
+-        Self::take_mode(true).await
++        Self::take_mode(true,false).await
+     }
+ 
+-    async fn take_mode(native_observations: bool) -> Result<(IpCore, InterruptHandler)> {
++    /// Open OBN2 only, preserving the independent DDC/recorder configuration.
++    pub async fn take_continuous() -> Result<(IpCore,InterruptHandler)>{Self::take_mode(true,true).await}
++    async fn take_mode(native_observations: bool,continuous_observations:bool) -> Result<(IpCore, InterruptHandler)> {
+         let uio = Uio::from_name("maia-sdr")
+             .await
+             .context("failed to open maia-sdr UIO")?;
+@@ -253,6 +256,7 @@ impl IpCore {
+             .context("failed to open maia-sdr-spectrometer DMA buffer")?;
+         let interrupt_registers = Registers(mapping.clone());
+         let mut ip_core = IpCore {
++            continuous_observations,
+             native_observations,
+             registers: Registers(mapping),
+             phys_addr,
+@@ -268,6 +272,15 @@ impl IpCore {
+ 
+         ip_core.log_open().await?;
+         ip_core.check_product_id()?;
++        if continuous_observations{
++            if phys_addr!=0x7c460000 || uio.map_size(0).await?<0x164 || ip_core.stream_read(0x50)!=crate::continuous::ABI || ip_core.stream_read(0xe4)!=2 || ip_core.stream_read(0xe0)!=0x1f{anyhow::bail!("OBN2 r2 contract/capabilities/MMIO mismatch; no legacy fallback");}
++            if ip_core.spectrometer.buffer.buffer_size()!=32768 || ip_core.spectrometer.buffer.num_buffers()!=8{anyhow::bail!("OBN2 requires existing 8 x 32768 rxbuffer");}
++            ip_core.set_sdr_reset(false);
++            let spectrum=ip_core.stream_read(0x20);ip_core.spectrometer_integrations=(spectrum>>1)&1023;
++            ip_core.ddc_enabled=ip_core.registers.ddc_control().read().enable_input().bit();
++            ip_core.spectrometer_mode=if spectrum&(1<<15)!=0{maia_json::SpectrometerMode::PeakDetect}else{maia_json::SpectrometerMode::Average};
++            return Ok((ip_core,InterruptHandler::new(uio,interrupt_registers)));
++        }
+         ip_core.set_sdr_reset(false);
+         if native_observations {
+             if ip_core.native_read(0x50) != crate::native_observation::ABI { anyhow::bail!("OBN1 ABI ID mismatch; PL-5b is not a native metadata source"); }
+@@ -423,6 +436,18 @@ impl IpCore {
+         &mut self,
+         input: maia_json::SpectrometerInput,
+         input_samp_freq: f64,
++    ) -> Result<()> {
++        let use_ddc=matches!(input,maia_json::SpectrometerInput::DDC);
++        self.set_fft_source(input,input_samp_freq)?;
++        self.set_ddc_enable(use_ddc);
++        Ok(())
++    }
++
++    /// Select the FFT input without disabling the parallel DDC/real8 path.
++    pub fn set_fft_source(
++        &mut self,
++        input: maia_json::SpectrometerInput,
++        input_samp_freq: f64,
+     ) -> Result<()> {
+         let use_ddc = matches!(input, maia_json::SpectrometerInput::DDC);
+         if use_ddc {
+@@ -440,7 +465,6 @@ impl IpCore {
+         self.registers
+             .spectrometer()
+             .modify(|_, w| w.use_ddc_out().bit(use_ddc));
+-        self.set_ddc_enable(use_ddc);
+         self.spectrometer_input = input;
+         Ok(())
+     }
+@@ -502,6 +526,17 @@ impl IpCore {
+         assert!(self.native_observations && (0x50..=0xd4).contains(&offset) && offset%4==0);
+         unsafe {std::ptr::read_volatile((self.registers.0.addr() as *const u8).add(offset) as *const u32)}
+     }
++    /// Held snapshot registers are read only while the IpCore mutex is owned.
++    pub fn stream_read(&self,offset:usize)->u32{
++        assert!(self.continuous_observations&&offset<=0x160&&offset%4==0);
++        unsafe{std::ptr::read_volatile((self.registers.0.addr()as *const u8).add(offset)as *const u32)}
++    }
++    /// Device readback orders a posted command before subsequent snapshot reads.
++    pub fn stream_write(&self,offset:usize,value:u32){
++        assert!(self.continuous_observations&&[0x20,0x54,0x58,0x5c,0x60,0xe8,0xec,0xf0].contains(&offset));
++        unsafe{std::ptr::write_volatile((self.registers.0.addr()as *mut u8).add(offset)as *mut u32,value)};
++        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);let _=self.stream_read(0x64);
++    }
+     fn native_write(&self,offset:usize,value:u32){
+         assert!(self.native_observations && ([0x54,0x58,0x5c,0x60,0x84,0x88,0x8c,0x90,0x94,0x98,0x9c,0xa0,0xa4,0xa8].contains(&offset)));
+         unsafe {std::ptr::write_volatile((self.registers.0.addr() as *mut u8).add(offset) as *mut u32,value)};
+@@ -533,7 +568,8 @@ impl IpCore {
+         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);Ok(())
+     }
+ 
+-    fn set_ddc_enable(&mut self, enable: bool) {
++    /// Enable the DDC independently of the FFT input selection.
++    pub fn set_ddc_enable(&mut self, enable: bool) {
+         self.registers
+             .ddc_control()
+             .modify(|_, w| w.enable_input().bit(enable));
+@@ -845,13 +881,16 @@ macro_rules! impl_interrupt_handler {
+             async fn wait_and_notify(&mut self) -> Result<()> {
+                 self.uio.irq_enable().await?;
+                 self.uio.irq_wait().await?;
++                self.notify_pending();
++                Ok(())
++            }
++            fn notify_pending(&self){
+                 let interrupts = self.registers.interrupts().read();
+                 $(
+                     if interrupts.$interrupt().bit() {
+                         self.[<notify_ $interrupt>].notify_one();
+                     }
+                 )*;
+-                Ok(())
+             }
+ 
+             $(
+@@ -867,6 +906,9 @@ macro_rules! impl_interrupt_handler {
+ }
+ 
+ impl InterruptHandler {
++    /// Cancellable sticky-status polling for OBN2. Recorder notifications remain
++    /// separate from spectral completion counters; no blocking UIO read on exit.
++    pub async fn run_polling(self)->Result<()>{loop{self.notify_pending();tokio::time::sleep(std::time::Duration::from_millis(1)).await;}}
+     /// Runs the interrupt handler.
+     ///
+     /// This function only returns if there is an error.
+diff --git a/maia-httpd/src/httpd.rs b/maia-httpd/src/httpd.rs
+index 9758bd3..7ca6e99 100644
+--- a/maia-httpd/src/httpd.rs
++++ b/maia-httpd/src/httpd.rs
+@@ -71,6 +71,7 @@ impl Server {
+         waterfall_sender: broadcast::Sender<Bytes>,
+     ) -> Result<Server> {
+         let native=state.native_observations();
++        let continuous=state.continuous_observations();
+         let mut app = Router::new()
+             // all the following routes have .with_state(state)
+             .route("/api", get(api::get_api))
+@@ -143,6 +144,9 @@ impl Server {
+         }
+         let app = app
+             .layer(axum::middleware::from_fn(move |request:axum::extract::Request,next:axum::middleware::Next|async move{
++                if continuous&&crate::continuous_live::http_rejection(request.method().as_str(),request.uri().path()){
++                    return axum::response::IntoResponse::into_response((axum::http::StatusCode::LOCKED,"static OBN2 RF descriptor is immutable; stop/drain before reconfiguration"));
++                }
+                 if let Some(code)=crate::native_observation::http_rejection(native,request.method().as_str(),request.uri().path()){
+                     return axum::response::IntoResponse::into_response((axum::http::StatusCode::from_u16(code).unwrap(),"native static RF capture: use GOBS1; mutations disabled"));
+                 }
+diff --git a/maia-httpd/src/httpd/ddc.rs b/maia-httpd/src/httpd/ddc.rs
+index ea1bf83..dad2821 100644
+--- a/maia-httpd/src/httpd/ddc.rs
++++ b/maia-httpd/src/httpd/ddc.rs
+@@ -101,6 +101,7 @@ pub async fn patch_ddc_config(
+             .map_err(JsonError::client_error_alert)?;
+     }
+     if let Some(enabled) = patch.enabled {
++        if state.continuous_observations(){state.ip_core().lock().unwrap().set_ddc_enable(enabled);}
+         set_ddc_routing(enabled).map_err(JsonError::server_error)?;
+     }
+     ddc_config(&state).await
+diff --git a/maia-httpd/src/httpd/scan.rs b/maia-httpd/src/httpd/scan.rs
+index 9470df8..a95aabb 100644
+--- a/maia-httpd/src/httpd/scan.rs
++++ b/maia-httpd/src/httpd/scan.rs
+@@ -8,14 +8,20 @@ pub async fn status(State(state):State<AppState>)->Response {
+ }
+ pub async fn stop(State(state):State<AppState>)->Response {state.scan().stop.store(true,Ordering::Relaxed);(axum::http::StatusCode::ACCEPTED,"stop queued; poll resident status").into_response()}
+ pub async fn handler(State(state):State<AppState>,ws:WebSocketUpgrade)->Response {
+-    if !state.native_observations(){return (axum::http::StatusCode::CONFLICT,"resident source required").into_response();}
++    if !state.native_observations()&&state.parts().is_none(){return (axum::http::StatusCode::CONFLICT,"prepared source required").into_response();}
+     if state.scan().clients.fetch_add(1,Ordering::AcqRel)>=2{state.scan().clients.fetch_sub(1,Ordering::AcqRel);return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();}
+     struct Lease(AppState);impl Drop for Lease{fn drop(&mut self){self.0.scan().clients.fetch_sub(1,Ordering::AcqRel);}}
+     let lease=Lease(state.clone());
+     ws.on_upgrade(move |mut socket|async move {
+         let _lease=lease;let mut ordinal=0;let mut pending=Vec::with_capacity(112+64*8+8*32768);
++        let mut cursor=crate::continuous::Cursor::default();let parts=state.parts();
+         loop {
+-            if state.scan().poll(&mut ordinal,&mut pending){
++            let ready=if let Some(parts)=&parts{
++                let missed=cursor.missed;
++                let ready=parts.lock().unwrap().poll(&mut cursor,&mut pending);
++                state.scan().missed.fetch_add(cursor.missed-missed,Ordering::Relaxed);ready
++            }else{state.scan().poll(&mut ordinal,&mut pending)};
++            if ready{
+                 // At most one in-flight message/client. No acquisition lock is
+                 // held across send, and slow readers lose whole older frames.
+                 let bytes=bytes::Bytes::copy_from_slice(&pending);
+diff --git a/maia-httpd/src/lib.rs b/maia-httpd/src/lib.rs
+index 533ca55..b60449b 100644
+--- a/maia-httpd/src/lib.rs
++++ b/maia-httpd/src/lib.rs
+@@ -7,6 +7,10 @@
+ #![warn(missing_docs)]
+ 
+ pub mod app;
++pub mod continuous;
++pub mod scan_parts;
++pub mod continuous_runtime;
++pub mod continuous_live;
+ pub mod args;
+ pub mod ddc;
+ pub mod fpga;
+diff --git a/maia-httpd/src/main.rs b/maia-httpd/src/main.rs
+index 2d35635..1a7966e 100644
+--- a/maia-httpd/src/main.rs
++++ b/maia-httpd/src/main.rs
+@@ -17,6 +17,17 @@ async fn main() -> Result<()> {
+     #[cfg(not(feature = "uclibc"))]
+     let args = Args::parse();
+ 
++    if let Some(path)=&args.check_continuous_observations{
++        let config=maia_httpd::continuous_live::Config::load(path)?;
++        println!("OBN2-r2 static config valid; no hardware access: {config:?}");return Ok(());
++    }
++    if let Some(path)=&args.check_obn2_record{
++        let bytes=std::fs::read(path)?;let h=maia_httpd::continuous::header(&bytes).map_err(anyhow::Error::msg)?;let mut power=vec![0.;4096];
++        maia_httpd::continuous::normalize(&bytes,h,1./750668f64.powi(2),&mut power).map_err(anyhow::Error::msg)?;
++        let hash=power.iter().flat_map(|p|p.to_le_bytes()).fold(0xcbf29ce484222325u64,|hash,b|(hash^b as u64).wrapping_mul(0x100000001b3));
++        println!("OBN2-r2 no hardware access bins=4096 actualK={} ordinal={} fnv64={hash:016x}",h.k,h.ordinal);return Ok(());
++    }
++
+     if let Some(path)=&args.check_native_observations{
+         let config=maia_httpd::native_runtime::Config::load(path)?;
+         println!("OBN1-r1 config syntax/profile valid; no hardware access or boot/RF assertion verified: {config:#?}");
+diff --git a/maia-httpd/src/scan_parts.rs b/maia-httpd/src/scan_parts.rs
+new file mode 100644
+index 0000000..ef8e3de
+--- /dev/null
++++ b/maia-httpd/src/scan_parts.rs
+@@ -0,0 +1,40 @@
++//! SCN1 v2 ARM-to-host parts. Software transport, independent of PL CSR layout.
++//! Each call flushes already prepared parts immediately; count=1 is normal.
++#![allow(missing_docs)]
++use crate::continuous::{PreparedPart,BINS};
++pub const COMMON:usize=64;
++pub const MAX_PARTS:usize=4;
++pub const PART_BYTES:usize=64+4*BINS;
++pub const MAX_WIRE:usize=COMMON+MAX_PARTS*PART_BYTES;
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]pub struct Identity{pub capture:[u8;16],pub map:u64,pub run:u64}
++#[derive(Clone,Debug)]pub struct Entry{pub epoch:u64,pub lo:u64,pub offset:u32,pub context:u32,pub route:u32,pub flags:u32}
++#[derive(Clone,Debug)]pub struct Descriptor{pub identity:Identity,pub fs:f64,pub bin0:f64,pub step:f64,pub bins:u32,pub tick_hz:u64,pub enbw:f64,pub entries:Vec<Entry>}
++impl Descriptor{
++    pub fn validate(&self)->Result<(),String>{
++        if self.identity.capture==[0;16]||self.identity.map==0||self.identity.run==0||!self.fs.is_finite()||self.fs<=0.||!self.bin0.is_finite()||!self.step.is_finite()||self.step<=0.||self.tick_hz!=62_500_000||!self.enbw.is_finite()||self.enbw<=0.||!(4096..=32768).contains(&self.bins)||self.entries.is_empty()||self.entries.len()>8||(self.step-self.fs/4096.).abs()>self.step*1e-10{return Err("SCN1 descriptor bounds/grid".into())}
++        for(i,e)in self.entries.iter().enumerate(){if e.epoch==0||e.lo==0||e.context==0||e.flags&!6!=0||e.offset as u64+4096>self.bins as u64||e.route>0xffffff||self.entries[..i].iter().any(|p|p.epoch==e.epoch)||((e.lo as f64-self.fs/2.)-(self.bin0+e.offset as f64*self.step)).abs()>self.step*1e-6{return Err("SCN1 entry provenance/placement".into())}}
++        Ok(())
++    }
++}
++fn common(out:&mut Vec<u8>,id:Identity,kind:u16,count:u32,seq:u64,floor:u64){out.clear();out.extend_from_slice(b"SCN1");out.extend_from_slice(&2u16.to_le_bytes());out.extend_from_slice(&kind.to_le_bytes());out.extend_from_slice(&0u32.to_le_bytes());out.extend_from_slice(&count.to_le_bytes());out.extend_from_slice(&id.capture);for v in[id.map,id.run,seq,floor]{out.extend_from_slice(&v.to_le_bytes())}}
++fn finish(out:&mut[u8]){let n=out.len()as u32;out[8..12].copy_from_slice(&n.to_le_bytes())}
++pub fn descriptor(d:&Descriptor,seq:u64,out:&mut Vec<u8>)->Result<(),String>{d.validate()?;common(out,d.identity,1,d.entries.len()as u32,seq,0);for v in[d.fs,d.bin0,d.step]{out.extend_from_slice(&v.to_le_bytes())}out.extend_from_slice(&d.bins.to_le_bytes());out.extend_from_slice(&(d.entries.len()as u32).to_le_bytes());out.extend_from_slice(&d.tick_hz.to_le_bytes());out.extend_from_slice(&d.enbw.to_le_bytes());for e in &d.entries{out.extend_from_slice(&e.epoch.to_le_bytes());out.extend_from_slice(&e.lo.to_le_bytes());for v in[e.offset,e.context,e.route,e.flags]{out.extend_from_slice(&v.to_le_bytes())}}finish(out);Ok(())}
++/// One ready part. No normalization, accumulation, geometry or wait here.
++pub fn part(d:&Descriptor,seq:u64,pass:u64,p:&PreparedPart<'_>,out:&mut Vec<u8>)->Result<(),String>{
++    let e=d.entries.get(p.position as usize).ok_or("part position")?;let h=p.header;
++    if !h.clean()||h.epoch!=e.epoch||h.flags&6!=e.flags||p.power.len()!=4096||p.power.iter().any(|x|!x.is_finite()||*x<0.){return Err("prepared part/descriptor mismatch".into())}
++    common(out,d.identity,2,1,seq,pass);out.extend_from_slice(&pass.to_le_bytes());out.extend_from_slice(&p.position.to_le_bytes());out.extend_from_slice(&h.k.to_le_bytes());for v in[h.first_seq,h.last_seq,h.epoch,h.first_tick]{out.extend_from_slice(&v.to_le_bytes())}out.extend_from_slice(&h.flags.to_le_bytes());out.extend_from_slice(&4096u32.to_le_bytes());out.extend_from_slice(&h.ordinal.to_le_bytes());for v in p.power{out.extend_from_slice(&v.to_le_bytes())}finish(out);Ok(())
++}
++/// Ordered input progress: passes below floor cannot receive further parts.
++/// Static/replay assigns passes explicitly; not a claim about RF pass boundaries.
++pub fn progress(id:Identity,seq:u64,floor:u64,terminal:bool,out:&mut Vec<u8>){common(out,id,3,terminal as u32,seq,floor);finish(out)}
++/// Combine only parts which are already ready. Never wait to fill this batch.
++pub fn coalesce(frames:&[&[u8]],out:&mut Vec<u8>)->Result<(),String>{
++    if frames.is_empty()||frames.len()>4{return Err("batch count".into())}
++    let first=frames[0];if first.len()!=COMMON+PART_BYTES{return Err("part size".into())}out.clear();out.extend_from_slice(&first[..COMMON]);
++    for f in frames{if f.len()!=COMMON+PART_BYTES||f[..8]!=first[..8]||f[12..16]!=1u32.to_le_bytes()||f[16..48]!=first[16..48]{return Err("batch identity/type".into())}out.extend_from_slice(&f[COMMON..]);}out[12..16].copy_from_slice(&(frames.len()as u32).to_le_bytes());finish(out);Ok(())
++}
++#[cfg(test)]mod tests{
++    use super::*;use crate::continuous::Header;
++    #[test]fn cross_language_ready_parts(){let d=Descriptor{identity:Identity{capture:[0x66;16],map:31,run:9},fs:61_440_000.,bin0:2_400_000_000.-30_720_000.,step:15_000.,bins:8192,tick_hz:62_500_000,enbw:2.0050129965307675,entries:vec![Entry{epoch:7,lo:2_400_000_000,offset:0,context:1,route:0,flags:0},Entry{epoch:8,lo:2_461_440_000,offset:4096,context:2,route:0,flags:0}]};let mut desc=Vec::new();descriptor(&d,0,&mut desc).unwrap();assert_eq!(desc.len(),176);let p=vec![0.125;4096];let h=Header{first_seq:1,last_seq:2,epoch:7,first_tick:1000,k:2,flags:1,ordinal:0};let mut a=Vec::new();part(&d,1,0,&PreparedPart{header:h,position:0,power:&p},&mut a).unwrap();assert_eq!(a.len(),COMMON+PART_BYTES);let mut b=Vec::new();part(&d,2,0,&PreparedPart{header:Header{epoch:8,first_seq:3,last_seq:4,first_tick:10000,..h},position:1,power:&p},&mut b).unwrap();let mut batch=Vec::new();coalesce(&[&a,&b],&mut batch).unwrap();assert_eq!(batch.len(),COMMON+2*PART_BYTES);if let Ok(dir)=std::env::var("OBS_CONTINUOUS_OUTPUT_DIR"){std::fs::create_dir_all(&dir).unwrap();for(n,v)in[("descriptor.scn",desc),("part0.scn",a),("part1.scn",b),("batch.scn",batch)]{std::fs::write(std::path::Path::new(&dir).join(n),v).unwrap()}}}
++}
+diff --git a/maia-httpd/tests/observation-continuous/layout-k1-sum.bin b/maia-httpd/tests/observation-continuous/layout-k1-sum.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..99e3f838eadc377db39e692f7e7cc5b6803f8547
+GIT binary patch
+literal 32768
+zcmXZl1zQwd0EXc+YhsJtUD%3=fn6vnwxXYk-3p3<ohWt(Vt03UCw60tjf#!>&GNkS
+z2hKHT&Yb&tW_M?ei9Njk#U7@rwWRdbZgH#z8}o*y2^njZXudUG>#gw|4oCT3Vb|ju
+zv+2Z*7vClr&ldG76wK&inK-vs^sN|dna%$t-u+)<hiUny|L-wLjEU=i&vQ+PF<bsr
+z8Gk;R71(ORx(n~8S<T|5bRG`(tqTL2xw{(I*0~=qYCg-Ph`+hklOd_C65Gmb$s0Py
+zYSQLd+MdVKItC`FH+<XkbY}i`d)NdE%zodt&Vj852_tuoYOu)qyQ5#`GyO6<Oj~=@
+zIa!Qx8TYo)-caMdGnvo4``IklcJuc?_#0-KL^+*@<KwOkle*N%WiI_!>eI%qE6s+)
+zM_PQIoX0Y|YacDMWwn)}{k42S*YY_`k~Y(hf6Z^q9(&jf>y6c+k8@zlB>j16X1k4+
+z**m)MozaCIrlURT>LMmA+1!{8=eC%Q`?C41eOJud=Vza8^6gff<RzVl!`gq)dBVnY
+zs_8g9c$YCL>{(t?+A;@PhSxs2$8vOjR(9&MvJR8dInCvbIcN{-cEFe}Bb@_V#x;>W
+z(TA*&hh|lJJ*$$#bhSs_Q`wkQYm)lkJ8I0~VgdX9RIyAq`*gFPuuSUe&ck7jTymbU
+zvAQ=;btU+;F=^~s-dxKvN4r058GhC>J)-L@jjrP`X`Rzt&zNKOupSqU={dtWuw~L^
+zvM2hoWsa}({<YHEVS3r4o^5DM`n_4ly$v_!g!A(HSf;mqx+QK{CPP!_;V>s3IZxP_
+zK3(k#eA}3e_ADQ1VVP4yzjS|k*D`&b%c`}*WO7b(8)HtVck}RiXiUH5&VenHxsW~4
+z5tcc#%ek-|roTPv-S)<0IahRU%u{2|HnuOXpJfKvr(5lXWwLg59u9Nvqw|D~@gHno
+z;7DV#*|U7Ln`O>Vi977e8_NVZmsL-P$?lxyUdCJ~;Nj)_!I*(NoC8}XM@4(0qbzgr
+zv~yuO%piNzH~o#tX)oub(Z*crXkXp{%LLk|+vJ;Nat(4G4s+Q=*e7hv;9&a#|1>7I
+zJ<CsqSmw%-G$C<gEHlKptb!aSk8_%b8*{b1mv8TX#tc1a4{R)xw}Eq_Efap*URVx?
+z8D@|AJB~5=?B$$woH5t@?aLeAGC}s~cA8+B{1fdXp~GBH8Fguci!s9&IWMp=1?*Y=
+zoY*oqHal-%%ZzX?t7H!2=A7o_#@wvu+k3=xV@BSz2Tp03g6*6WZJAq<_QFc#Fr%Ee
+zZyI9?*~_`;Tw`vJvoCKt%Z#>9ci?=>6kcE-864(LPAlSIMq|cobY5U%ia588ES9-@
+z#CZc-W~_5rWpkLK&S}nW%)K`Du*-}Y_tG9Xr)7%ubxyQp?*FtGR&IwG@4S8U8dKa}
+z&Yo+Gc`(<$y!kCN!FjstEK_2=eYiQy!;-F1mkJs)@sRTZ8&lG`Z4|N0qpQvv*fNt^
+z*~_Y!!?-)AxwtVAz3gGP8x#E99=N1sN{w<(v}GPAvbU?!4l{YSeIu1IrnJ4B8|^jb
+z$r}6emb1*1;`Zt8w@jG>_Tk|$Ppjv$A}SaYa@l!-jVbHgHY!`@*%RjtY?-M&>}6HO
+zVanOlJgurR&xhN?o-k%w!XGbhR<}&~na+u}%!^F+c2&z^rmwPZq}s-K*vq-YIb&Y#
+zwKvMTmYGr2KHUqJsc_Lgyd36LQ+L;>`o_$Ra9&_zDmu4~hL(x^?7V?3Gi#W=tQtE^
+zC3~8~e2jTL%^voKF|#wc{CL^aGL`M^Iniy)yeVXFS1lZ7&TjigYH5t8y`25;8T0m>
+zy-~Kd%v>M)bRSrz%0v6`b(nXZYvi)p88a`+d4Y|o>fAQkTjqV7VfGDdnfW31hSkww
+zs@c=L&Ci$*VfL^uj9K88(d9>H%T%|w=S-27`B>53uDUtQ!ZY@b)ZLgG&gJ~pn5cX9
+zM%mLci~O80Sf=I&`{?a3p9a}1^fhL&b=bbZ#?*3d8~rWwIdzDA16yWEsJ&tNJ4|hR
+znvVw<^JSY8Bx6E7Y>omgQ^($(3;ncAbOU?48sacZ@7OoeP-E&kmvf9UU*FmrWsqgU
+z0-P{drk>Ni5f1ZhqRoP3%re(2!8J!4<Fz=}LGwLNtb=CxmRJW({c<??<9MutW`!3H
+zHn@d@KilEp%GWsPJpc!P#l$*jR*jE!&@@aD>!A6)Al5;%I#;ZNrqQNY2Te@rSO?9T
+zqp=Q}#&u&IG=HwgI%wAV#yV(xUd1|S{`SSeb-!@1$=Fy2&A+6v4x07zaIk5PSO<;4
+zL9@X<)<M(kFb-NcXf}r9VDr{E=)gg<sW%R`_<@6Q<lyGSu@0J+b7CDdadFUWSsUx1
+zX;mWDK@(37ZmofXt*_u<d>k~}p5kDeo;a954sIWTgT5}Y4w{5=a7ShwY`Yo<UF6`-
+zeK^>z8V)AHL9?qF4*vHT2NTP|-CuC9eGm>Nk%N1t<6wu3IG9up?k$Xi9rxg1GC8>K
+zJP!Ib!NKHmaDNvZ?DPo-Q^>&sadEKoR2)nx2M;d8!7c@H&{Yl|s)U1G&*ESzIe7R!
+z4tDE=gQ?}<kw6^m?!dt`a`0#x9PF_a2h+;IW7~1CX9XNgCkKyv<6y75IGA1zo_L3Y
+zy$9l8203_g5)SrBg@YO8;HkVg*mo-qW|D)aPvBs``Z$<b4xafB2m8Ol!7Os{>>nH)
+zFaZa%%E5CBanL_E4rY^s=gZ(=z%d-mE(b5%z`=oSaWID*yx0#12mQvuoO19|G8_z?
+zkAu17;N=ZCIJguJ=9Yt3YUALLYdDxk4qknMgG2k^U|u;GJ{kvyCBeaba`0L<91L2A
+zgZbs)^@BJ#ye1A7kb^f`;^2s9IOrw^Z+^qUkt1=ipd7q43kOGK!NEdu@OCjA9K9b0
+z3(LVfmvC@Qa~v!p2k&;r!LiXeSX2()OMrvpX5e5kIe3314vsH^gT>|GgDN;U;Q|hp
+zkb@5&;o!usI9O5+J{pRHlj7l^yBv&2kAuO>aj=vee7p+>Cs)S7(sJ-gV;r3F00+y+
+z!KWW_Fk~<emX(9grr_Yzv^ZE!4n8k{gVT24V0k(C;xrCUZ-|2)a`0tG9GvkU2P??I
+zR|W@X2IF8wIT*PF2WREO!Af%Qb$J||eG&&N%fUCdad1w19Q2ffZ~bv_?q3|NA_w24
+z#KC!saImTze7_k7=a<F7YI5*HJsezc69=oy!H<zRxUfGC){uiy<8W|MavZEF2S4S+
+z!NnVKu$CPBd;|xV)WN~pa_~zV91MMlgLUL!^iLdIItB;p%E7O5aWE`94%S;A+k@s?
+zNgP~u2nW4t#rB~2eia9ox5B~t&trSg{OE;)E574kgHiP0&qO%5ayAZnXN~Pa^J@(b
+zt}2d$4G++RzpLZm>dQFTs6}iKnwTdzxTXgVHvUQv{uz#gYZKz2&rEvoZzddEw+aWF
+z6r~6M?Zv_MRdKNC#n>J+Mh<R>z`<tS=s`;kZXAY#&EwO94mr3f0}i%WK@Y}}gPV8b
+zU`tPWFs>Zj;)8>&9@2yH<lxpQ9Be&=9*i#sw}s$fn{@PG0y((d4F`R9(t`=*;Eppm
+z*tQWp=pqMq`r%-^5A<LnIk+qK0f%M&n@kTTmV>)Paj<=UdN7F`+~a|R9Zu1MN#)?)
+zJ2=>}13j2b4(<!ULBD@a_>D;}2lu<;V5i0OU<x^SU<(d*E=Lchl!FJoaIniQdeBu4
+z9(s*~T?f#EspR0{@i^Em1wEKr4j##cgWWgLgK6a8(W5xnqb@y|Rt_HX#lfDh=)rVy
+z@c1tr>@}7iOfLsd%)`OnIq1O*a`2=(4)!@r4`!5ur^0ctZ)<umlN>zV8wdOSpa(O{
+z!83_*u>Tx-FpC^KyA}rrl%NN*%E5CraM1q>J(x`no_~si0X^x#>~iqJ2pk;fLJ#JU
+zgBLU7;Gos?U`{!BX&(*-R-*@V$-&FbaB%QrdN8*fyz&JHhXm1sdF0^L={PtvBR!Z`
+z4u%)T!C`yo!F+P?+IbudYC;d@mxI^4;Nb92^k4xwcq1+jj+jahy2-(t%W!aHL3*&D
+z9K2Nt2S=Ty2Mfu;+xKyBbSHYSupGP-h=XGs^k5M=csC6Wj$KL*7L|kdw&UQq3iMzx
+zIe6b22gl!~2aC(W2k&rj!a#bkgdBW02?r;pq6bUL!AE&<aMD(K&|MBjoWQ~0`t)Ea
+zIr#WL9Gv`y9xN>fpZvkWDHG_yGIH?gLL3aqO%IlpgU`y~;M8OEU^zMX{00tAYfBH7
+zmxC|*;o$V&^q_|ve3=XfXUwMuE6BlD8*p%DDSEJ?9E_}ugR`#DgO%jq>lZjUyAM5B
+zSq{D#je~QN(1V_G@NG66oVyMOtH{B32XSy-O&qK$2j92E!THZ{u$mnF@C^qSjKsm}
+za`59U99)<M2W!Z|sA4#{Xg?0tl!Kox;o#!tI9N*#e(sKgOQLbGwjBJD00%>7;9wm&
+z7`+k)mlnanx^nPq6&wt^fP?j#(u3a~;o!2aIOz469{fHO2bagg!TQta!5`^yaK&;Q
+zY*2_E{J9GUS60SB?{oCvuf{mI>H!Wm>`V{-{)mIC2jgI)IP_r56dYWW76%)L(Sv^q
+z;NaRFIOtQ69{hV62iG;k!6x_U!G9fbaQ%B6Y&wV@G;(l5Fb+0LO%GafaAQ6kY`%>i
+zbjZO?CvmVv19~uy9NgR<2V1_S2jj}YEq`&a)kJzQo*dk|2nSo|p$Fs3!EI%6u+4FL
+zFo7K0eiH|M+tGsw<=~F~IM_CZ9(0j|JCoyJy9M-MB00D#_Ja-E|I+keVmY|G4i2`z
+zP7fxLgL_`$V28f+U{X1_cMJ}8OiB+XlY{%R<DlPqdN8>h+<yoMJJq5GQ^>&st#GjO
+zb9ykP96b0P2fK`-2VLdhq1iatH7h-sN)8?_j)UC}(1WSv;E~HX*u4ckm_`mB?SX?m
+zzS4tf<>0Y|IM{P0J(x}o9$$rny^7L<>E+;wsyNvDB0ZQv4xWs_!9LyS!Hjb7)G!?E
+z8=oG`BnMAtz`=ei=)uf#@XT%;?C(hrW|4zueQ<EVLwYc)96T3=gZ@M4!EAEyd<YH(
+zq@xG3%fSn7I5==8J(xodUOa<?gBsC;IpyFbKO7AFKo91UgO@EF96XsG%q<76gyP_k
+z{PbWRIe66r2Zx@b2lL9o@H;p-tOGrmPYzxSz`>w@&IjMd<d=ijU2$;uVtTNE9K5jw
+z2S=2n2i@f0O)nfAd5az_C<kx7#=%ho=)ppA@b-8d9G!w5EG!4_<if!*o9MwJa`5g^
+z92{Gh9xN&c@A=~3xL5RGF*$hu7Y>deOAi*8gAeB6;Dj9XU<o<+&>aUS9;OFN%E3qB
+zI5?>_J?Jh6BYNXt@DF;hlpK7V7zZcMp$ALL!6$2Ra7qb!u#6mhS_20|uF!*J<>0fY
+zI5@Q@Jy=c-J|BUD(_HAm@^bJ+W*nTpnjZ9!gD>~t;EZbYU<En&su>Q>d`u5kl!K99
+zaBx--Jy=N&zMhVQvoq3zmF3`@!Z<i*4?XB92j8B@!MROvu!<af*98aXeZs-2a`1gz
+z9GpKD2dl}!56f_HK|vg>E(bqW!oh`Saj=FQjJl75i#p+8O*!}}5C<1KaIlsf{G0{{
+zmn_A>+H&yAb{q_?fP;19V6-<5F1?F`b>-mKcQ_a}5C`iSo{N5)goDdc;h@(NdhmN*
+z99+H?2kV!o2Y;Nv!4>s!u)%G5@aKOxxbh7Sdi&FZzy9FhstGvQFeN?sdm#?4&W(eO
+zHq(PKWpHrKF&u1Mj~@JU0|(c(#X+A)dhl;Q99;Js2b+we2md9*!S(ZTuxU<u(8$3J
+zrEsv>5qi*)gB!2mVDmQgphFIB>VtzVe$s<+<lyEcIM{M7Js4LGZdr$etxD2^@#Nsv
+znmE|{Dm@rq4sLsfgKc`zg9+r|_K`T~n}{AvC<k|B!NIm`=s_1bxN|=awyRDLCX$1@
+zoL^|LKOg+>2|but4(^V|!S=)H!6b5U&kP*wkcl2lDhKx#!NHDu>A_@jaNh+S^lM5F
+zCYOWzyW(J{&-7plId~u*4tAbK52loZ2bbeumqPTQs~kL383((bqX$#T!NU)5uv=$(
+zFtr>!G8hND$Ds$)$ibs&aj-`iJ(yMw9@~L~JuA|K>Ez(?hB(;k9zB>|4xV_AgS`jQ
+zgBj%D$zUAplbRmPC<jmF!@<7W=)p{K@bpO>?AL%E%q$1bw8z2zZ|T7-a`5b592_u_
+z9?U8S&n?11|2*_yHaU2{EDi=7rw6mk!3#HWa9}%nFoztx*dGT6#n6K}<=~~{I2gEq
+z9?T^NFK@)b!KLZJ+;Z?r9UL5TogU012d}=w!J&QW!Mt)Xd<+f_OG*#slY`f?<6zKw
+zdN98nynYA=hu5M93&_D6t#EL}b9&HC4&MBZgCj@Lg9YW_t=Tv@Dl0u$NDkgEj)S8Q
+z(1V5L;GN4jIHm<XSVRuq?SX@1ztV$6<>0-9I5=)5Jy=W*-d}}-<BQUR#pU3GsyH~|
+zB0X3_4nB;)!HM1I!IE<D(J&mG6rUb+mxB=*a4>iUJy=Q(KHiOklRfFd(sJ;L4-QUw
+zNDr2ggHNMyFk}clSXK@`3&Fvu>FB|7a`3qu4o=%i50;mMFV5iL^hWfcha7zAhl4Xd
+z(1R7^;42FUXHKREE6TyhP#m0<pB}6v2VZ;O;OtZMU}ZV@<_-?d=|B&9%E7k*I5_v8
+z^8;`D^M5(`&J_peEylsBa`62Y9GqVc2dl}!4_-L9;1&*6mxCW)<KV&pI9NjtMvce8
+zMJaHwrX2i~3kMf(!ogZ{@bgg|Tv8VYYs<kezBm~A3J2@R!RTK&xO6NI)|G=_=iy*j
+z4jinvf#;&%+;MQ(VI1_TO%Hw#$HC>Taj^aidhkbY99;1O2OEs02Y)8U!Ig7x&^sGF
+z_-ic=t}20p4G+?TziZ&&>MJ<ds3koZ^Arcy^u)o&-{`?VBXDr73l93sq6hzG#=&)~
+zaj;1-dhp*q99&-w2b*4^2aO!u@E8Z1b*Bd{Ik+(h2b(9L2OV;7Q$`$Yv63E)BL_F{
+z!NHbQ=)t&ha7z;$Z1sp9j3)=Te!{`lL+Qcza&X&J9Bh-G9!wwyw->}g-(B=zLOHnO
+zEDpA9Ob@!q!JVCOu-!*`Fp(VG<@_R}{XLogrqF|l<>2n6IM}`bJ(xre?x}!-9Zu7O
+zN#)?)yExdfBR!Z*4(=O>gMNk{OfCoar^3NbOX$HAa`3=b9PC`49!x0*57x)QF1P7H
+zS2=j-4Gwnorw3EX!NU`9uv<!cFtr>!k{buRZ>9&+$ibt>aIi-`dN8dVJk}Nmdq&cO
+z>Ez(?-#FN796gv`4xX5ggS~UogBj%D$x=Aj=LkKRQ4XHEhJ$_E(1V%e;ORa%*zYGj
+zm{|^<NrHp@=hA~&<lxzLI5?mrJ(yJvo~wz2{#WV2Y;y4YGaL-)MGt0|gBM2P;J`%m
+zU=BHWF$)e3T0;-!l!KS{<6vNQdN7w9yxbfI2S1?)bIZXi(Kt9{I6at04qlysgF`dX
+zgL&m(co7^NwwE5vCkL-xz`>xV^k9BDc)cqQ4*yIK7LbEC;^E+kY4o6*9K5+42S*m7
+z2Mfx<Ta|He)H!;vkQ}`I00&2RrUwhl!8?O-a7-L}u!tPIn-&MhhS7sX<>0*?I5@5%
+zJy=W*-fxJ5<L}Xf#pU3G_c%CV5ItBz4n7RV!HKEq!IE<DQ9c};w2dBgmxB=}aWJ?6
+zJy=Q(K5mbLli$*VrRCt0zc@H$B0X3}4nAFkgCTk7!LoAjSy>#MdYm3CCkLP3#KCFp
+z=)v-G@I`+doE}3DddR_-$#HPT0(!859DKDA2WOV12P?|K$T~PU>pDGHNe;e#iG#EI
+z(u0-d;F~cxI43DR=qU%^X2-#~>v6D(9DH{O2j|to!K!lbeJdQC{~QOa$-xibad5#X
+z9IP$}KhDO%g;{a1h8&D4j)RL1;9yNT_~|kZE^dK?wdCOE9yqw<D-PC{gI^NjVCYO7
+ztRn}bSK;8&qBvMr4t}kQgJBnOuwFBI@LL29F6)MaUSH_J@569#d3+qKKb;=@kpTx+
+ztiZtrh3UbcyK!)(Ck}d_rw4!e;NYr<IM}cYJ@`8c2Uicl!A5cE!I%&nT$2t58!w{=
+z|G44c+MPJ)Q;8n@dj<#BHNwFr_vyiZemJ=P0}eI~qz8>0+%Opjo28)#EjhR`KMpqE
+zP7gZd;HFbJ*utA0j3Wm(cfi4x@94p}a&XH(=NH{9(`phu7*7svU5taR^U{Oy<>0n*
+zIN0U{J(xfaZoh?tzW>pK3FY990XW$94?XB22Y05x!FCJj!9;R!SL_cMZ2!y9gNfzf
+z?z%YG{sujmL=NtGg@YaX(Su3l;NGz~*fAMBm`o1t%YlP_8|cC0a&Z4)9PCt^9!wzz
+z546U?&M)Y}lydOk4;<_=njUnOgNNqeVApK)U@AFyxC9P%J4g?vmV-yG;9&Qb^k5n}
+zc(f-D_V`8*rj>)oTyU`GEP61V96Y`n2YVHx2h+>J6V-6A_a%BTgB(2h7zg`wrw232
+z!Basv*f#+^m`M(v&WMBkR?>r+<=~k;IM}}mJ(xufo^67I10K<XS>@olPdMm5lpf3`
+z2hUH%!GQGiV0Jlpp&$+p+(i%Okb@V`;^3gh^k7aoc&QT(27aUmbIHNW4jddjg&xc;
+z2d^x}!660c!8~&CY6Tn|dYT^0D+j~x;^453^k6<Ycx@mK1{r!VzZ|@t3I~TTp$7}d
+z!5dp~a71}}&`l2BtdD~uZ_|SX<>0M1I5^6m9xNmWZ%@F%(JAS{!gBCVZX6u5nI0@6
+z2k#!k!Ljw|!J=~TURxX-7fBBmlY{qv<KXyl^k8v0_+UN`PRL0QmXL!FOX1+eBlKWN
+zIr!)r4o+%A54y|2h(0(N{F5FmB?liT!NJLM>A})+@X0zHoKlh=EF%Y>*2KY(tMp)5
+zIr!`u4o>Yw50;aI&qw0mv_$k^c{%tZ3l2_SLl1h$!I%4Sa7J}{u!0<X)f@+BKA{II
+z%E8EJ9Go?r9;_q>U(dk7*_r6U%5v~c5geSemmc(#gKsb3;M}G-SVa!L>xzT(KI33j
+zIru&v4$hy3gVp5Vhvhi9pb!pLmxCWG<KV(`I9NjtMm@m6MV)c5rX2h<7zY=}!NFQ`
+z@N-%mToQ(ZwdLTK9XJ?T5eMtY!RUrKxbz+l)|G=_-{WA|ARMe`(SzTDad25`9P|pM
+z2fydT!R6a<u)YU9_~RrFu4sUR4ero`KilKr%C|V^9Y7EM`iq0BCgNa2S9<XGA{<<u
+z2L~H%p$B8i;^3O&IM~>W9{h6?2iLa4L7&(3;NSi@xGn|<n~bLi|0T!4^$T#YX)bz@
+zAM)8h11ODy&5qK8mK@x89S58H(t{2;xT!A=w)jO4#*u@Ylj2~@dGughIk;s#4z_Zq
+z2jj`Xt+jBlbvQj3Uk+}2j)QG_(}M}*;Pz2C=$n`xOehC;WW~X@Yw1B3Ik@ux4z{a7
+z4<?d>yJCO1Xn+3ylpahh2X}wP!S*BQ!6b5U&rBTbkeMD#DhKx##lepI=)q)iaNk87
+z^lL^BCYOWzyWwD`FZ5svId~vG4tAbS52loZ2Up-=m%{X*s~kM!iGy9w(}Stx;Ngcj
+z*sTjam|6}V8G?h|<I;m^<lxbCIM`zuJ(yMw9@~k7JuA_J>Ez(?MmX5(K0TOT4xadc
+zgS`Xk!3=Wn<YXM|lZGD5C<jmF$HBha>A_5L@boDh?B`7nW|o6zI^baccl2NuIe7M;
+z^M_szGhh-um{ks*Ta1JLdFjDya`1dP91J)?4`!Ex7jEI;!2jsM9CGmD0300jhaSu+
+z2QQ_-!N7&|U@kd$c@qu}E<+FImV;O7;^2@Q^k5!2c=Z(y4(&$|=9PotV{vd;GI}td
+z9K4nT2ZJ`ygZbs)^}{$gyf!^pKn~t$je{dz(1UJr@a7L3966dEEGP$W&B4J@+33MS
+za`1Ku92|X+9xN;e?_9ybF)iuAB69F<PaGWkjUFs22k*Jy;J8`zU@<v(e>Dz{FGdd*
+zmxB+g;oyWz^k4}&`0z0fPV7z(mXw2!f^cwB0(#J04n}0e!QhqjU@1BHcn=Ovu0ju%
+zmV-~4;NX-;^k5k|`1BJFh76?#%gVuLQ*m%=dU~*&9DH672dC|#2g}RB7iV#BdSiOf
+zLk_;|go86a(t{P`;423X&YVIIR+NL0OL1^k0eY~K9DH2?2WOwA2P@0LH+OMxPDgss
+zQx3izh=X$t4pxza?^5C5yd^kTRSv%2ii7jZ<6t#8_@O=yF1U?@)#c#FH#oS^9|vp5
+z!Kev1xF{tK)|7*va^v9Q%{W*~4t_p{gG=h+U~M`0r7aGIM&e){IT-yL2bYe+!Mbwr
+z>wFvx%ZY>aHu7BbTPYk|b_55#>d=GVui@bGHaJ-SB|Z3~4-T&QiGvNs(1Smd;NZ%+
+zIOv_79{jZq2UnHE!G?$E!QVA;aP?IjY}AS#jCqEGYkJ{e<L~s~pOHAYHW3c`%%%tb
+zX2HRAYjChhaeDCIejHq19S56UrU#82-0%bkoAsavEjhSxI1V;XNDn&X;HFGC*kTnu
+z7)K6n-iw1RtI~sU<=~d4IM^zJ9*idkw|>UK*2Cz*_;PUDG#qS`fgVgC2e%i(LEqi<
+zU_v>#;~WmQ^`Qq{<lxTEIM^<V9!w+$cR62JaLD#QgdR*R2X}|zV0$-uFo_)8QxOL{
+zoS_Gk%E7(&aIm8vJ(x@m?i+-Ieil8LTn_F}jf0&+>A@6o@W3`4?Ce1grj&yR8{lA<
+zJM^Hd96a<E2fGH)gQ?`;;fXld&6OTZEeDU}!NKlZ=)p8{@aS<I?BPWZrj>)o+Tmc&
+z*YsdIIe0t<2YZdD2h+>J6AN&#cP@G`gB(0r8VCCvr3W+0!Bf|9u&*yYm`M(v?u&!{
+ze$j)O<=~m5IM{z4J(xufo?VZF1KjDsta9*NEgbX@rw6mi!Sl~?FrYU*m|YHD7=?oa
+z6Vrn^<lx1uI5=o6J(yDtUOIq-fi>vCTypSo3mhE$lpf422d{j^!675)!8~&C>P#FQ
+znwcKVD+j}i;^44-^k6<Yc<mw%1~sDx^UJ~O-EeUD7kaRO9J~=92S-e&2i@f0%@sH}
+zvM@bZP!8Vm#KBSL>A^yB@b*I-9NmQ;EG!4_48g%Map}P#a`0|C92~oh9xN&c@9o6F
+zah2%7Vsh|)BODxmpB^kO2OoUE!3lx%U<o<+a54@~OhXTrl!K4*<KU$2^q{*Oj5vjZ
+z!QS*>DLMGK0}f7pM-P^kgHQh1Kk&9cADl9Y9xNjVpDxD1ki7I@SvmNu91c!BK@XOb
+zgU@f_;I#kf!SZtO#Q+?f{)Zm)kb^H%;NXmf^k4-!_-Ydl&MZR@R+NL0b#ZXk4SKMW
+z9DMx>2WR)A2P@0LH)C;dPBMDXQx3k(frE25;9wOw`0g+c&Z~`sRpsFO);Ku-1rAn|
+zgCBn2;DXUOSX~Z&oP&c4v*BP3IT%#}2Nxa0!J2aL(-j<C+!6<C$-&P(ad62u9IPz|
+zzqsIF=qwzpBL|~b<KWU_I9OK>eyxUsVV7{QUUQy{etV3A%ev#BS2R8NJqQPvC&0n_
+zGw8t|8F6sMN*ruZgdY642M1SH!9ni}^x&^1IJoK&4mRvc5B~mygR6()V54~SV9Zn;
+zT$3IL8!x8^{}jZ*wYzZ8r!qbG_bd*sYm9?U9?*mTI^p2@k2u(LFg+Oi;vU<<4O4Ki
+zSz3C~l7kxy;9&C|^q@lyZaR&FEgI5;apd6UjyTxzJv|s#4sJ0x*eaMFj3)=TF2TXp
+z`RKv;a&TLD9Bgxv9!wwyx8KG=-}dxiLOHm@9|zn1r3YQ);Lemd*lrO$m`D!pihWU$
+z{r$hP^k8B+xVs(>w!cXaCXs`CB5|-oe|j*f9Naq&2RkOG2b0OceK~Q^ZzDaJTn_F(
+zf`gsv(1R)D;DI(c*!d+rm{JZN{E35I#?XVVa`4bx9PFB%9!w<%50}KjZinc>)N=61
+zRUGWziXKcO2aoo`!5-h~!L)MlSRx$kIh!6#CkKzO!NFd|>B01J@I-YS?0uOY%peC(
+zKEc60J?O!Va`4n}9PFEr9?T>MPiMlxeyixg%yRI|UL5RSl^)C@2hTRe!2uEUU{*PJ
+z?lTVh52FXO$-(o}a4;YPJ(yh%UMPfv19#JdIppBQb2vE2haSu+2QPKT!N4ebFqa&>
+z90vynhtPw$<=~Yt930|C59X1BS1aP+&@=R4UO5<k4+n?&(S!Nq;I%<G7-Z3d`Q_mC
+z)HpailpZV~2XAb{!4V$xpqm`L*#HMe-k}Ez%E4Q2ad1=sJy=K%-kykqqh0C2!gBCV
+z9vmFAg&r&-2k#!o!LeTSU{N`EuN@AKdrc1(lY{qTaB%#1da$@0e6RoqC*-0BOUS{8
+zrEzfLQF^eX9DH;g2PgT`gYI%LqAv~x|Dp#=$-&1-ad7fHda$${e6k(~r?}IDW#r(~
+zS~wUIP7juqgU_Dh;MCsqU^zMXd=w5&OH2=zmxC{|;^6eP^q_|ve0cx|XVjnvE6BlD
+zEpTw=Q+lwX9E|*mgR@4^gO%jq>zOz>J2O34Sq{D_ii30Z(Sx3H@a;t$oZAcstH{B3
+z-EeT;7aXiA2j9oX!THm1u$mnFumT4c6vn~oa`2-k4lX>8gEiz})I%Ix)CC7?%E3=V
+zaBy*49IPb=Kc~aNCChNIwjBJj69+>p;b0v(7~Kd5m)^(0x^nRA2OJCw#KC$Fdhpw1
+z99)(L2fdckgWvPx;PUM_Sib^2_~R4~uJFde26ySfpB->;<vSeo9!L-V`e(n`#eT2a
+zs!2H5Fcm%cdod2K&WnSMw$g(!<#2G#2^?%(pC0^k3kTQ!hl4(E=)u1OaB$rp9BeXy
+z9{iUA2iGse!KS(CL0;JBFdNF?V6$WNpd|-4-oU};ZRtUW9Ng3o2V4B62jj@W&B<`E
+z<$QWDt{mL50S8-^q6g#2!L7A%u=O>1Fuokz_5ugn^q~h6$ieNSanLsjJ(y4q?#PCN
+zZP(F*E^=_^K^$yXlO9YY2X{GNP-wqb?Z0RAU}8DA`x_3nA4v};k%N0?;b4a>^k7ms
+zxVIP%cHB=7CX<8vF5#eGb9ykj9Nga>2RlX6gDK?Tfdn|%c?Lb0QVt$miGy8=(1WgW
+z@K6;T?0SJ7OeF^oKf=LoUFpHpa`4Dd9PA#C9!w(#kEX}L9?R*$v~uv+E*$JxnI23h
+z2ah+#!CnvO!Sr(Q#77+LJ(wQMAO}xQ!NERh>A{S0@KgaD?7M>=%p?a-pT@y{4e7zm
+za_~$?9PIy|9?T*K&l(&Y5KIqdm4oM&;Glm#dN7+DJYOCM15VO|+2!Dc+c-F|Jw2F1
+z4qo)f!9joN!JKmNQc4^QTtpA%l7p8w<KW=3^k8l|c%>c=4!KDW=8=O}BXMwOe|j*l
+z91I_agTs>3gZbp(wVXH@w2>anF9)w5!NK8m=)nSV@J1UP9PyGKbd!TOf8yZCG4x<T
+zIe2R>4vxxB4;GSxw@c#S=tJ~iVL5o`Dh`fmMGqE{gLix3;Mni<U{N`EFA)xon@tZE
+zlY{ry;NbY;^k8v0_@FutPPj}DmXL!FpWxuc9`s;IIrwNe4o*r)54y|2h)g&byow$y
+zB?lkx#lgu{>A})+@JUk~oDx9~mXU)`KjUD?FnX}89DFtn2d8GB2g}L9=Y?=^+HQKV
+zyc~RS4hN_E(1RXw@MUKloDoG2R*-|Q;^5%S5PGnp9E=RZ!C7wfU?n;Dx*`tFK0^;y
+zmV<BZ;ouxUdeBo2z8!>vb1fXKA_w24#=&`^I9OE<zTbv}^F45|njHMl00$S`!NKZs
+z@Z(z?To{0ZHRNE_L>ye?ii0)f;HNw|xOfW=){=vtkK^DHFC45b2fwt#!O+(@SVs;<
+z$Kc@7@i<sl4t`yLgJHRFu-+z~i+(GOgUgQMpjTab@cVTfT<(j5^<UA0Kl<X}ieEU`
+zU@SfOGbs+PoQH$nIq1P(>v3?EI}SEHOb`C9g@dcZaj;QqdNAfW4zB5qgN=XCgMUWh
+z;M&AE=re~N{F@aA*R93DCMD>>e+O`IeGMFJdW9a0eNnIN;D)C-*sLc#Xvx8iBXF>}
+z3q9zNgPStrV2joCU>rHPc^?k8tVR#Um4jQF;b5!B^k6(Wxb+JTwhp2P<IBNq({Zp(
+zMtU%T9Nb<Q2YvU@g9+u}j`KL!wh2AxA_sSN!NGQ)=)pvCa98Y$iEaO<(u0ZR;O=EO
+z*uEe=m_!clsf2?a&eDTP<>21?IM}fhJ(x@m?hC|0KL<USTn_F}gM*!x(t|1F;DPNp
+z*tr5dm{JZN^v1z1cj-Y_Ie6$D4t5<#52liXhbQ4+w^a0CYB_i$FAjF!N)M)ygGW!`
+zV2}FrU|KnN>^~gr`Gy`$CkK!J!NFb==)v@I@WetK?46q)%peC(mchY3$LPU~a`4m*
+z9PHbc9?T>MPxr&Ye!uC#%yRHdG92tbpB~I22hVQ6!2zY{!K`xdTx}fmzeW#clY{49
+z;9x)>dN8{jyf7LE2PUBhbI8Gq*>G^sI(jgt9K3W82Lo%;gSq73<(4=&_!&KzTMl0N
+zhJ!;!(t~;A;MG|;I5Z1Am{$&l7sJ6}`{}`aa`4(E91Lns59XJH*Sq83@MwClfE>J$
+z00&3Rpa<RL;LVjdII;*mSWph$s)B=~F3^L8<lyZ`I5@g1Jy=){-WiI6W8%?+MdaY!
+z^f)+nIXzfZ4&K{^gX1dGgT>_F{l+*r{sBE$Tn;|?h=UUb(}N}C;KM06I590fSW*r?
+zDu9ENcF=?FaxmgF4hA=*2TRGp#~pES@_Tx)v>be5aBxa6Jy=E#K3#%?A^GURvU2cQ
+zc^sU2k{&E42cO@@!D;R3!SZtOg+C5X|4R>g$ibH>ad5^Wda!~Ve6<+|XO^W0E6Tyh
+zdN?@iCOue54!(}W!P))k!OC**%{UyKlbjy(l!I?`;^5qkI9NpvzB_`0^XlMWRXO;+
+z4GzwKiG$VT;D?_$xL^zpR+obx=i=bP>^N9M4n~#4!9|B~u%;aRbQK2|x5B|%a`1C6
+z99;4p2W!j0FNtt4bT$swk%Q4|aByjH9IPt`zgEY=u**1DuLV8$?FkMp>w$w_U+KZ`
+z!*OtVLL96=lOFt$2?tlK!odbb>A|0Sad2f-9Q3|O5B_S3gR3HNuwgfP@b_mNTs;g2
+z8^xywW2WKYnhZGDcm+N9rw|UV-Hn4jp7h|~b2zxp2M3!xqzC_X#=-SbIM{RuJ;)3C
+zZT~}Xuvt2K(2|22-Egq^PI}NG2REI;!4{3^!8meovmXw&{6G)Jm4jO>9Beh29*idk
+zw}#?i>-_X!d^xzy0|(ojq6ZVm!R>c&(6<9Um{1Px2*AO%|Lhlh+wa+Sk%K#3aj@ND
+zdN7e3+~xd30{cDN|COT$6U)KfUO3qP7Co3m4(@r4gB=FYgGuG!-tjotF$F!COb+hL
+zg@b;Z=)vT2aQ{&p>{OQ?Od$sk_~KyaSM*>?Ie73F4t5z!54y_1L-TO3YYuual^i_m
+zj)UC}(}Sty;E`|~?B1FlOd|)6_Qt^;Kj^`<a`0GU9PBxV9!w_(kFUkSUM1+k^m6b-
+z4IJ!!g&xcx2Twl5!9G3d!Hjb7)Ce5x>p~A^l7pu+<6ytl^k8N=cxE3C_OC_{W|4zu
+zo8jPq$Mj%UIe6|14*CbtgW2TZ`RO<qkdYqDE(b3Z#=(Jm=)oLv@ZxzK9Mps!%qa&i
+zb-}^FPxN3eIe0lP4i27559XGGSC--6kb?AJ9yxfm5)KYMOAqFigW>maa9AgLFrOT}
+z7KnpE4tg-Z9K4<e2Zt}E2Mfr-8{2VkL<M@#O%C4l#=((y>A`|>@YXvV95s+0EF=eS
+zPr|{`sp!GNa_~-G92~Qi9xNgU@1DTHvGwV}qH^%we>gbq4Lw*)4&MKRgX1UAgT>|G
+zgM~OaAvZl(LJmGGgM$-~(Ss%B;G-KjIH@f?=q?8%`r%;kZ+ftl9DJM%2Pe;`2TRMr
+zCmV2ZN-27<j2wJg8wW$K(Sv2>;IkJvIJFNwSWXT;AB}_4lF)<Y<=~5KI5>SBJ?J3^
+zUmnE488zv_3UcsOOB|f}j2^5g2P41X;H;7KU?n;DdKM1O&O#4XmV<AK;ozM8^q{94
+ze0vE8=QhW|Dsu2$cO0A-je}L?;QItPIDZBXR+EDtR^s4-A~;xG4t}hHg9|U<U=2AK
+z^#}(Sb;ZG&a`4ko99$d^2W!c}&*^b+$#NX5EeF5s!okqWI9NvxMmNU6r4Mkht{nXO
+z5eLHt<6ylwJQw{o1qYX<#X+wydhmMz99+Hw2kTd)2Y;N#!4(a0u)#fg@MlLHT=^ac
+zy$8{QzYGqp3dX^Psp-MrOK@;?J{)YcjUJ3CkArJY;$Y(j^x&V{IJmYw4*I;M2mkux
+z;JUv!*kmF-_%9_6u3v<MP4m!$v46~CJGh}N4mLYZ4_b0?<4qiF-i{u0$iYqhaj-=U
+zJs3w0ZcdJaEf>&(apmBajX2n<G(8wk4sNZ3gRQUAgYo6ywwE~ArY}91Kn`vngM+?F
+z>A{3@a7T6=Y`dNwbdiHQ58+_DTJ&HdIk+qKkBDslpVNbh<>2n`IM{v^J(xre?wO5)
+z9kSAcN#)?);yBpx06myY4(_{*gMKaO!Q^sqe-9k&^pze=AqNj6#KF!p>A{q8@Zc&O
+z>{65-bd`gLs^VbRi}YYBIe0h%2fKBn2UE+zBg1g8dwhB@jT}6h0S9}mpa;{+!DG8|
+zu%{<Im`)BJ_rbwl59z`5a_~eH4)z{G4`z^qCqr<sPda)qqZ~ZthJ$@~(u0}g;OR3s
+z*sl>im{|^<@x#IXALzj>a`3E$g99ehgIVR^xlkPR&rc6#lY{3ya4_H$J(yh%UbusU
+z13S=zIppBQ0300j&;DZ%`+G7u<=`b(91L7c59X4Cm$%^H;Bxd}ZaH|x3kQeXq6hQH
+z!K<%vaOePfFs~d8ACH5>QqY6><lwbjI2g2v9?UNXuOG$1;dSZ30&?(%FAk1)MGv~k
+z!JEHuaO7Beu%H~gH4g_z<)8-($-&$1I5_$+Jy=){-U-LSF|FyrB69F<ZyX%^gB~m@
+z2k#}u!Etlw!D4do{#qOyUxFSiE(agfz`+Su=)n?l@ZnP&oY<2dEGY*cjljW4F7%+g
+z9E`|}gTbrm!BTSY@je`!T#X(qEeD@8!@((!>A^B`@aY#E3<;tK%gVuL({XTWMtZQE
+z9DH6F2dC|!2g}RB7w2(sdJ}rkLk_;|f`c<Y(SsG_;H$VeICCmJSWyl}F2liD1?j;`
+za`1H}9GrcY9;_?}-`vN+Ii2W1PdWHD5C`WvaIlITe3u3X=Pkv-s&erCb{w2v0SBwe
+z!4KXzxZo}hR+obx-{IiGfjC%04n|GF!9}TXu%;aRlotmVZ^gk{a`5vB99&W#2W!j0
+zFaP0S=o=iYBL}1Z;Na2;I9OK>eqD%zVYzXz-e!96TNxZ&b_@r->d}MWZ{Xnawm4Wn
+zk{<lg4+mHL#=!>T=)s@KaB$^(9Q4jf5B}PKgR4s6V8bKy;P2WvxcV9nHflo;#=OA6
+zHGOcf@lSg2&uAQ6n*;}a=F)?Iv*F;nbvW3hBt7`=AP%mtiGxkA(t}10Zg_@+&3e&;
+zmK@wT5(k?nq6Zyva8ni>Y_WzOj3Wm(@5jNG)#<^wa&Sv?9BlQ39*idkw?^Y&>*4fZ
+zd^xyn1`f8#L=PsAgWHSXpzmIKFrggWaRCS0Hl+t$<lxS(IN0tpJ(x%i?uz{bLi_uF
+z)9As(a&Y%@9Bf~R9!w$!_f*Eg4(I5>q;hcY103wwnI23g2loxeLBBZkU~)OQKP?V+
+z3Zn;8$iV|UaIkYldN8FNJlGHiyWFD(UFG1R_c+*f5IvYm4jvB1!EUMP!PIi_NIo3w
+zzKtGCBL|P3#K9g7=)tsd@K}2s?D>`+OeY7A|HZ*x6Y0V9a`40=9PFKk9?T#IPnN~O
+zKF8_7jB@bQO&sjojvmY;2T%9M!G1CHU}iaZCOHoFUqBCLk%MP9;^2VN^k7ywc&-i(
+z`d_C9v&q5pFL5xSFFlxD4qh08g9DS&gE{2j#q2mZXgxicQx0A_goA;#=)qia@Nz30
+z9Q>Rf%q<76e8<5dqv*jra`5VG92}aJ9?UBT!;9nKumkj9J~?>pG7bi{pa=8I!RtM6
+zaQIhxuz(!Akq`$*%%lh1<lxO!I5@H>Jy=i<-l~d&qb|~eh2-Gv2pk;UjUFs42k#8S
+z!7=ga!6I_-ZU!72yMi7pDhKcF#=&u(^k6YLc;5#H$3LV8i_5_WQ8+kZ2t8Or4n7RQ
+z!HMbU!IE<DksA(9+DQ+(%fW~<I2hcB9xNpXAN%3p<PY><X*u}B!oew%>A^B`@M$Ox
+zhUBLQ%gVuL9ymDl6g^l@4nDtwgVQ?DgXQJmivS#){?GnHFZ=%oJ>=j^R~($Nm>#Sk
+z2VZT$!I|ag!HRM)(hCP?-J%C8$-&pJad7qkda$w_d@~*g=cJ$qJ>}rrTsSy)6Ao69
+zgYS;w;JmsxSXB<b_r<~auW+!M9Q^PL2N#UR!Rm7G<2)Q(m;(oE$iXOg99(o52W!f~
+zPvJPYxHS&el7pXn<KU7XI9OW_eo2gjp>uGsjvS0$i-Su`;9y-j__YQOhF!tIdM$Y_
+z`t2zWF6)VdUf<}!?;~(<xeE@~pG6P;$c%$4R^woUV)Wq8eK@$X8V-72q6dF9!@*UL
+zaj;=`dhqub99$iQgN+i<gE7-_a7{)WY`l^l{8JbQ*Y3eVpDOg=-}5-Qt_cn{c|;HX
+z>w<&pKjC20q4c1UgBzyeV6*h}pd|-47R15kyXZlO9Ncsk2U|3z2jj@W&7E+t<wtrj
+zt{mLrz`<5i=)rh$aO+YWY+ZmJj4ubbRlvbEr|H22a&Y@y9Q5r-4<?j@I|kxlTSE`J
+z$ibbdaIoDHdN7e3+!g!B!}jO@<>|r1a&UKj9BhA^9!w$!_q@Tu4*v9DQaQMH0uFXe
+zNe?EIgZpyhpx<VCFu5Gue+&mZ)uRVf$iV|`aj<hFJ(yAs9{i1iUB=Oau5$3ud>rhW
+zlO9YZ2M?FR!EQ(B!PIi_$Tb}7-i97bBL|Q6!NDFs>A|#e@K_QY>^YYnOeY7AufxG!
+zCF#NRa_~e=9PE9S9?T#IPd>xJKE3F{jB@bQNF3~&h#t%&2Ty0g!G3G#!OU{-%zhl~
+zU!5MzA_vbl$H4(l=)tUV@LV(w`VXfEv&q5pGjK2<6Frz+4qhmNg9G={gE{2j#S1t%
+zs3|>|Qx0D0ii3fl>A_rb@NzsH96XI4%q<76EXTnih3LUNa`0+p92|O%9?UBT!yn+_
+zu+H>gJ~?=8Fb)RAp$GHJ!Ru*paCjI!SU?Wm*nxv1D$;{)a`0wD92|L%9xNyaZ@tIC
+zQG@8gLUQnSFb<ARO%E29gLm@b;FxXnU=cZZ_aqLEZ9oqem4o-%<KVcr^k6YLc>gaB
+zj-N;m7MFt$7UAH8JoI1*Iry+F4o*By50;dJk8a}Nq;~Y6yBv(@kAuN6^k6AD_&7NZ
+zPF_F{mX?E0Hsauv()3^%Iry{=4u)K(2g}OAXD@MZYF~P=oE&^U1_!4lr3cH)!57(a
+zaQb?B&_fQsJcNTYYSDug<lw7TI5_h;Jy=l=Mt;Y^S)=H|N^<b^Y#f}Ol^(1t2j3LO
+z!8r%$K~FjO_A(C6ZGnST<lws=I5_Vs4px<e?-SzS{FyjdO%8rog@X%<;$U?-_^~Pu
+zF1(0?HRNDa1P(6hhJ!Wb;HP0YxHvuz){=vtGvMHo6*yR14u08<gQ1={SVs;<`{3Zx
+zhd5YQ4t|Zo!LT7XST8QmMZbmM;Iec$=(UU<{O*Q>%Xi{n{Yv!Uk25&9q7e=@xK9uM
+z^uxiGA8^n+kRJSH;oz#tIM^@^J@`8m2Uq9E!A9HZ!59x5TyqKs8++4(f9~Mm+73AA
+k^Nt?;8-RoB{yG29+L$Jj=)r%kIJkZ>4mQn84;nf6Kk4W<#sB~S
+
+literal 0
+HcmV?d00001
+
+diff --git a/maia-httpd/tests/observation-continuous/layout-k1023-sum.bin b/maia-httpd/tests/observation-continuous/layout-k1023-sum.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..815450153a072fda61cef352938df957a55306d5
+GIT binary patch
+literal 32768
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/maia-httpd/tests/observation-continuous/layout-k2-sum.bin b/maia-httpd/tests/observation-continuous/layout-k2-sum.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0ace760a78da390988d8c11c0aa7c7d069299c8
+GIT binary patch
+literal 32768
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/maia-httpd/tests/observation-continuous/layout-k3-peak.bin b/maia-httpd/tests/observation-continuous/layout-k3-peak.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..55d3fd32b8aa5ad0866324d13fede9f540517fc5
+GIT binary patch
+literal 32768
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/maia-httpd/tests/observation-continuous/obn2_vectors.py b/maia-httpd/tests/observation-continuous/obn2_vectors.py
+new file mode 100644
+index 0000000..d38fec2
+--- /dev/null
++++ b/maia-httpd/tests/observation-continuous/obn2_vectors.py
+@@ -0,0 +1,68 @@
++"""Portable OBN2-r2 encoding goldens. Python 3 stdlib only; no FPGA tools.
++
++These are byte-layout vectors, including representable mantissa extremes.
++Real FFT/integer-accumulator equivalence is tested separately.
++"""
++import hashlib
++import json
++from pathlib import Path
++import struct
++import sys
++
++MAGIC = 0x324E424F
++HEADER = '<IHHQQQIIIIIIQ'
++
++
++def encode(mantissa, exponent, *, seq, epoch, first_tick, actual_k,
++           peak=False, source_ddc=False, ordinal=0):
++    n = len(mantissa)
++    assert n >= 64 and len(exponent) == n and 1 <= actual_k <= 1023
++    header = struct.pack(HEADER, MAGIC, 2, 64, seq, epoch, first_tick, n,
++        actual_k, 62500000, 1 | (int(source_ddc)<<1) | (int(peak)<<2),
++        2, n*8, ordinal)
++    assert len(header) == 64
++    words = []
++    for j, (m, e) in enumerate(zip(mantissa, exponent)):
++        assert 0 <= int(m) < (1<<47) and 0 <= int(e) <= 4
++        words.append(int(m) | (int(e)<<47) | ((header[j] if j<64 else 0)<<56))
++    return struct.pack('<'+'Q'*n, *words)
++
++
++def decode(raw):
++    words = struct.unpack('<'+'Q'*(len(raw)//8), raw)
++    header = bytes(w>>56 for w in words[:64])
++    magic, rev, size, seq, epoch, tick, n, k, hz, flags, enc, size_bytes, ordinal = struct.unpack(HEADER,header)
++    assert (magic,rev,size,enc,size_bytes,n*8)==(MAGIC,2,64,2,len(raw),len(raw))
++    assert 1<=k<=1023 and hz==62500000 and flags&1 and not flags&~7 and epoch!=0
++    assert all((w>>50)&63==0 for w in words)
++    assert all(w>>56==0 for w in words[64:])
++    exponent=[(w>>47)&7 for w in words]
++    assert max(exponent)<=4
++    return dict(seq=seq,epoch=epoch,first_tick=tick,actual_k=k,n=n,ordinal=ordinal,
++                peak=bool(flags&4),source_ddc=bool(flags&2),
++                mantissa=[w&((1<<47)-1) for w in words],exponent=exponent)
++
++
++def generate(directory):
++    directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
++    manifest={'format':'OBN2-r2/encoding2','purpose':'byte-layout, not RF or FFT reference','vectors':[]}
++    for i,(k,peak) in enumerate([(1,False),(2,False),(3,True),(1023,False)]):
++        name=f'layout-k{k}-'+('peak' if peak else 'sum')+'.bin'
++        mantissa=[((j+1)*0x123456789AB+i*0xFFEEDDCCBB)&((1<<47)-1) for j in range(4096)]
++        mantissa[0]=0;mantissa[1]=(1<<47)-1
++        exponent=[(j+i)%5 for j in range(4096)]
++        params=dict(seq=0x1234567800000000+i*1024,epoch=0xFEDCBA9876543210+i,
++                    first_tick=0xABCDEF0012340000+i,actual_k=k,peak=peak,
++                    source_ddc=bool(i&1),ordinal=0x100000000+i)
++        raw=encode(mantissa,exponent,**params)
++        d=decode(raw)
++        assert d['mantissa']==mantissa and d['exponent']==exponent
++        (directory/name).write_bytes(raw)
++        manifest['vectors'].append(dict(file=name,bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest(),**params))
++    (directory/'vectors.json').write_bytes((json.dumps(manifest,indent=2)+'\n').encode())
++    return manifest
++
++
++if __name__=='__main__':
++    print(json.dumps(generate(sys.argv[1] if len(sys.argv)>1 else 'golden'),indent=2))
++
+diff --git a/maia-httpd/tests/observation-continuous/vectors.json b/maia-httpd/tests/observation-continuous/vectors.json
+new file mode 100644
+index 0000000..f699c16
+--- /dev/null
++++ b/maia-httpd/tests/observation-continuous/vectors.json
+@@ -0,0 +1,55 @@
++{
++  "format": "OBN2-r2/encoding2",
++  "purpose": "byte-layout, not RF or FFT reference",
++  "vectors": [
++    {
++      "file": "layout-k1-sum.bin",
++      "bytes": 32768,
++      "sha256": "753a10ac07524439b79eb3149d586e50f7a691dc2471a208bd4ec6bd0909e512",
++      "seq": 1311768464867721216,
++      "epoch": 18364758544493064720,
++      "first_tick": 12379813734295797760,
++      "actual_k": 1,
++      "peak": false,
++      "source_ddc": false,
++      "ordinal": 4294967296
++    },
++    {
++      "file": "layout-k2-sum.bin",
++      "bytes": 32768,
++      "sha256": "e5420102b8b14b54a75955dcdb686cdef5fc6f7971768a404501911594fb27d6",
++      "seq": 1311768464867722240,
++      "epoch": 18364758544493064721,
++      "first_tick": 12379813734295797761,
++      "actual_k": 2,
++      "peak": false,
++      "source_ddc": true,
++      "ordinal": 4294967297
++    },
++    {
++      "file": "layout-k3-peak.bin",
++      "bytes": 32768,
++      "sha256": "275ebab88647b523336a9bc86b9624bb3a482f3447cb4835189b13f785397c21",
++      "seq": 1311768464867723264,
++      "epoch": 18364758544493064722,
++      "first_tick": 12379813734295797762,
++      "actual_k": 3,
++      "peak": true,
++      "source_ddc": false,
++      "ordinal": 4294967298
++    },
++    {
++      "file": "layout-k1023-sum.bin",
++      "bytes": 32768,
++      "sha256": "ae200484df962e571bdb93629ae8b411186d2040c62be6199f0569b02067dc08",
++      "seq": 1311768464867724288,
++      "epoch": 18364758544493064723,
++      "first_tick": 12379813734295797763,
++      "actual_k": 1023,
++      "peak": false,
++      "source_ddc": true,
++      "ordinal": 4294967299
++    }
++  ]
++}
++
