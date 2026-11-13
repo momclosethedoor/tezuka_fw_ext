@@ -101,10 +101,11 @@ if arm_only:
     smoke2=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-continuous-observations',str(continuous_path)],text=True,timeout=20)
     check('no hardware access' in smoke2,'Offline OBN2 config check failed')
     obn2_results=[]
-    for golden in sorted((src/'maia-httpd/tests/observation-continuous').glob('*.bin')):
-        text2=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-obn2-record',str(golden)],text=True,timeout=20)
+    for golden in sorted((src/'maia-httpd/tests/observation-continuous').glob('*.hex')):
+        raw_golden=artifact/(golden.stem+'.bin');raw_golden.write_bytes(bytes.fromhex(golden.read_text()))
+        text2=subprocess.check_output(['qemu-arm','-L',str(out/'target'),str(elf),'--check-obn2-record',str(raw_golden)],text=True,timeout=20)
         check('bins=4096' in text2 and 'no hardware access' in text2,'ARM OBN2 golden decode failed')
-        obn2_results.append({'file':golden.name,'sha256':sha(golden),'result':text2.strip()})
+        obn2_results.append({'file':raw_golden.name,'sha256':sha(raw_golden),'result':text2.strip()})
     check(len(obn2_results)==4,'Missing i5 OBN2 golden records')
     (artifact/'obn2-arm-offline.json').write_text(json.dumps(obn2_results,indent=2)+'\n')
     common['continuous_abi']={'id':'OBN2-r2/encoding2','contract_commit':'449b79e839010089836e8202cdae9c6b77d12492','hardware_accepted':False,'static_config':smoke2.strip(),'layout_goldens':obn2_results}
