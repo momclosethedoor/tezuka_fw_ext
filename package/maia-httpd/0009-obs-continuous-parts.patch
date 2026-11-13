@@ -116,7 +116,7 @@ index 6ec2074..5acaa3c 100644
              listen: "0.0.0.0:8000".parse().unwrap(),
 diff --git a/maia-httpd/src/continuous.rs b/maia-httpd/src/continuous.rs
 new file mode 100644
-index 0000000..98b83c7
+index 0000000..2b980c0
 --- /dev/null
 +++ b/maia-httpd/src/continuous.rs
 @@ -0,0 +1,137 @@
@@ -155,28 +155,28 @@ index 0000000..98b83c7
 +    for (dst,w) in out.iter_mut().zip(b.chunks_exact(8)){let w=u64v(w,0);*dst=(((w&((1u64<<47)-1)) as f64)*(1u64<<(2*((w>>47)&7))) as f64*scale) as f32;if !dst.is_finite(){return Err("OBN2 power overflow".into())}}
 +    Ok(())
 +}
-+#[derive(Clone,Copy,Debug)]
-+pub struct Snapshot{pub cookie:u32,pub committed:u64,pub reserved:u64,pub released:u64,pub selected:u64,pub dropped:u64,pub running:bool,pub dma_busy:bool,pub drained:bool,pub fault:bool}
++#[derive(Clone,Copy,Debug,Default)]
++pub struct Snapshot{pub input_seq:u64,pub finished:u64,pub unselected:u64,pub dirty_drop:u32,pub stop_drop:u32,pub stop_input_limit:u64,pub cookie:u32,pub committed:u64,pub reserved:u64,pub released:u64,pub selected:u64,pub dropped:u64,pub running:bool,pub dma_busy:bool,pub drained:bool,pub fault:bool}
 +/// Implement only from i5's final CONTRACT. copy_slot includes cache invalidation.
 +pub trait RingIo{fn start(&mut self)->Result<(),String>;fn snapshot(&mut self)->Result<Snapshot,String>;fn copy_slot(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;fn release(&mut self,cookie:u32,tail:u64)->Result<(),String>;fn stop(&mut self)->Result<(),String>;}
-+#[derive(Default,Debug)]pub struct ReaderStats{pub copied:u64,pub serviced:u64,pub high_water:u64}
-+pub struct Reader{cookie:u32,next:u64,stopping:bool,previous:Snapshot,scratch:Vec<u8>,pub stats:ReaderStats}
++#[derive(Default,Debug)]pub struct ReaderStats{pub copied:u64,pub serviced:u64,pub high_water:u64,pub max_service_us:u64,pub max_interval_us:u64}
++pub struct Reader{cookie:u32,next:u64,stopping:bool,previous:Snapshot,last_service:std::time::Instant,scratch:Vec<u8>,pub stats:ReaderStats}
 +impl Reader{
-+    pub fn attach(s:Snapshot)->Result<Self,String>{if s.cookie==0 || s.fault || s.released>s.committed || s.committed-s.released>SLOTS as u64{return Err("ring attach snapshot".into())}Ok(Self{cookie:s.cookie,next:s.released,stopping:false,previous:s,scratch:vec![0;BYTES],stats:Default::default()})}
++    pub fn attach(s:Snapshot)->Result<Self,String>{if s.cookie==0 || s.fault || s.released>s.committed || s.reserved<s.committed || s.reserved-s.released>SLOTS as u64{return Err("ring attach snapshot".into())}Ok(Self{cookie:s.cookie,next:s.released,stopping:false,previous:s,last_service:std::time::Instant::now(),scratch:vec![0;BYTES],stats:Default::default()})}
 +    fn checked(&self,s:Snapshot)->Result<(),String>{
 +        if s.cookie!=self.cookie || s.released!=self.next || s.committed<self.previous.committed || s.selected<self.previous.selected || s.dropped<self.previous.dropped || s.committed<s.released || s.reserved<s.committed || s.reserved-s.released>SLOTS as u64{return Err("ring lifetime/cursor/ownership/fault".into())}Ok(())
 +    }
 +    /// Drain what is ready now, never wait for a full ring/batch. Release each
 +    /// owned record before queueing; processing receives no borrowed DMA memory.
 +    pub fn service<I:RingIo>(&mut self,io:&mut I,q:&mut OwnedQueue)->Result<Snapshot,String>{
-+        let s=io.snapshot()?;self.checked(s)?;self.stats.high_water=self.stats.high_water.max(s.committed-self.next);
++        let now=std::time::Instant::now();self.stats.max_interval_us=self.stats.max_interval_us.max(now.duration_since(self.last_service).as_micros()as u64);self.last_service=now;let s=io.snapshot()?;self.checked(s)?;self.stats.high_water=self.stats.high_water.max(s.reserved-self.next);
 +        for tail in self.next..s.committed{
 +            io.copy_slot((tail%SLOTS as u64) as usize,&mut self.scratch)?;
 +            if header(&self.scratch)?.ordinal!=tail{return Err("committed slot ordinal mismatch; no release".into())}
 +            io.release(self.cookie,tail+1)?;self.next=tail+1;
 +            q.push_swap(&mut self.scratch);self.stats.copied+=1;
 +        }
-+        self.previous=s;self.stats.serviced+=1;if s.fault{return Err("PL fatal after draining valid committed prefix".into())}Ok(s)
++        self.previous=s;self.stats.serviced+=1;self.stats.max_service_us=self.stats.max_service_us.max(now.elapsed().as_micros()as u64);if s.fault{return Err("PL fatal after draining valid committed prefix".into())}Ok(s)
 +    }
 +    pub fn stop<I:RingIo>(&mut self,io:&mut I)->Result<(),String>{if !self.stopping{io.stop()?;self.stopping=true;}Ok(())}
 +    pub fn drained(&self,s:Snapshot)->bool{self.stopping&&s.drained&&!s.running&&!s.dma_busy&&self.next==s.committed&&s.reserved==s.committed}
@@ -253,13 +253,13 @@ index 0000000..98b83c7
 +    #[test]fn all_bins_sum_peak_and_selection(){let scale=1./750668f64.powi(2);for k in[1,2,3,1023]{for peak in[false,true]{let b=record(1,7,k,peak);let h=header(&b).unwrap();let mut p=vec![0.;4096];normalize(&b,h,scale,&mut p).unwrap();for j in 0..4096{assert_eq!(p[j],((j as u64*19+7)as f64*(1u64<<(2*(j%5)))as f64*scale/if peak{1.}else{k as f64})as f32)}}}let b=record(1,7,2,false);let mut p=vec![0.;4096];let mut prep=Prepare::new(vec![Context{epoch:7,position:0,flags:0,scale}],1000).unwrap();assert!(prep.accept(&b,&mut p).unwrap().is_some());assert!(prep.accept(&b,&mut p).unwrap().is_none());let mut skip=record(3,7,2,false);skip[4095*8+6]=255;assert!(prep.accept(&skip,&mut p).unwrap().is_none());assert_eq!(prep.stats.normalized,1);assert!(prep.accept(&record(5,0,2,false),&mut p).is_err());assert!(prep.accept(&record(7,8,2,false),&mut p).is_err());}
 +    struct Mock{data:Vec<Vec<u8>>,snap:Snapshot,copies:u64,releases:u64,stops:u64}
 +    impl RingIo for Mock{fn start(&mut self)->Result<(),String>{self.snap.running=true;Ok(())}fn snapshot(&mut self)->Result<Snapshot,String>{Ok(self.snap)}fn copy_slot(&mut self,s:usize,b:&mut[u8])->Result<(),String>{b.copy_from_slice(&self.data[s]);self.copies+=1;Ok(())}fn release(&mut self,c:u32,t:u64)->Result<(),String>{assert_eq!(c,self.snap.cookie);assert!(t<=self.snap.committed);self.snap.released=t;self.releases+=1;Ok(())}fn stop(&mut self)->Result<(),String>{self.stops+=1;self.snap.running=false;self.snap.drained=true;Ok(())}}
-+    #[test]fn wrap_full_release_before_processing_stop_reset(){let s=Snapshot{cookie:7,committed:0,reserved:0,released:0,selected:0,dropped:0,running:true,dma_busy:false,drained:false,fault:false};let mut io=Mock{data:(0..8).map(|_|vec![0;BYTES]).collect(),snap:s,copies:0,releases:0,stops:0};let mut r=Reader::attach(s).unwrap();let mut q=OwnedQueue::new(3).unwrap();for batch in 0..100{for j in 0..8{io.data[j]=record((batch*8+j)as u64,7,1,false)}io.snap.committed+=8;io.snap.reserved=io.snap.committed;io.snap.selected+=8;r.service(&mut io,&mut q).unwrap();assert_eq!(io.snap.released,io.snap.committed);}assert_eq!(r.stats.copied,800);assert_eq!(q.dropped,797);assert_eq!(q.storage_bytes(),3*BYTES);let mut out=vec![0;BYTES];assert!(q.pop_swap(&mut out));assert_eq!(header(&out).unwrap().ordinal,797);r.stop(&mut io).unwrap();r.stop(&mut io).unwrap();let s=r.service(&mut io,&mut q).unwrap();assert!(r.drained(s));assert_eq!(io.stops,1);io.snap.cookie+=1;assert!(r.service(&mut io,&mut q).is_err());}
++    #[test]fn wrap_full_release_before_processing_stop_reset(){let s=Snapshot{cookie:7,committed:0,reserved:0,released:0,selected:0,dropped:0,running:true,dma_busy:false,drained:false,fault:false,..Snapshot::default()};let mut io=Mock{data:(0..8).map(|_|vec![0;BYTES]).collect(),snap:s,copies:0,releases:0,stops:0};let mut r=Reader::attach(s).unwrap();let mut q=OwnedQueue::new(3).unwrap();for batch in 0..100{for j in 0..8{io.data[j]=record((batch*8+j)as u64,7,1,false)}io.snap.committed+=8;io.snap.reserved=io.snap.committed;io.snap.selected+=8;r.service(&mut io,&mut q).unwrap();assert_eq!(io.snap.released,io.snap.committed);}assert_eq!(r.stats.copied,800);assert_eq!(q.dropped,797);assert_eq!(q.storage_bytes(),3*BYTES);let mut out=vec![0;BYTES];assert!(q.pop_swap(&mut out));assert_eq!(header(&out).unwrap().ordinal,797);r.stop(&mut io).unwrap();r.stop(&mut io).unwrap();let s=r.service(&mut io,&mut q).unwrap();assert!(r.drained(s));assert_eq!(io.stops,1);io.snap.cookie+=1;assert!(r.service(&mut io,&mut q).is_err());}
 +    #[test]fn slow_client_gets_descriptor_then_visible_gap(){let mut h=PartsHub::new(2,64).unwrap();h.descriptor(&[1;64]).unwrap();let mut slow=Cursor::default();let mut o=Vec::new();assert!(h.poll(&mut slow,&mut o));for i in 0..10000{h.publish(&[i as u8;64]).unwrap();}assert!(h.storage_bytes()<=3*64);assert!(h.poll(&mut slow,&mut o));assert_eq!(slow.missed,9998);let mut reconnect=Cursor::default();assert!(h.poll(&mut reconnect,&mut o));assert_eq!(o,[1;64]);h.descriptor(&[2;64]).unwrap();assert!(h.poll(&mut slow,&mut o));assert_eq!(o,[2;64]);}
 +    #[test]fn reject_reserved_payload_and_malformed_groups(){let mut b=record(4,7,2,false);b[600*8+6]=4;let mut out=vec![0.;4096];assert!(normalize(&b,header(&b).unwrap(),1.,&mut out).is_err());let mut b=record(4,7,2,false);b[36*8+7]=0;assert!(header(&b).is_err());}
 +}
 diff --git a/maia-httpd/src/continuous_live.rs b/maia-httpd/src/continuous_live.rs
 new file mode 100644
-index 0000000..249124f
+index 0000000..5eedeab
 --- /dev/null
 +++ b/maia-httpd/src/continuous_live.rs
 @@ -0,0 +1,46 @@
@@ -285,7 +285,7 @@ index 0000000..249124f
 +pub struct Hardware{state:AppState,config:Config,control:u32,active:bool,pub last:Option<Snapshot>}
 +impl Drop for Hardware{fn drop(&mut self){if self.active{if let Ok(core)=self.state.ip_core().lock(){core.stream_write(0x54,4);}}}}
 +impl Hardware{
-+    fn snapshot_locked(&self)->Result<Snapshot,String>{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;core.stream_write(0x54,self.control|32);let read64=|a|core.stream_read(a)as u64|((core.stream_read(a+4)as u64)<<32);let status=core.stream_read(0x154);if status&8!=0{return Err("OBN2 rejected command sticky".into())}Ok(Snapshot{cookie:core.stream_read(0x150),committed:read64(0x100),reserved:read64(0x108),released:read64(0x110),selected:read64(0x130),dropped:core.stream_read(0x140)as u64+core.stream_read(0x144)as u64+core.stream_read(0x160)as u64,running:status&1!=0,dma_busy:status&2!=0,drained:status&16!=0,fault:status&4!=0})}
++    fn snapshot_locked(&self)->Result<Snapshot,String>{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;core.stream_write(0x54,self.control|32);let read64=|a|core.stream_read(a)as u64|((core.stream_read(a+4)as u64)<<32);let status=core.stream_read(0x154);if status&8!=0{return Err("OBN2 rejected command sticky".into())}Ok(Snapshot{input_seq:read64(0x118),finished:read64(0x128),unselected:read64(0x138),dirty_drop:core.stream_read(0x148),stop_drop:core.stream_read(0x14c),stop_input_limit:read64(0x158),cookie:core.stream_read(0x150),committed:read64(0x100),reserved:read64(0x108),released:read64(0x110),selected:read64(0x130),dropped:core.stream_read(0x140)as u64+core.stream_read(0x144)as u64+core.stream_read(0x160)as u64,running:status&1!=0,dma_busy:status&2!=0,drained:status&16!=0,fault:status&4!=0})}
 +}
 +impl RingIo for Hardware{
 +    fn snapshot(&mut self)->Result<Snapshot,String>{let s=self.snapshot_locked()?;self.last=Some(s);Ok(s)}
@@ -311,7 +311,7 @@ index 0000000..249124f
 +}
 diff --git a/maia-httpd/src/continuous_runtime.rs b/maia-httpd/src/continuous_runtime.rs
 new file mode 100644
-index 0000000..0ba61ee
+index 0000000..5c1ad8e
 --- /dev/null
 +++ b/maia-httpd/src/continuous_runtime.rs
 @@ -0,0 +1,70 @@
@@ -334,7 +334,7 @@ index 0000000..0ba61ee
 +/// not a model of autonomous hops or measured RF pass boundaries.
 +#[derive(Default)]pub struct StaticPass{next:u64}
 +impl PassResolver for StaticPass{fn candidate(&mut self,_:c::Header)->Result<Option<u64>,String>{if self.next==u64::MAX{return Err("static pass exhaustion".into())}Ok(Some(self.next))}fn accepted(&mut self,_:c::Header,_:u64){self.next+=1;}fn closed_through(&self)->u64{self.next}}
-+#[derive(Debug)]pub struct Outcome{pub reader:c::ReaderStats,pub prepare:c::PrepareStats,pub owned_dropped:u64,pub network_dropped:u64,pub stopped:bool}
++#[derive(Debug)]pub struct Outcome{pub reader:c::ReaderStats,pub final_snapshot:c::Snapshot,pub prepare:c::PrepareStats,pub owned_dropped:u64,pub network_dropped:u64,pub stopped:bool}
 +
 +pub async fn run<I:RingIo+Send+'static,C:Consumer,R:PassResolver>(mut io:I,mut prepare:Prepare,mut descriptor:Descriptor,hub:Arc<Mutex<PartsHub>>,stop:Arc<AtomicBool>,mut consumer:C,mut resolver:R)->Result<Outcome,String>{
 +    descriptor.validate()?;let mut frame=Vec::with_capacity(wire::MAX_WIRE);
@@ -354,7 +354,7 @@ index 0000000..0ba61ee
 +                let snap={let mut q=q.lock().map_err(|_|"owned queue lock")?;reader.service(&mut io,&mut q)?};
 +                if reader.drained(snap){break}
 +                tokio::time::sleep(Duration::from_millis(1)).await;
-+            }Ok::<_,String>(reader.stats)
++            }Ok::<_,String>((reader.stats,io.snapshot()?))
 +        }.await;
 +        if result.is_err(){let _=io.stop();}
 +        d.store(true,Ordering::Release);result
@@ -377,13 +377,13 @@ index 0000000..0ba61ee
 +        }Ok::<_,String>(())
 +    }.await;
 +    if processing.is_err(){stop.store(true,Ordering::Release)}
-+    let reader=acquire.await.map_err(|e|e.to_string())??;
++    let (reader,final_snapshot)=acquire.await.map_err(|e|e.to_string())??;
 +    processing?;
 +    seq=seq.checked_add(1).ok_or("wire sequence exhaustion")?;
 +    wire::progress(descriptor.identity,seq,resolver.closed_through(),true,&mut frame);
 +    hub.lock().map_err(|_|"hub lock")?.publish(&frame)?;
 +    let owned_dropped=queue.lock().map_err(|_|"owned queue lock")?.dropped;
-+    Ok(Outcome{reader,prepare:prepare.stats,owned_dropped,network_dropped,stopped:true})
++    Ok(Outcome{reader,final_snapshot,prepare:prepare.stats,owned_dropped,network_dropped,stopped:true})
 +}
 diff --git a/maia-httpd/src/fpga.rs b/maia-httpd/src/fpga.rs
 index f11ca67..c63ad7a 100644
