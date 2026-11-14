@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.94.0 --profile minimal --target armv7-unknown-linux-gnueabihf
-          cargo +1.94.0 build --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-dma/reader/Cargo.toml --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OUTPUT_DIR/host/bin/arm-linux-gcc\""
+          RUSTFLAGS="-C target-cpu=cortex-a9" cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-dma/reader/Cargo.toml --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OUTPUT_DIR/host/bin/arm-linux-gcc\""
           cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-dma-read artifact/
           cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-view-check artifact/
           cp tools/obs-dma/reader/Cargo.lock tools/obs-dma/reader/source-sha256.json artifact/

@@ -51,7 +51,15 @@ impl Hardware{
  fn live64(&self,o:usize)->u64{loop{let hi=self.r(o+4);let lo=self.r(o);if hi==self.r(o+4){return(hi as u64)<<32|lo as u64}}}
  fn sync(&mut self,region:u32,offset:u32,len:u32,cpu:bool)->R<()>{let t=Instant::now();let s=Sync{region,offset,len,for_cpu:cpu as u32};if unsafe{libc::ioctl(self.device.as_raw_fd(),0x4f02,&s)}!=0{return Err(format!("DMA sync: {}",std::io::Error::last_os_error()))}compiler_fence(Ordering::SeqCst);self.sync_ns+=t.elapsed().as_nanos();Ok(())}
  fn copy(&mut self,region:u32,off:usize,out:&mut[u8])->R<()>{self.sync(region,off as u32,out.len()as u32,true)?;let p=if region==0{self.full.ptr}else{self.overview.ptr};let t=Instant::now();unsafe{std::ptr::copy_nonoverlapping(p.add(off),out.as_mut_ptr(),out.len())};self.copy_ns+=t.elapsed().as_nanos();self.ranges.push((region,off as u32,out.len()as u32));Ok(())}
- fn give_back(&mut self)->R<()>{while let Some((r,o,n))=self.ranges.pop(){self.sync(r,o,n,false)?;}Ok(())}
+ fn give_back(&mut self)->R<()>{
+  // DMA_FROM_DEVICE, read-only VMA with VM_MAYWRITE cleared. CPU never changes
+  // DMA memory: no sync_for_device is required (Linux6.12 dma-api-howto,
+  // receive-buffer example). Complete all reads before cumulative MMIO release.
+  self.ranges.clear();
+  #[cfg(target_arch="arm")] unsafe{std::arch::asm!("dmb sy",options(nostack,preserves_flags));}
+  #[cfg(not(target_arch="arm"))] std::sync::atomic::fence(Ordering::SeqCst);
+  Ok(())
+ }
  fn prepare(&mut self,c:&Config)->R<()>{let s=self.snapshot()?;if s.running||s.dma_busy||!s.drained||s.committed!=s.released||s.reserved!=s.committed||s.fault{return Err("START needs STOP/DRAINED/released/nonfatal".into())}
   self.w(0x1b8,0);self.w(0x1a8,self.info.full as u32);self.w(0x1ac,self.info.view as u32);self.w(0x1b0,self.info.full_len);self.w(0x1b4,self.info.view_len);self.w(0x1a4,c.mode);
   self.w(0x164,c.scan as u32);self.w(0x168,c.settling);self.w(0x16c,0);self.w(0x178,0);self.w(0x18c,1);self.w(0x20,c.k*2|if c.peak{1<<15}else{0});self.w(0x58,100);self.w(0x5c,0);self.w(0x1b8,0x56494557);
