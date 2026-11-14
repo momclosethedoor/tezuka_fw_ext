@@ -65,10 +65,10 @@ index 9d3f2d4..6575e66 100644
          let root=std::env::var("OBS_OBN2_VECTOR_ROOT").unwrap_or_else(|_|"maia-httpd/tests/observation-continuous".into());
          for(i,(k,peak,name))in [(1,false,"layout-k1-sum.bin"),(2,false,"layout-k2-sum.bin"),(3,true,"layout-k3-peak.bin"),(1023,false,"layout-k1023-sum.bin")].into_iter().enumerate(){
 diff --git a/maia-httpd/src/continuous_live.rs b/maia-httpd/src/continuous_live.rs
-index bdba389..aed4bff 100644
+index bdba389..dfa8e3d 100644
 --- a/maia-httpd/src/continuous_live.rs
 +++ b/maia-httpd/src/continuous_live.rs
-@@ -42,7 +42,7 @@ impl Runtime{
+@@ -42,11 +42,16 @@ impl Runtime{
      pub async fn run(self)->Result<()>{
          let c=&self.config;let flags=if c.peak{4}else{0};let descriptor=Descriptor{identity:Identity{capture:uuid(&c.capture_id)?,map:1,run:1},fs:c.sample_rate as f64,bin0:c.rx_lo_hz as f64-c.sample_rate as f64/2.,step:c.sample_rate as f64/4096.,bins:4096,tick_hz:c::TICK_HZ,enbw:crate::native_observation::ENBW,entries:vec![Entry{epoch:c.epoch,lo:c.rx_lo_hz,offset:0,context:1,route:0,flags}]};
          let prepare=c::Prepare::new(vec![c::Context{epoch:c.epoch,position:0,flags,scale:1./750668f64.powi(2)}],0).map_err(anyhow::Error::msg)?;
@@ -77,6 +77,15 @@ index bdba389..aed4bff 100644
          let io=Hardware{state:self.state.clone(),config:c.clone(),control:0,active:false,last:None};let stop=Arc::new(AtomicBool::new(false));let timer_stop=stop.clone();let state=self.state.clone();let duration=Duration::from_secs_f64(c.run_seconds);
          let timer=tokio::spawn(async move{let start=std::time::Instant::now();loop{if start.elapsed()>=duration||state.scan().stop.load(Ordering::Acquire){timer_stop.store(true,Ordering::Release);break}tokio::time::sleep(Duration::from_millis(1)).await;}});
          *self.state.scan().status.lock().unwrap()=format!("{{\"version\":2,\"kind\":\"static-continuous\",\"running\":true,\"k\":{},\"stride\":{},\"autonomous_rf\":false}}",c.k,c.publish_stride);
+         let result=continuous_runtime::run(io,prepare,descriptor,hub,stop,CountingConsumer::default(),StaticPass::default()).await;timer.abort();
++        // Hardware and owned queue are already drained. App::run cancels HTTP
++        // when this future returns; give fast clients a bounded final flush.
++        // A slow socket cannot extend this deadline or retain any DMA slot.
++        // One second exceeds the 8-row / 30 Hz fast-client backlog budget.
++        if result.is_ok(){tokio::time::sleep(Duration::from_secs(1)).await;}
+         match result{Ok(outcome)=>{tracing::info!(?outcome,"OBN2 stopped/drained; static passes, no RF acceptance");*self.state.scan().status.lock().unwrap()=format!("{{\"version\":2,\"kind\":\"static-continuous\",\"running\":false,\"copied\":{},\"normalized\":{},\"owned_drop\":{},\"network_drop\":{},\"high_water\":{}}}",outcome.reader.copied,outcome.prepare.normalized,outcome.owned_dropped,outcome.network_dropped,outcome.reader.high_water);Ok(())},Err(e)=>{tracing::error!(error=%e,"OBN2 error; no implicit AXI reset or RAM correction");Err(anyhow::anyhow!(e))}}
+     }
+ }
 diff --git a/maia-httpd/src/continuous_runtime.rs b/maia-httpd/src/continuous_runtime.rs
 index 5c1ad8e..5c702c9 100644
 --- a/maia-httpd/src/continuous_runtime.rs

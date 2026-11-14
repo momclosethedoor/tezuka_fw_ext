@@ -44,10 +44,10 @@
     },
     {
       "name": "0011-obs-row-delivery-view-core.patch",
-      "sha256": "7da8faa60aeb55ac8b3b48b6a0eb63ba90810d904ade4b88fb091dc89b35d089"
+      "sha256": "9b41c0e8a2e85e2aa23db5e5b76c702647917b3088dd86ebc4ca542e93aafd32"
     }
   ],
-  "maia_httpd_tree_sha256": "da2efac20957eb42c9d6a2d3e0dec019b70647cd243f2df894ed8014b71d5da2",
+  "maia_httpd_tree_sha256": "54186ca23fea8d094e234aa8dd0e23c5e0eab8af63d5505241c2a0b0d77d5c67",
   "files": {
     "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
     "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
@@ -77,7 +77,7 @@
     "maia-httpd/src/bin/gobs-synthetic.rs": "ebce57e7848eeb2370ec4a55ef74f07974677137cfd30f8fb6bf2d5e6e14568a",
     "maia-httpd/src/bin/obs-view-check.rs": "45ef3b1e3c19f128dbe3e802325d7f7b6945e6816f5bab97d674938a0de51090",
     "maia-httpd/src/continuous.rs": "15f3e964f96d094b8a7f099939f9b42bf3e6024af09438221e4ba337541fd706",
-    "maia-httpd/src/continuous_live.rs": "14c5df3b7087fb62c64da9ef9e67fdf71fa222e116f0516b893e8ab5dc6d23d6",
+    "maia-httpd/src/continuous_live.rs": "6e989d52a61cbf3f3a3dbbb5c2a7d1bc29392bc4e80743f56618b7197dd3653e",
     "maia-httpd/src/continuous_runtime.rs": "0db7ade5725db06290ff28e575e95855400fc0af08db44a087eac1732f19b3f4",
     "maia-httpd/src/ddc.rs": "c4afe7a6187b3391acc12c0a4e173c02525a542687aff64930d4979d8de5ff84",
     "maia-httpd/src/ddc/constants.rs": "686fa8d5b1280f908256a83a108e7dbb1917d70374cb9e0acdfc6ed6e41362ad",
