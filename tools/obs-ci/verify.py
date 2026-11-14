@@ -15,6 +15,7 @@ check('Compiling maia-httpd v' in pathlib.Path('maia-build.log').read_text(),'No
 compiled=src/'maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd'
 if arm_only:
     binary=compiled.read_bytes()
+    shutil.copyfile(compiled.with_name('obs-view-check'),diagnostics/'obs-view-check')
     files={p.relative_to(out/'target').as_posix():b'' for p in (out/'target').rglob('*')}
 else:
     data=lzma.decompress((images/'rootfs.cpio.xz').read_bytes()); files={}; pos=0
