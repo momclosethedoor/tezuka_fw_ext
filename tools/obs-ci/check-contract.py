@@ -35,7 +35,7 @@ def main():
         # The same std-only modules used by the ARM crate, without host BLAS/toolchain.
         harness=work/'contract.rs'
         env['OBS_CONTINUOUS_OUTPUT_DIR']=str(output/'continuous-vectors')
-        harness.write_text('\n'.join('#[path='+json.dumps(str(tree/('maia-httpd/src/'+name+'.rs')).replace('\\','/'))+'] mod '+name+';' for name in ['observation','observation_live','native_observation','observation_transport','observation_accumulator','resident_schedule','scan_frame','gap_diagnostics','continuous','scan_parts','view','view','view']))
+        harness.write_text('\n'.join('#[path='+json.dumps(str(tree/('maia-httpd/src/'+name+'.rs')).replace('\\','/'))+'] mod '+name+';' for name in ['observation','observation_live','native_observation','observation_transport','observation_accumulator','resident_schedule','scan_frame','gap_diagnostics','continuous','scan_parts','view']))
         exe=work/('contract-tests.exe' if windows else 'contract-tests')
         command(['rustc','+'+version,'--edition=2024','-O','--test',harness,'-o',exe],tree,env,output/'rust-compile.log')
         command([exe,'--nocapture'],tree,env,output/'rust-tests.log')
