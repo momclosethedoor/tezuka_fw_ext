@@ -18,12 +18,14 @@ jobs:
       BR2_DL_DIR: /home/runner/br-dl
       OUTPUT_DIR: ${{ github.workspace }}/output/nano
       CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      RUSTUP_TOOLCHAIN: '1.99.0'
     steps:
       - uses: actions/checkout@v6
       - name: Build dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y gcc g++ make bison flex bc libssl-dev libncurses-dev rsync cpio unzip wget curl device-tree-compiler u-boot-tools zstd
+          sudo apt-get install -y gcc g++ make bison flex bc libssl-dev libncurses-dev rsync cpio unzip wget curl device-tree-compiler u-boot-tools zstd kmod
+          rustup toolchain install 1.99.0 --profile minimal
       - uses: actions/download-artifact@v8
         if: inputs.kit_run != ''
         with:
@@ -51,16 +53,14 @@ jobs:
           set -euo pipefail
           ./getbuildroot.sh
           make -C buildroot O="$OUTPUT_DIR" nano_defconfig
-          echo 'BR2_CCACHE=y' >> "$OUTPUT_DIR/.config"
-          echo 'BR2_CCACHE_USE_BASEDIR=y' >> "$OUTPUT_DIR/.config"
           make -C buildroot O="$OUTPUT_DIR" olddefconfig
           make -C buildroot O="$OUTPUT_DIR" linux V=1 2>&1 | tee kernel-build.log
-      - name: Verify exact running-kernel ABI and export kit
+      - name: Export prepared kernel even if verification needs adjustment
+        if: always()
         run: |
           set -euo pipefail
           KDIR="$OUTPUT_DIR/build/linux-custom"
           mkdir -p artifact kit-export
-          python3 tools/obs-dma/check_kernel.py "$KDIR" | tee artifact/kernel-check.txt
           cp "$KDIR/.config" artifact/kernel.config
           cp "$KDIR/Module.symvers" artifact/Module.symvers
           cp "$KDIR/include/generated/utsrelease.h" artifact/
@@ -68,9 +68,12 @@ jobs:
           tar -I 'zstd -T2 -3' -cf kit-export/kernel-kit.tar.zst output/nano/host output/nano/build/linux-custom
           sha256sum kit-export/kernel-kit.tar.zst > kit-export/SHA256SUMS
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: obs-kernel-kit
           path: kit-export/
+      - name: Verify exact running-kernel ABI before building module
+        run: python3 tools/obs-dma/check_kernel.py "$OUTPUT_DIR/build/linux-custom" | tee artifact/kernel-check.txt
       - name: Build reusable DMA owner module
         run: |
           set -euo pipefail
