@@ -1,0 +1,116 @@
+diff --git a/maia-httpd/src/continuous.rs b/maia-httpd/src/continuous.rs
+index 8cea7c8..9d3f2d4 100644
+--- a/maia-httpd/src/continuous.rs
++++ b/maia-httpd/src/continuous.rs
+@@ -7,6 +7,38 @@ pub const BINS:usize=4096;
+ pub const SLOTS:usize=8;
+ pub const ABI:u32=0x324e424f;
+ pub const TICK_HZ:u64=62_500_000;
++/// Explicit diagnostic DDR layout, selected only at committed -> owned copy.
++#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]pub enum CopyLayout{#[default]Normal,Ram544}
++/// No magic search. ordinal is the absolute DMA cursor, never the START/run id.
++/// The cold ordinal0 prefix must be protected with first_per_epoch until copied.
++pub fn copy_committed<F:FnMut(usize,std::ops::Range<usize>,&mut[u8])->Result<(),String>>(ordinal:u64,layout:CopyLayout,out:&mut[u8],mut copy:F)->Result<(),String>{
++    if out.len()!=BYTES{return Err("committed copy bounds".into())}
++    let slot=(ordinal%SLOTS as u64)as usize;
++    match layout{
++        CopyLayout::Normal=>copy(slot,0..BYTES,out),
++        CopyLayout::Ram544=>{let prefix=544*8;let suffix=BYTES-prefix;let previous=(slot+SLOTS-1)%SLOTS;let offset=if ordinal==0{0}else{suffix};let(a,b)=out.split_at_mut(prefix);copy(previous,offset..offset+prefix,a)?;copy(slot,0..suffix,b)}
++    }
++}
++
++#[cfg(test)]mod copy_tests{
++    use super::*;
++    #[test]fn explicit_segments_cold_then_wrap(){
++        for ordinal in 0..26u64{for layout in [CopyLayout::Normal,CopyLayout::Ram544]{
++            let expected:Vec<u8>=(0..BYTES).map(|j|((j*31+j/257+ordinal as usize)%251)as u8).collect();let mut ring=vec![0;BYTES*SLOTS];let mut spans=Vec::new();let mut out=vec![0;BYTES];
++            copy_committed(ordinal,layout,&mut out,|slot,range,b|{spans.push((slot,range.start,range.end));Ok(())}).unwrap();
++            let mut offset=0;for &(slot,start,end)in &spans{let n=end-start;ring[slot*BYTES+start..slot*BYTES+end].copy_from_slice(&expected[offset..offset+n]);offset+=n;}assert_eq!(offset,BYTES);
++            copy_committed(ordinal,layout,&mut out,|slot,range,b|{b.copy_from_slice(&ring[slot*BYTES+range.start..slot*BYTES+range.end]);Ok(())}).unwrap();assert_eq!(out,expected);
++            if layout==CopyLayout::Ram544{assert_eq!(spans,vec![(((ordinal+7)%8)as usize,if ordinal==0{0}else{28416},if ordinal==0{4352}else{32768}),((ordinal%8)as usize,0,28416)]);}
++        }}
++    }
++    /// Local physical bytes stay private. Execute the CI-built Windows test binary
++    /// with OBS_RAM_CAPTURE_ROOT after independent Python prepared each case.
++    #[test]fn saved_physical_captures(){
++        let Some(root)=std::env::var_os("OBS_RAM_CAPTURE_ROOT")else{return};let mut count=0;
++        for entry in std::fs::read_dir(root).unwrap(){let p=entry.unwrap().path();if !p.is_dir(){continue}let name=p.file_name().unwrap().to_str().unwrap();let mut fields=name.split('-');let layout=if fields.next()==Some("normal"){CopyLayout::Normal}else{CopyLayout::Ram544};let ordinal:u64=fields.next().unwrap().parse().unwrap();let ring=std::fs::read(p.join("ring.bin")).unwrap();let expected=std::fs::read(p.join("record.bin")).unwrap();let mut out=vec![0;BYTES];copy_committed(ordinal,layout,&mut out,|slot,range,b|{b.copy_from_slice(&ring[slot*BYTES+range.start..slot*BYTES+range.end]);Ok(())}).unwrap();assert_eq!(out,expected,"{name}");let h=header(&out).unwrap();assert_eq!(h.ordinal,ordinal);let mut bins=vec![0.;BINS];normalize(&out,h,1./750668f64.powi(2),&mut bins).unwrap();let f32bytes:Vec<u8>=bins.iter().flat_map(|v|v.to_le_bytes()).collect();assert_eq!(f32bytes,std::fs::read(p.join("power.f32")).unwrap(),"all4096 {name}");count+=1;
++        }assert!(count>=19);println!("physical capture cases={count}, exact records/metadata/all4096 f32 PASS");
++    }
++}
+ fn u16v(b:&[u8],i:usize)->u16{u16::from_le_bytes(b[i..i+2].try_into().unwrap())}
+ fn u32v(b:&[u8],i:usize)->u32{u32::from_le_bytes(b[i..i+4].try_into().unwrap())}
+ fn u64v(b:&[u8],i:usize)->u64{u64::from_le_bytes(b[i..i+8].try_into().unwrap())}
+@@ -36,7 +68,7 @@ pub fn normalize(b:&[u8],h:Header,scale:f64,out:&mut[f32])->Result<(),String>{
+ #[derive(Clone,Copy,Debug,Default)]
+ pub struct Snapshot{pub input_seq:u64,pub finished:u64,pub unselected:u64,pub dirty_drop:u32,pub stop_drop:u32,pub stop_input_limit:u64,pub cookie:u32,pub committed:u64,pub reserved:u64,pub released:u64,pub selected:u64,pub dropped:u64,pub running:bool,pub dma_busy:bool,pub drained:bool,pub fault:bool}
+ /// Implement only from i5's final CONTRACT. copy_slot includes cache invalidation.
+-pub trait RingIo{fn start(&mut self)->Result<(),String>;fn snapshot(&mut self)->Result<Snapshot,String>;fn copy_slot(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;fn release(&mut self,cookie:u32,tail:u64)->Result<(),String>;fn stop(&mut self)->Result<(),String>;}
++pub trait RingIo{fn start(&mut self)->Result<(),String>;fn snapshot(&mut self)->Result<Snapshot,String>;fn copy_slot(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;fn copy_record(&mut self,ordinal:u64,out:&mut[u8])->Result<(),String>{self.copy_slot((ordinal%SLOTS as u64)as usize,out)}fn release(&mut self,cookie:u32,tail:u64)->Result<(),String>;fn stop(&mut self)->Result<(),String>;}
+ #[derive(Default,Debug)]pub struct ReaderStats{pub copied:u64,pub serviced:u64,pub high_water:u64,pub max_service_us:u64,pub max_interval_us:u64}
+ pub struct Reader{cookie:u32,next:u64,stopping:bool,previous:Snapshot,last_service:std::time::Instant,scratch:Vec<u8>,pub stats:ReaderStats}
+ impl Reader{
+@@ -49,7 +81,7 @@ impl Reader{
+     pub fn service<I:RingIo>(&mut self,io:&mut I,q:&mut OwnedQueue)->Result<Snapshot,String>{
+         let now=std::time::Instant::now();self.stats.max_interval_us=self.stats.max_interval_us.max(now.duration_since(self.last_service).as_micros()as u64);self.last_service=now;let s=io.snapshot()?;self.checked(s)?;self.stats.high_water=self.stats.high_water.max(s.reserved-self.next);
+         for tail in self.next..s.committed{
+-            io.copy_slot((tail%SLOTS as u64) as usize,&mut self.scratch)?;
++            io.copy_record(tail,&mut self.scratch)?;
+             if header(&self.scratch)?.ordinal!=tail{return Err("committed slot ordinal mismatch; no release".into())}
+             io.release(self.cookie,tail+1)?;self.next=tail+1;
+             q.push_swap(&mut self.scratch);self.stats.copied+=1;
+diff --git a/maia-httpd/src/continuous_live.rs b/maia-httpd/src/continuous_live.rs
+index 5eedeab..bdba389 100644
+--- a/maia-httpd/src/continuous_live.rs
++++ b/maia-httpd/src/continuous_live.rs
+@@ -1,5 +1,5 @@
+ //! Static OBN2 r2 binding, contract 449b79e839010089836e8202cdae9c6b77d12492.
+-//! No PL load, RF hop, automatic RF retune or production RAM correction.
++//! No PL load, RF hop or automatic RF retune. RAM layout is explicitly opt-in.
+ #![allow(missing_docs)]
+ use crate::{app::AppState,continuous::{self as c,RingIo,Snapshot},continuous_runtime::{self,CountingConsumer,StaticPass},scan_parts::{Descriptor,Entry,Identity}};
+ use anyhow::{Result,ensure};
+@@ -9,6 +9,7 @@ use std::{path::Path,fs::{File,OpenOptions},os::fd::AsRawFd,sync::{Arc,Mutex,ato
+     pub capture_id:String,pub coordinated_boot_id:String,pub sample_rate:u32,pub rx_lo_hz:u64,pub epoch:u64,
+     #[serde(default="two")]pub k:u32,#[serde(default)]pub peak:bool,#[serde(default="stride")]pub publish_stride:u32,
+     pub externally_settled:bool,pub controllers_quiesced:bool,pub run_seconds:f64,
++    #[serde(default)]pub ram_split544:bool,#[serde(default)]pub first_per_epoch:bool,
+ }
+ fn two()->u32{2}fn stride()->u32{250}
+ pub fn http_rejection(method:&str,path:&str)->bool{!matches!(method,"GET"|"HEAD")&&(path.starts_with("/api/ad9361")||path.starts_with("/api/spectrometer"))}
+@@ -24,8 +25,13 @@ impl Hardware{
+ }
+ impl RingIo for Hardware{
+     fn snapshot(&mut self)->Result<Snapshot,String>{let s=self.snapshot_locked()?;self.last=Some(s);Ok(s)}
+-    fn start(&mut self)->Result<(),String>{let before=self.snapshot_locked()?;if before.fault||before.running||before.dma_busy||!before.drained||before.reserved!=before.committed||before.released!=before.committed{return Err("OBN2 START needs stopped drained released nonfatal source".into())}if before.cookie==u32::MAX{return Err("run counter exhausted".into())}{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;let mode=(self.config.k<<1)|((self.config.peak as u32)<<15);core.stream_write(0x20,mode);core.stream_write(0x58,self.config.epoch as u32);core.stream_write(0x5c,(self.config.epoch>>32)as u32);core.stream_write(0x60,self.config.publish_stride);self.control=1;self.active=true;core.stream_write(0x54,self.control|2);}let after=self.snapshot()?;if after.cookie!=before.cookie+1||!after.running{return Err("OBN2 START not accepted".into())}Ok(())}
++    fn start(&mut self)->Result<(),String>{let before=self.snapshot_locked()?;if before.fault||before.running||before.dma_busy||!before.drained||before.reserved!=before.committed||before.released!=before.committed{return Err("OBN2 START needs stopped drained released nonfatal source".into())}if self.config.ram_split544&&before.committed==0&&!self.config.first_per_epoch{return Err("cold RAM ordinal0 requires first_per_epoch at fixed epoch before continuous START".into())}if before.cookie==u32::MAX{return Err("run counter exhausted".into())}{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;let mode=(self.config.k<<1)|((self.config.peak as u32)<<15);core.stream_write(0x20,mode);core.stream_write(0x58,self.config.epoch as u32);core.stream_write(0x5c,(self.config.epoch>>32)as u32);core.stream_write(0x60,self.config.publish_stride);self.control=1|if self.config.first_per_epoch{16}else{0};self.active=true;core.stream_write(0x54,self.control|2);}let after=self.snapshot()?;if after.cookie!=before.cookie+1||!after.running{return Err("OBN2 START not accepted".into())}Ok(())}
+     fn copy_slot(&mut self,s:usize,b:&mut[u8])->Result<(),String>{self.state.ip_core().lock().map_err(|_|"IpCore lock")?.native_copy(s,b).map_err(|e|e.to_string())}
++    fn copy_record(&mut self,ordinal:u64,b:&mut[u8])->Result<(),String>{
++        if !self.config.ram_split544{return self.copy_slot((ordinal%8)as usize,b)}
++        let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;
++        c::copy_committed(ordinal,c::CopyLayout::Ram544,b,|slot,range,out|core.continuous_copy_range(slot,range,out).map_err(|e|e.to_string()))
++    }
+     fn release(&mut self,cookie:u32,tail:u64)->Result<(),String>{let core=self.state.ip_core().lock().map_err(|_|"IpCore lock")?;core.stream_write(0xe8,tail as u32);core.stream_write(0xec,(tail>>32)as u32);core.stream_write(0xf0,cookie);core.stream_write(0x54,self.control|64);if core.stream_read(0x64)&8!=0{return Err("OBN2 release rejected".into())}Ok(())}
+     fn stop(&mut self)->Result<(),String>{self.control=0;self.state.ip_core().lock().map_err(|_|"IpCore lock")?.stream_write(0x54,4);self.active=false;Ok(())}
+ }
+diff --git a/maia-httpd/src/fpga.rs b/maia-httpd/src/fpga.rs
+index c63ad7a..f0cb682 100644
+--- a/maia-httpd/src/fpga.rs
++++ b/maia-httpd/src/fpga.rs
+@@ -568,6 +568,16 @@ impl IpCore {
+         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);Ok(())
+     }
+ 
++    /// Diagnostic committed-record segment. Use the existing per-slot DMA ioctl
++    /// for BOTH physical slots; never return a borrowed reference across release.
++    pub fn continuous_copy_range(&self,slot:usize,range:std::ops::Range<usize>,out:&mut[u8])->Result<()>{
++        if !self.native_observations || slot>=8 || range.start>range.end || range.end>32768 || out.len()!=range.len(){anyhow::bail!("continuous copy range bounds");}
++        self.spectrometer.buffer.cache_invalidate(slot)?;
++        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
++        out.copy_from_slice(&self.spectrometer.buffer.buffer_as_slice(slot)[range]);
++        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);Ok(())
++    }
++
+     /// Enable the DDC independently of the FFT input selection.
+     pub fn set_ddc_enable(&mut self, enable: bool) {
+         self.registers

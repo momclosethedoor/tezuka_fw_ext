@@ -39,6 +39,7 @@ def main():
         exe=work/('contract-tests.exe' if windows else 'contract-tests')
         command(['rustc','+'+version,'--edition=2024','-O','--test',harness,'-o',exe],tree,env,output/'rust-compile.log')
         command([exe,'--nocapture'],tree,env,output/'rust-tests.log')
+        shutil.copyfile(exe,output/exe.name) # local private capture verification with same production copy code
         command([sys.executable,'-m','unittest','discover','-s',ROOT/'tools/observation','-p','test_*.py','-v'],ROOT,env,output/'python-tests.log')
         synthetic=output/('gobs-synthetic.exe' if windows else 'gobs-synthetic')
         flags=['-C','target-feature=+crt-static'] if windows else []

@@ -37,9 +37,13 @@
     {
       "name": "0009-obs-continuous-parts.patch",
       "sha256": "0454618d5e58e26f00da3c1d56748f32202a6b2948723dc3e9b7dfcc7b4bcb22"
+    },
+    {
+      "name": "0010-obs-continuous-ram-layout.patch",
+      "sha256": "b4e945989a4226701b9b8eb6943719bda1919c94849a7532a1b2e86f65813981"
     }
   ],
-  "maia_httpd_tree_sha256": "4547a1fadd7de0143fcf7c1c9e4b3518ccf3641a1031cbba1c59dadd812805ab",
+  "maia_httpd_tree_sha256": "882a7afe7ebc747fdba1b8f893959b6a0092f4cacbacedf84ad1c0ade1bcde71",
   "files": {
     "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
     "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
@@ -67,12 +71,12 @@
     "maia-httpd/src/app.rs": "1f740616d8a021cc17aa3a6f262cd8c30b4224c5c79a99aa2d8301cf57293433",
     "maia-httpd/src/args.rs": "d0a3dcd578d3db9d19caa3bc5b1774b6e21c429d043a229f909ee3f359ddb0b7",
     "maia-httpd/src/bin/gobs-synthetic.rs": "ebce57e7848eeb2370ec4a55ef74f07974677137cfd30f8fb6bf2d5e6e14568a",
-    "maia-httpd/src/continuous.rs": "9e1903e21a1716af62de256ba3d020858595a9c6ab685b656fca1add819da9e5",
-    "maia-httpd/src/continuous_live.rs": "23ec5fcbe9630a87e81654ec4fa8fb1affc7f1049897c308cad8f32a8b605f0e",
+    "maia-httpd/src/continuous.rs": "a7073998d462157b20e5bd5da59572a10fca3c98a5019b9247c383753f42b30a",
+    "maia-httpd/src/continuous_live.rs": "dcf4bc18586b0505bbe18871c1c376eff38dceeb66ba2b040da06977906bcdba",
     "maia-httpd/src/continuous_runtime.rs": "4821914a12a1d2e8cf5cfe2fa947cb95bca44a91af27a5547248fba034287e65",
     "maia-httpd/src/ddc.rs": "c4afe7a6187b3391acc12c0a4e173c02525a542687aff64930d4979d8de5ff84",
     "maia-httpd/src/ddc/constants.rs": "686fa8d5b1280f908256a83a108e7dbb1917d70374cb9e0acdfc6ed6e41362ad",
-    "maia-httpd/src/fpga.rs": "f79722584b98200b7e9bcfbfd9212577965678c25227c4220960830bab79d256",
+    "maia-httpd/src/fpga.rs": "2a574525ff36547ae768938b6b01fe784fce9060f0f31d995e9973d2d10a6541",
     "maia-httpd/src/gap_diagnostics.rs": "a49c034672540a05597e55347d4c1e2c53fece8ba490187e127e38e9b0999442",
     "maia-httpd/src/httpd.rs": "751471862977c917eb4a58369e2d587656b20912268c7cbf9561ffb5c0791b6a",
     "maia-httpd/src/httpd/ad9361.rs": "81ddb5486815f3b48d67d0386e9990bf2745746ac5d38a4d45e40cde80bea2c0",
