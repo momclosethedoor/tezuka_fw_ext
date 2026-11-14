@@ -44,10 +44,10 @@
     },
     {
       "name": "0011-obs-row-delivery-view-core.patch",
-      "sha256": "9b41c0e8a2e85e2aa23db5e5b76c702647917b3088dd86ebc4ca542e93aafd32"
+      "sha256": "12c9eb3055cd93598d95616db16628b8458bf86df467583f406566b72db701e8"
     }
   ],
-  "maia_httpd_tree_sha256": "54186ca23fea8d094e234aa8dd0e23c5e0eab8af63d5505241c2a0b0d77d5c67",
+  "maia_httpd_tree_sha256": "23fc91082c0e7d90e60b9950944f99743c617a67617a7850638e6ba8be418a0b",
   "files": {
     "maia-httpd/.cargo/config.toml": "4cd74b8a16b798af5ae7737195dca6dd7d109b062a5126237b8e2fcaa66c1cec",
     "maia-httpd/.gitignore": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb",
@@ -75,6 +75,7 @@
     "maia-httpd/src/app.rs": "1f740616d8a021cc17aa3a6f262cd8c30b4224c5c79a99aa2d8301cf57293433",
     "maia-httpd/src/args.rs": "d0a3dcd578d3db9d19caa3bc5b1774b6e21c429d043a229f909ee3f359ddb0b7",
     "maia-httpd/src/bin/gobs-synthetic.rs": "ebce57e7848eeb2370ec4a55ef74f07974677137cfd30f8fb6bf2d5e6e14568a",
+    "maia-httpd/src/bin/obs-dma-read.rs": "c54d32dc89f8b8b09871984d084496c0ad8f8b8259202ed4af91d6aea8822f75",
     "maia-httpd/src/bin/obs-view-check.rs": "45ef3b1e3c19f128dbe3e802325d7f7b6945e6816f5bab97d674938a0de51090",
     "maia-httpd/src/continuous.rs": "15f3e964f96d094b8a7f099939f9b42bf3e6024af09438221e4ba337541fd706",
     "maia-httpd/src/continuous_live.rs": "6e989d52a61cbf3f3a3dbbb5c2a7d1bc29392bc4e80743f56618b7197dd3653e",
@@ -114,7 +115,7 @@
     "maia-httpd/src/sigmf.rs": "72396a53d0e5f6cb352aa36f44be1d72db583a8cdd954cc9970d835a25753b45",
     "maia-httpd/src/spectrometer.rs": "fb1c44ad5fcb9a250946fd86fccb3da9239832eb119efdb7dc0db465ba8c8669",
     "maia-httpd/src/uio.rs": "9c122903d7bfc0131a06c9b827cbf3fafce37bcbc201f335bc0b74ba6b8e9a07",
-    "maia-httpd/src/view.rs": "f6d3e4b4c4eb50f087d3e40de273107b41f5de8120cb9a9b668bfae05712ca65",
+    "maia-httpd/src/view.rs": "d01a9a7339d59c2b582ac8d6fe7e0c0a89f18924b53af4257f0099e5e12c5f4d",
     "maia-httpd/tests/observation-continuous/layout-k1-sum.hex": "ca48eb4c5a15ad22c114d723f08e92128de6378633ef982b0040b313b64653c2",
     "maia-httpd/tests/observation-continuous/layout-k1023-sum.hex": "19a15937bcc097885f86a3511533f16955dc31004f0351434e6760e8a23e741b",
     "maia-httpd/tests/observation-continuous/layout-k2-sum.hex": "f20f9bbc2697093fb572667805f2185c54b88caaef27cc2f169e657e6aab3825",
