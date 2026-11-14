@@ -84,6 +84,17 @@ jobs:
           modinfo artifact/obs_dma.ko | tee artifact/modinfo.txt
           cp tools/obs-dma/obs_dma.c tools/obs-dma/Makefile tools/obs-dma/check_kernel.py artifact/
           (cd artifact && sha256sum obs_dma.ko kernel.config Module.symvers > SHA256SUMS)
+      - name: Build isolated actual PairReader exerciser with kit toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal --target armv7-unknown-linux-gnueabihf
+          cargo +1.94.0 build --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-dma/reader/Cargo.toml --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OUTPUT_DIR/host/bin/arm-linux-gcc\""
+          cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-dma-read artifact/
+          cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-view-check artifact/
+          cp tools/obs-dma/reader/Cargo.lock tools/obs-dma/reader/source-sha256.json artifact/
+          "$OUTPUT_DIR/host/bin/arm-linux-readelf" -h -A -l artifact/obs-dma-read > artifact/reader-elf.txt
+          (cd artifact && sha256sum obs-dma-read obs-view-check Cargo.lock source-sha256.json >> SHA256SUMS)
+
       - uses: actions/upload-artifact@v7
         if: always()
         with:
