@@ -73,7 +73,9 @@ jobs:
           name: obs-kernel-kit
           path: kit-export/
       - name: Verify exact running-kernel ABI before building module
-        run: python3 tools/obs-dma/check_kernel.py "$OUTPUT_DIR/build/linux-custom" | tee artifact/kernel-check.txt
+        run: |
+          set -euo pipefail
+          python3 tools/obs-dma/check_kernel.py "$OUTPUT_DIR/build/linux-custom" | tee artifact/kernel-check.txt
       - name: Build reusable DMA owner module
         run: |
           set -euo pipefail
