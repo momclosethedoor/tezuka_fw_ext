@@ -32,7 +32,7 @@ static int close_owner(struct inode *i, struct file *f)
 {
  u32 status;
  if (readl(csr+0x50)==0x324e424f && readl(csr+0xe4)==3) {
-  writel(5,csr+0x54);
+  writel(4,csr+0x54);
   if (readl_poll_timeout(csr+0x64,status,!(status&3),100,500000))
    pr_err("obs_dma: STOP timed out; allocations STILL PINNED until reboot\n");
  }
@@ -69,7 +69,7 @@ static int map_region(struct file *f, struct vm_area_struct *vma)
  vma->vm_pgoff=0;
  return cached ? dma_mmap_pages(dev,vma,r->len,r->page) : dma_mmap_coherent(dev,vma,r->cpu,r->dma,r->len);
 }
-static const struct file_operations fops={.owner=THIS_MODULE,.open=open_owner,.release=close_owner,.unlocked_ioctl=control,.mmap=map_region,.llseek=no_llseek};
+static const struct file_operations fops={.owner=THIS_MODULE,.open=open_owner,.release=close_owner,.unlocked_ioctl=control,.mmap=map_region};
 static struct miscdevice misc={.minor=MISC_DYNAMIC_MINOR,.name="obs_dma",.fops=&fops,.mode=0600};
 static void free_regions(void)
 {
