@@ -1,0 +1,45 @@
+name: OBS006D reader CI
+on:
+  push:
+    branches: [build/obs006d-hw-rate]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  reader:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-kernel-kit
+          path: kit
+          run-id: 43645241286
+          github-token: ${{ github.token }}
+      - name: Restore pinned toolchain
+        run: |
+          echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
+          tar --zstd -xf kit/kernel-kit.tar.zst
+          python3 tools/obs-dma/check_kernel.py output/nano/build/linux-custom
+      - name: Test source and build Cortex A9 reader
+        env:
+          OBS_VIEW_VECTOR_ROOT: ${{ github.workspace }}/tools/obs-dma/reader/tests/view
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal --target armv7-unknown-linux-gnueabihf
+          cargo +1.94.0 test --locked --manifest-path tools/obs-dma/reader/Cargo.toml --bin obs-dma-read view::tests -- --nocapture
+          cargo +1.94.0 test --locked --manifest-path tools/obs-dma/reader/Cargo.toml --bin obs-dma-read rate_tests -- --nocapture
+          RUSTFLAGS='-C target-cpu=cortex-a9' cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-dma/reader/Cargo.toml --config "target.armv7-unknown-linux-gnueabihf.linker=\"$PWD/output/nano/host/bin/arm-linux-gcc\""
+          mkdir artifact
+          cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-dma-read artifact/
+          cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-view-check artifact/
+          cp tools/obs-dma/reader/source-sha256.json artifact/
+          output/nano/host/bin/arm-linux-readelf -h -A artifact/obs-dma-read > artifact/reader-elf.txt
+          cd artifact
+          sha256sum obs-dma-read obs-view-check source-sha256.json > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs006d-reader
+          path: artifact/

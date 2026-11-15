@@ -36,31 +36,41 @@ pub fn decode(full:&[u8],view:&[u8],power:&mut[f32])->Result<Header,String>{
 /// and copy to owned memory. OFF never invokes copy_view.
 pub trait PairIo{
     fn snapshot(&mut self)->Result<Snapshot,String>;
+    fn batch_limit(&self)->usize{512}
+    fn full_read(&self)->bool{true}
+    fn prepare_prefix(&mut self,_first:u64,_end:u64)->Result<(),String>{Ok(())}
+    fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->Result<(),String>>(&mut self,slot:usize,full:&mut[u8],view:&mut[u8],sink:&mut F)->Result<(),String>{
+        self.copy_full(slot,full)?;let h=c::header_revision(full,3)?;let n=view_len(h);
+        if n!=0{self.copy_view(slot,&mut view[..n])?;}sink(h,&[full],&view[..n])
+    }
     fn copy_full(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;
     fn copy_view(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;
     fn release(&mut self,run:u32,tail:u64)->Result<(),String>;
 }
-pub struct PairReader{run:u32,next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub high_water:u64}
+pub struct PairReader{run:u32,next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub high_water:u64}
 impl PairReader{
     /// Full-payload local consumer, without costly float conversion/reference
     /// comparison. Every counted record is copied in full into owned storage.
-    pub fn service_raw<I:PairIo,F:FnMut(Header,&[u8],&[u8])->Result<(),String>>(&mut self,io:&mut I,mut sink:F)->Result<Snapshot,String>{
+    pub fn service_raw<I:PairIo,F:FnMut(Header,&[&[u8]],&[u8])->Result<(),String>>(&mut self,io:&mut I,mut sink:F)->Result<Snapshot,String>{
         let s=io.snapshot()?;
         if s.cookie!=self.run||s.released!=self.next||s.committed<self.next||s.committed>s.reserved||s.reserved-self.next>SLOTS as u64{return Err("r3 cursor/owner violation".into())}
         self.high_water=self.high_water.max(s.reserved-self.next);
-        for ordinal in self.next..s.committed{
-            let slot=ordinal as usize&(SLOTS-1);io.copy_full(slot,&mut self.full)?;
-            let h=c::header_revision(&self.full,3)?;
-            if h.ordinal!=ordinal{return Err(format!("r3 ordinal mismatch expected {ordinal}, got {}; no release",h.ordinal))}
-            let n=view_len(h);if n!=0{io.copy_view(slot,&mut self.view[..n])?;}
-            self.read+=1;sink(h,&self.full,&self.view[..n])?;self.consumed+=1;
+        let end=s.committed.min(self.next+io.batch_limit() as u64);
+        io.prepare_prefix(self.next,end)?;
+        for ordinal in self.next..end{
+            let slot=ordinal as usize&(SLOTS-1);
+            io.visit_pair(slot,&mut self.full,&mut self.view,&mut |h,parts,v|{
+                if h.ordinal!=ordinal{return Err(format!("r3 ordinal mismatch expected {ordinal}, got {}; no release",h.ordinal))}
+                sink(h,parts,v)
+            })?;
+            self.visited+=1;if io.full_read(){self.read+=1;self.consumed+=1;}
             io.release(self.run,ordinal+1)?;self.next=ordinal+1;
         }
         if s.fault{return Err("r3 fatal after committed prefix".into())}Ok(s)
     }
     pub fn attach(s:Snapshot)->Result<Self,String>{
         if s.cookie==0||s.fault||s.released>s.committed||s.committed>s.reserved||s.reserved-s.released>SLOTS as u64{return Err("r3 attach cursors".into())}
-        Ok(Self{run:s.cookie,next:s.released,full:vec![0;c::BYTES],view:vec![0;VIEW_BYTES],power:vec![0.;c::BINS],read:0,consumed:0,high_water:s.reserved-s.released})
+        Ok(Self{run:s.cookie,next:s.released,full:vec![0;c::BYTES],view:vec![0;VIEW_BYTES],power:vec![0.;c::BINS],read:0,consumed:0,visited:0,high_water:s.reserved-s.released})
     }
     /// Sink consumes all 4096 bins synchronously or copies them into its own
     /// bounded storage. A socket client must never be this sink.

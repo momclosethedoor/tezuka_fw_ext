@@ -52,6 +52,10 @@ pub fn header(b:&[u8])->Result<Header,String>{
 pub fn header_revision(b:&[u8],revision:u16)->Result<Header,String>{
     if !matches!(revision,2|3){return Err("unsupported OBN2 revision".into())}
     if b.len()!=BYTES{return Err("OBN2 slot length".into())}
+    header_prefix(b,revision)
+}
+pub fn header_prefix(b:&[u8],revision:u16)->Result<Header,String>{
+    if b.len()<512 || !matches!(revision,2|3){return Err("OBN2 prefix bounds/revision".into())}
     let mut h=[0u8;64];for j in 0..64{h[j]=b[j*8+7];}
     if u32v(&h,0)!=ABI || u16v(&h,4)!=revision || u16v(&h,6)!=64 || u32v(&h,32)!=4096 || u32v(&h,40)!=TICK_HZ as u32 || u32v(&h,48)!=2 || u32v(&h,52)!=BYTES as u32{return Err("OBN2 ABI/revision/encoding/constants".into())}
     let k=u32v(&h,36);if !(1..=1023).contains(&k){return Err("OBN2 actualK".into())}
