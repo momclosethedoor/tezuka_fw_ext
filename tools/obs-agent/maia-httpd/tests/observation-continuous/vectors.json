@@ -1,0 +1,54 @@
+{
+  "format": "OBN2-r2/encoding2",
+  "purpose": "byte-layout, not RF or FFT reference",
+  "vectors": [
+    {
+      "file": "layout-k1-sum.bin",
+      "bytes": 32768,
+      "sha256": "753a10ac07524439b79eb3149d586e50f7a691dc2471a208bd4ec6bd0909e512",
+      "seq": 1311768464867721216,
+      "epoch": 18364758544493064720,
+      "first_tick": 12379813734295797760,
+      "actual_k": 1,
+      "peak": false,
+      "source_ddc": false,
+      "ordinal": 4294967296
+    },
+    {
+      "file": "layout-k2-sum.bin",
+      "bytes": 32768,
+      "sha256": "e5420102b8b14b54a75955dcdb686cdef5fc6f7971768a404501911594fb27d6",
+      "seq": 1311768464867722240,
+      "epoch": 18364758544493064721,
+      "first_tick": 12379813734295797761,
+      "actual_k": 2,
+      "peak": false,
+      "source_ddc": true,
+      "ordinal": 4294967297
+    },
+    {
+      "file": "layout-k3-peak.bin",
+      "bytes": 32768,
+      "sha256": "275ebab88647b523336a9bc86b9624bb3a482f3447cb4835189b13f785397c21",
+      "seq": 1311768464867723264,
+      "epoch": 18364758544493064722,
+      "first_tick": 12379813734295797762,
+      "actual_k": 3,
+      "peak": true,
+      "source_ddc": false,
+      "ordinal": 4294967298
+    },
+    {
+      "file": "layout-k1023-sum.bin",
+      "bytes": 32768,
+      "sha256": "ae200484df962e571bdb93629ae8b411186d2040c62be6199f0569b02067dc08",
+      "seq": 1311768464867724288,
+      "epoch": 18364758544493064723,
+      "first_tick": 12379813734295797763,
+      "actual_k": 1023,
+      "peak": false,
+      "source_ddc": true,
+      "ordinal": 4294967299
+    }
+  ]
+}

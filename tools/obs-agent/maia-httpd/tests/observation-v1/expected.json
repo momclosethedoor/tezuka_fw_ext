@@ -1,0 +1,161 @@
+{
+  "synthetic": true,
+  "session": "11111111111111111111111111111111",
+  "records": [
+    {
+      "descriptor_id": 1,
+      "seq": 0,
+      "epoch": 7,
+      "first_tick": 100,
+      "nint": 1,
+      "power": [
+        1,
+        2,
+        3,
+        4,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "descriptor_id": 1,
+      "seq": 1,
+      "epoch": 7,
+      "first_tick": 101,
+      "nint": 3,
+      "power": [
+        2,
+        4,
+        6,
+        8,
+        3,
+        6,
+        9,
+        12
+      ]
+    },
+    {
+      "descriptor_id": 2,
+      "seq": 2,
+      "epoch": 8,
+      "first_tick": 104,
+      "nint": 1,
+      "power": [
+        2,
+        3,
+        4,
+        5,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    {
+      "descriptor_id": 2,
+      "seq": 3,
+      "epoch": 8,
+      "first_tick": 105,
+      "nint": 2,
+      "power": [
+        2.5,
+        4,
+        1,
+        0,
+        4,
+        6,
+        2,
+        0
+      ]
+    },
+    {
+      "descriptor_id": 2,
+      "seq": 5,
+      "epoch": 8,
+      "first_tick": 107,
+      "nint": 1,
+      "power": [
+        null,
+        1,
+        0,
+        2,
+        null,
+        1,
+        0,
+        2
+      ]
+    },
+    {
+      "descriptor_id": 2,
+      "seq": 6,
+      "epoch": 0,
+      "first_tick": 108,
+      "nint": 1,
+      "power": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    }
+  ],
+  "nint3_input_ffts": [
+    [
+      1,
+      2,
+      3,
+      4
+    ],
+    [
+      2,
+      4,
+      6,
+      8
+    ],
+    [
+      3,
+      6,
+      9,
+      12
+    ]
+  ],
+  "missing_seq": [
+    4
+  ],
+  "known_epochs": [
+    7,
+    8
+  ],
+  "unattributed_seq": [
+    6
+  ],
+  "descriptors": [
+    {
+      "id": 1,
+      "sample_rate": 4000000.0,
+      "bin0_hz": 100000000.0,
+      "enbw_bins": 1.5,
+      "tick_hz": 1000000,
+      "bins": 4,
+      "mode": 3,
+      "source": 1
+    },
+    {
+      "id": 2,
+      "sample_rate": 4000000.0,
+      "bin0_hz": 200000000.0,
+      "enbw_bins": 1.5,
+      "tick_hz": 1000000,
+      "bins": 4,
+      "mode": 3,
+      "source": 1
+    }
+  ],
+  "legacy_fixture": "also synthetic; illustrates unavailable metadata in legacy-import encoding"
+}

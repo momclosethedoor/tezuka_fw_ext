@@ -1,0 +1,58 @@
+name: OBS007A integrated ARM agent
+on:
+  push:
+    branches: [build/obs007a-hw-system]
+    paths: ['tools/obs-agent/**', '.github/workflows/system-agent.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  agent:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-kernel-kit
+          path: kit
+          run-id: 43645241286
+          github-token: ${{ github.token }}
+      - name: Pinned6.12.77 toolchain
+        run: |
+          echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
+          tar --zstd -xf kit/kernel-kit.tar.zst
+          sudo apt-get update -qq
+          sudo apt-get install -y libclang-dev libssl-dev pkg-config gfortran-arm-linux-gnueabihf
+          rustup toolchain install 1.94.0 --profile minimal --target armv7-unknown-linux-gnueabihf
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/obs-agent/maia-httpd/target
+          key: obs007a-agent-rust194-${{ hashFiles('tools/obs-agent/maia-httpd/Cargo.lock') }}
+      - name: Build main agent with in-process reader and preview
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/output/nano/host/bin:$PATH"
+          export OPENBLAS_TARGET=armv7 OPENBLAS_HOSTCC=gcc
+          export OPENBLAS_CC="$PWD/output/nano/host/bin/arm-linux-gcc"
+          export OPENBLAS_FC="$PWD/output/nano/host/bin/arm-linux-gfortran"
+          if ! test -x "$OPENBLAS_FC"; then export OPENBLAS_FC=arm-linux-gnueabihf-gfortran; fi
+          export BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--sysroot=$($OPENBLAS_CC -print-sysroot)"
+          $OPENBLAS_CC -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-agent/maia-httpd/src/system_native/neon_sum.c -o "$PWD/agent-neon.o"
+          $OPENBLAS_CC -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-agent/maia-httpd/src/system_native/preview.c -o "$PWD/agent-preview.o"
+          export RUSTFLAGS="-C target-cpu=cortex-a9 -C link-arg=$PWD/agent-neon.o -C link-arg=$PWD/agent-preview.o -C link-arg=-ldl -C link-arg=-lm"
+          cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OPENBLAS_CC\""
+          mkdir agent-artifact
+          cp tools/obs-agent/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd agent-artifact/
+          output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
+          find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
+          cd agent-artifact
+          sha256sum maia-httpd elf.txt source-sha256.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs007a-main-agent
+          path: agent-artifact/

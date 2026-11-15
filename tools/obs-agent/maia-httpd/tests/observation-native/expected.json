@@ -1,0 +1,118 @@
+{
+  "abi": "OBN1-r1",
+  "pl_commit": "370d03a02fface2a287d8d7cafb6cee7422217ee",
+  "abi_sha256": "14e71f1803464d08cf18e250ffdfea4b071ff79c1dd1a0d05cfd0cd50808f9b6",
+  "normalization": {
+    "coefficient_sum": 750668,
+    "coefficient_square_sum": 275837336,
+    "enbw_bins": 2.0050129965307675,
+    "normalization_scale": 1.7746151888087567e-12
+  },
+  "records": [
+    {
+      "name": "seq-0",
+      "source": "synthetic native vectors",
+      "native_sha256": "044550b700f73a2aecde389c68bc12855109c684ebef4e3c488137a02f6ec47a",
+      "power_f32_sha256": "71124f0137ad4cb6dc0ba3eefc990a3c8a1129856d0f7ec3fcdc0506c64edab5",
+      "metadata": {
+        "seq": 0,
+        "epoch": 7,
+        "first_tick": 1000,
+        "clean": true,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    },
+    {
+      "name": "seq-5",
+      "source": "synthetic native vectors",
+      "native_sha256": "3da50f9ab604115f192709e560a36678cdd148c9c333ab628525c259f462f551",
+      "power_f32_sha256": "a0249746e91542627db6519f74161a372aa0b20555514d879f14b65456aa98bc",
+      "metadata": {
+        "seq": 5,
+        "epoch": 8,
+        "first_tick": 21480,
+        "clean": true,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    },
+    {
+      "name": "seq-6",
+      "source": "synthetic native vectors",
+      "native_sha256": "b8a06384c1776e8811176013a7a926058d2401cdd4ea132d58d2b6ef9d1401bf",
+      "power_f32_sha256": "adbc37940d4c47871d49f3ef8cc84f3f52df39aaaa31d4fd3e6d6d10da7a0499",
+      "metadata": {
+        "seq": 6,
+        "epoch": 0,
+        "first_tick": 25576,
+        "clean": false,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    },
+    {
+      "name": "dma-seq-0",
+      "source": "HDL simulation with synthetic IQ; not hardware",
+      "native_sha256": "b0a5631bf66e86385ee244e110cacc4917db1e268d8f10d865b131659891a669",
+      "power_f32_sha256": "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe",
+      "metadata": {
+        "seq": 0,
+        "epoch": 0,
+        "first_tick": 1,
+        "clean": false,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    },
+    {
+      "name": "dma-seq-1",
+      "source": "HDL simulation with synthetic IQ; not hardware",
+      "native_sha256": "b01d932b1b4e53dd5679c2837d0f0d8401d57f47f877b35d42d94d4dccd647f1",
+      "power_f32_sha256": "f9422895f95e0f405e6ea29cc2c2af727b9a29f9586097734e663d6663a03a14",
+      "metadata": {
+        "seq": 1,
+        "epoch": 7,
+        "first_tick": 8193,
+        "clean": true,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    },
+    {
+      "name": "dma-seq-2",
+      "source": "HDL simulation with synthetic IQ; not hardware",
+      "native_sha256": "f4c21d85d4a8db06f44fb9312c7cad13ccc297fe6ba4d7e94cb22a587e5cb216",
+      "power_f32_sha256": "ad67b787cdbf842e0040fd149afad3a93602ffe0f70925766fd0c9a87e596668",
+      "metadata": {
+        "seq": 2,
+        "epoch": 0,
+        "first_tick": 16385,
+        "clean": false,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    },
+    {
+      "name": "dma-seq-3",
+      "source": "HDL simulation with synthetic IQ; not hardware",
+      "native_sha256": "62959584829900b8326f77698655915b0b5a85d7f36860e9f23f740843f65c50",
+      "power_f32_sha256": "970fcfdc49ab96b358b20bdf8c1902452d34364de0400d84c5f04cb5691f2f44",
+      "metadata": {
+        "seq": 3,
+        "epoch": 0,
+        "first_tick": 24577,
+        "clean": false,
+        "use_ddc": false,
+        "nint": 1,
+        "tick_hz": 62500000
+      }
+    }
+  ]
+}
