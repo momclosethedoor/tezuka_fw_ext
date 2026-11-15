@@ -18,7 +18,7 @@ type R<T>=Result<T,String>;
  #[serde(default)]save_ordinal:Option<u64>,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
- #[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
+ #[serde(default)]tx_active:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
 }
 fn batchdefault()->usize{32}
 fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}fn warmdefault()->f64{5.}
@@ -36,9 +36,9 @@ impl Hardware{
   for p in std::fs::read_dir("/proc").map_err(|e|e.to_string())?{let p=p.map_err(|e|e.to_string())?.path();if std::fs::read_to_string(p.join("comm")).is_ok_and(|s|s.trim()=="maia-httpd"){return Err("legacy Maia owner active".into())}}
   if c.hot{
    let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard").map_err(|e|e.to_string())?;let mut status=[0u32;128];
-   if unsafe{libc::ioctl(guard.as_raw_fd(),0x4605,status.as_mut_ptr())}!=0||status[0]!=1||status[1]!=2||status[2]!=0||status[9]!=3{return Err("guard must own calibrated SPI lease".into())}
+   if unsafe{libc::ioctl(guard.as_raw_fd(),0x4605,status.as_mut_ptr())}!=0||status[0]!=2||status[1]!=2||status[2]!=0||!matches!(status[9],3|7){return Err("guard must own calibrated SPI lease".into())}
   }else{
-   if read("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()!="1"{return Err("TX must be off".into())}
+   if read("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()!=if c.tx_active{"0"}else{"1"}{return Err("TX readback differs from declared test mode".into())}
    if read("/sys/bus/iio/devices/iio:device0/in_voltage_sampling_frequency")?.trim()!="61440000"{return Err("Fs prerequisite".into())}
   }
   let lease=OpenOptions::new().read(true).write(true).create(true).truncate(false).open("/run/maia-observation.lock").map_err(|e|e.to_string())?;
@@ -83,7 +83,7 @@ impl Hardware{
  }
  fn start(&mut self)->R<()>{let before=self.snapshot()?.cookie;self.valid=1;self.active=true;self.w(0x54,3);let s=self.snapshot()?;if !s.running||s.cookie!=before+1{return Err("START rejected".into())}self.last_release=Instant::now();Ok(())}
  fn stop(&mut self){self.valid=0;self.w(0x54,4);self.active=false;}
- fn fld(&self)->Value{loop{let v=self.r(0x22c);let epoch=self.live64(0x238);let pass=self.r(0x268);let status=self.r(0x228);let loads=self.r(0x254);let late=self.r(0x258);let errors=self.r(0x25c);let current_pass=self.r(0x230);let position=self.r(0x234);if v==self.r(0x22c){return json!({"version":v,"map_epoch":epoch,"map_pass":pass,"status":status,"loads":loads,"late":late,"errors":errors,"pass":current_pass,"position":position,"transactions":self.r(0x264)})}}}
+ fn fld(&self)->Value{loop{let v=self.r(0x22c);let epoch=self.live64(0x238);let pass=self.r(0x268);let status=self.r(0x228);let loads=self.r(0x254);let late=self.r(0x258);let errors=self.r(0x25c);let current_pass=self.r(0x230);let position=self.r(0x234);if v==self.r(0x22c){return json!({"version":v,"map_epoch":epoch,"map_pass":pass,"status":status,"loads":loads,"late":late,"errors":errors,"pass":current_pass,"position":position,"tx_changes":self.r(0x260),"transactions":self.r(0x264)})}}}
  fn counters(&mut self)->R<Value>{let s=self.snapshot()?;Ok(json!({"fld":self.fld(),"committed":s.committed,"reserved":s.reserved,"released":self.r64(0x110),"logical_released":s.released,"input_seq":s.input_seq,"formed":s.finished,"selected":s.selected,"unselected":s.unselected,"bank_drop":self.r(0x140),"ring_drop":self.r(0x144),"dirty_drop":s.dirty_drop,"stop_drop":s.stop_drop,"dma_drop":self.r(0x160),"run":s.cookie,"status":self.r(0x154),"visit_epoch":self.live64(0x180),"visit_status":self.r(0x188),"first_epoch":self.live64(0x198)}))}
 }
 impl Drop for Hardware{fn drop(&mut self){if self.active{self.stop();}}}

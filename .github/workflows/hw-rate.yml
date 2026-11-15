@@ -1,7 +1,7 @@
-name: OBS006D reader CI
+name: OBS007A system CI
 on:
   push:
-    branches: [build/obs006d-hw-rate]
+    branches: [build/obs007a-hw-system]
   workflow_dispatch:
 permissions:
   contents: read
@@ -51,5 +51,5 @@ jobs:
           sha256sum obs_ad9361.ko obs-fl-ctl obs-iq-snapshot callback-coverage.json >> SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: obs006d-reader
+          name: obs007a-system
           path: artifact/
