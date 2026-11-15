@@ -18,7 +18,7 @@ type R<T>=Result<T,String>;
  #[serde(default)]save_ordinal:Option<u64>,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
- #[serde(default)]aligned:bool,
+ #[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,
 }
 fn batchdefault()->usize{32}
 fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}fn warmdefault()->f64{5.}
@@ -34,8 +34,13 @@ impl Hardware{
   if read("/proc/sys/kernel/random/boot_id")?.trim()!=c.boot_id{return Err("boot lease mismatch".into())}
   if read("/tmp/pl-uart-obs-session/phase")?.trim()!="OBS_READY"{return Err("UART loader prerequisite".into())}
   for p in std::fs::read_dir("/proc").map_err(|e|e.to_string())?{let p=p.map_err(|e|e.to_string())?.path();if std::fs::read_to_string(p.join("comm")).is_ok_and(|s|s.trim()=="maia-httpd"){return Err("legacy Maia owner active".into())}}
-  if read("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()!="1"{return Err("TX must be off".into())}
-  if read("/sys/bus/iio/devices/iio:device0/in_voltage_sampling_frequency")?.trim()!="61440000"{return Err("Fs prerequisite".into())}
+  if c.hot{
+   let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard").map_err(|e|e.to_string())?;let mut status=[0u32;128];
+   if unsafe{libc::ioctl(guard.as_raw_fd(),0x4605,status.as_mut_ptr())}!=0||status[0]!=1||status[1]!=2||status[2]!=0||status[9]!=3{return Err("guard must own calibrated SPI lease".into())}
+  }else{
+   if read("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()!="1"{return Err("TX must be off".into())}
+   if read("/sys/bus/iio/devices/iio:device0/in_voltage_sampling_frequency")?.trim()!="61440000"{return Err("Fs prerequisite".into())}
+  }
   let lease=OpenOptions::new().read(true).write(true).create(true).truncate(false).open("/run/maia-observation.lock").map_err(|e|e.to_string())?;
   if unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("spectral owner busy".into())}
   let device=OpenOptions::new().read(true).write(true).open("/dev/obs_dma").map_err(|e|e.to_string())?;
@@ -78,7 +83,8 @@ impl Hardware{
  }
  fn start(&mut self)->R<()>{let before=self.snapshot()?.cookie;self.valid=1;self.active=true;self.w(0x54,3);let s=self.snapshot()?;if !s.running||s.cookie!=before+1{return Err("START rejected".into())}self.last_release=Instant::now();Ok(())}
  fn stop(&mut self){self.valid=0;self.w(0x54,4);self.active=false;}
- fn counters(&mut self)->R<Value>{let s=self.snapshot()?;Ok(json!({"committed":s.committed,"reserved":s.reserved,"released":self.r64(0x110),"logical_released":s.released,"input_seq":s.input_seq,"formed":s.finished,"selected":s.selected,"unselected":s.unselected,"bank_drop":self.r(0x140),"ring_drop":self.r(0x144),"dirty_drop":s.dirty_drop,"stop_drop":s.stop_drop,"dma_drop":self.r(0x160),"run":s.cookie,"status":self.r(0x154),"visit_epoch":self.live64(0x180),"visit_status":self.r(0x188),"first_epoch":self.live64(0x198)}))}
+ fn fld(&self)->Value{loop{let v=self.r(0x22c);let epoch=self.live64(0x238);let pass=self.r(0x268);let status=self.r(0x228);let loads=self.r(0x254);let late=self.r(0x258);let errors=self.r(0x25c);let current_pass=self.r(0x230);let position=self.r(0x234);if v==self.r(0x22c){return json!({"version":v,"map_epoch":epoch,"map_pass":pass,"status":status,"loads":loads,"late":late,"errors":errors,"pass":current_pass,"position":position,"transactions":self.r(0x264)})}}}
+ fn counters(&mut self)->R<Value>{let s=self.snapshot()?;Ok(json!({"fld":self.fld(),"committed":s.committed,"reserved":s.reserved,"released":self.r64(0x110),"logical_released":s.released,"input_seq":s.input_seq,"formed":s.finished,"selected":s.selected,"unselected":s.unselected,"bank_drop":self.r(0x140),"ring_drop":self.r(0x144),"dirty_drop":s.dirty_drop,"stop_drop":s.stop_drop,"dma_drop":self.r(0x160),"run":s.cookie,"status":self.r(0x154),"visit_epoch":self.live64(0x180),"visit_status":self.r(0x188),"first_epoch":self.live64(0x198)}))}
 }
 impl Drop for Hardware{fn drop(&mut self){if self.active{self.stop();}}}
 impl PairIo for Hardware{
@@ -96,18 +102,20 @@ impl PairIo for Hardware{
  }
  fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,slot:usize,full:&mut[u8],overview:&mut[u8],sink:&mut F)->R<()>{
   if self.direct||self.release_only{
-   if !self.shift||self.previous_view!=0{return Err("direct/header-only currently requires shift544, VIEW OFF".into())}
-   let a=((slot+511)&511)*32768+28416;let b=slot*32768;
-   self.ensure_sync(0,a as u32,if self.release_only{512}else{4352})?;
-   if !self.release_only{self.ensure_sync(0,b as u32,28416)?;}
-   let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(a),if self.release_only{512}else{4352})};
-   let h=continuous::header_prefix(prefix,3)?;
-   if view::view_len(h)!=0{return Err("direct/header-only unexpected VIEW mode".into())}
+   if !self.shift{return Err("direct/header-only requires shift544".into())}
+   let pv=self.previous_view;let prev=(slot+511)&511;let a=prev*32768+28416+pv;let b=slot*32768;
+   self.ensure_sync(0,a as u32,if self.release_only{512}else{(4352-pv)as u32})?;
+   let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(a),if self.release_only{512}else{4352-pv})};
+   let h=continuous::header_prefix(prefix,3)?;let n=view::view_len(h);
+   if !self.release_only{self.ensure_sync(0,b as u32,28416)?;if pv!=0{self.ensure_sync(1,(prev*2048)as u32,pv as u32)?;}if n!=0{self.ensure_sync(0,(b+28416)as u32,n as u32)?;}}
    let t=Instant::now();
    if self.release_only{sink(h,&[],&[])?;}else{
     let suffix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(b),28416)};
-    sink(h,&[prefix,suffix],&[])?;self.copied_bytes+=32768;
+    let middle=unsafe{std::slice::from_raw_parts(self.overview.ptr.add(prev*2048),pv)};
+    let v=unsafe{std::slice::from_raw_parts(self.full.ptr.add(b+28416),n)};
+    sink(h,&[prefix,middle,suffix],v)?;self.copied_bytes+=32768;self.view_bytes+=n as u64;
    }
+   self.previous_view=n;
    self.process_ns+=t.elapsed().as_nanos();return Ok(())
   }
   self.copy_full(slot,full)?;let h=continuous::header_revision(full,3)?;let n=view::view_len(h);
@@ -152,7 +160,7 @@ fn memory()->String{std::fs::read_to_string("/proc/self/status").unwrap_or_defau
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn execute(c:&Config)->R<()>{
- if c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||c.mode!=0||c.previous_mode!=0||c.check||c.save_ordinal.is_some()) {return Err("strategy bounds: direct/release-only OFF, no check/save; batch1..64".into())}
+ if c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c)?;
@@ -169,18 +177,22 @@ fn execute(c:&Config)->R<()>{
  if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
  if c.command=="rate"{io.prepare(c)?;io.start()?;}
  let mut reader=view::PairReader::attach(io.snapshot()?)?;
- let start=Instant::now();let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(400000);let mut checksum=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut saved=false;
+ let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(400000);let mut checksum=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut saved=false;
+ let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
+ let mut sent=0u64;let mut transport_drop=0u64;
  let mut sink=|h:Header,parts:&[&[u8]],overview:&[u8]|->R<()>{
   if records.len()==400000{return Err("bounded metadata trace full".into())}
   let mut total=0u64;for part in parts{if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
-  let full=parts.first().copied().unwrap_or(&[]);
+  let needs_owned=c.check||(!saved&&c.save_ordinal==Some(h.ordinal));
+  let joined=if needs_owned{parts.concat()}else{Vec::new()};let full=joined.as_slice();
   if c.check{let mut power=vec![0.;4096];view::decode(full,overview,&mut power)?;}
   if !saved&&c.save_ordinal==Some(h.ordinal){std::fs::write(c.output.join("record.bin"),full).map_err(|e|e.to_string())?;std::fs::write(c.output.join("record.view"),overview).map_err(|e|e.to_string())?;saved=true;}
+  if let Some(sock)=&socket{if !overview.is_empty(){let mut packet=[0u8;2112];packet[..8].copy_from_slice(b"GVIEW3\0\0");for(j,x)in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64].iter().enumerate(){packet[8+j*8..16+j*8].copy_from_slice(&x.to_le_bytes());}packet[56..56+overview.len()].copy_from_slice(overview);match sock.send(&packet[..56+overview.len()]){Ok(n)if n==56+overview.len()=>sent+=1,_=>transport_drop+=1}}}
   records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);Ok(())
  };
  loop{
-  if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin=Some(mark(&mut io,&reader,start)?);reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
-  if c.command=="rate"&&(start.elapsed().as_secs_f64()>=c.warmup+c.seconds||STOP.load(Ordering::Relaxed)){end=Some(mark(&mut io,&reader,start)?);break}
+  if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
+  if c.command=="rate"&&(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed)){end=Some(mark(&mut io,&reader,start)?);break}
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
   let s=reader.service_raw(&mut io,&mut sink)?;max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
@@ -191,7 +203,7 @@ fn execute(c:&Config)->R<()>{
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
  drop(sink);
  let after=io.counters()?;let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":false,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":sent,"udp_drop":transport_drop,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 fn main(){unsafe{libc::signal(libc::SIGINT,signal as libc::sighandler_t);libc::signal(libc::SIGTERM,signal as libc::sighandler_t);}
  let args:Vec<_>=std::env::args().collect();if args.len()!=2{eprintln!("obs-dma-read config.json (explicit RAM-loader+DMA module prerequisites)");std::process::exit(2)}

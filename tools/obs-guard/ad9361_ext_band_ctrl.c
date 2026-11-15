@@ -89,6 +89,9 @@ struct ad9361_ext_band_ctl {
 	struct ad9361_ctrl_objs		objs;		/* Objects to control */
 };
 
+static int obs_of_phandle_iterator_args(struct of_phandle_iterator *it, uint32_t *args, int size)
+{int i, count; count=it->cur_count; if(WARN_ON(size<count))count=size;
+ for(i=0;i<count;i++)args[i]=be32_to_cpup(it->cur++); return count;}
 static int ad9361_parse_setting(struct device *dev,
 				struct device_node *np,
 				struct ad9361_ext_band_ctl *ctl,
@@ -153,7 +156,7 @@ static int ad9361_parse_setting_seq(struct device *dev,
 	INIT_LIST_HEAD(lst);
 
 	of_for_each_phandle(&it, rc, np, list_name, NULL, cell_count) {
-		c = of_phandle_iterator_args(&it, args, cell_count);
+		c = obs_of_phandle_iterator_args(&it, args, cell_count);
 		if (c != cell_count) {
 			dev_err(dev, "Invalid cell count for phandle '%s'\n",
 				it.node->name);
