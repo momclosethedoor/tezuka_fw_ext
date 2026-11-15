@@ -185,7 +185,7 @@ fn execute(c:&Config)->R<()>{
  let mut reader=view::PairReader::attach(io.snapshot()?)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(400000);let mut checksum=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut saved=false;
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
- let mut sent=0u64;let mut transport_drop=0u64;let mut status_due=Instant::now();
+ let network=std::cell::RefCell::new(UdpBatch::new());let mut status_due=Instant::now();let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  let mut sink=|h:Header,parts:&[&[u8]],overview:&[u8]|->R<()>{
   if records.len()==400000{return Err("bounded metadata trace full".into())}
   let mut total=0u64;for part in parts{if c.neon{total=total.wrapping_add(neon_sum(part));}else if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
@@ -193,27 +193,34 @@ fn execute(c:&Config)->R<()>{
   let joined=if needs_owned{parts.concat()}else{Vec::new()};let full=joined.as_slice();
   if c.check{let mut power=vec![0.;4096];view::decode(full,overview,&mut power)?;}
   if !saved&&c.save_ordinal==Some(h.ordinal){std::fs::write(c.output.join("record.bin"),full).map_err(|e|e.to_string())?;std::fs::write(c.output.join("record.view"),overview).map_err(|e|e.to_string())?;saved=true;}
-  if let Some(sock)=&socket{if !overview.is_empty(){let mut packet=[0u8;2112];packet[..8].copy_from_slice(b"GVIEW3\0\0");for(j,x)in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64].iter().enumerate(){packet[8+j*8..16+j*8].copy_from_slice(&x.to_le_bytes());}packet[56..56+overview.len()].copy_from_slice(overview);match sock.send(&packet[..56+overview.len()]){Ok(n)if n==56+overview.len()=>sent+=1,_=>transport_drop+=1}}}
+  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==2{net.flush(sock);}}}
   records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);Ok(())
  };
  loop{
-  if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
-  if c.command=="rate"&&(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed)){end=Some(mark(&mut io,&reader,start)?);break}
+  if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin_network=network.borrow().counts();begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
+  if c.command=="rate"&&(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed)){end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break}
   if status_due.elapsed()>=Duration::from_millis(100){if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();}
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
-  let s=reader.service_raw(&mut io,&mut sink)?;max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
+  let s=reader.service_raw(&mut io,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush(sock);}max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released{std::thread::sleep(Duration::from_micros(50));}
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
- io.stop();let stop=Instant::now();loop{let s=reader.service_raw(&mut io,&mut sink)?;if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
+ io.stop();let stop=Instant::now();loop{let s=reader.service_raw(&mut io,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush(sock);}if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
  drop(sink);
  let after=io.counters()?;let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":sent,"udp_drop":transport_drop,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":2,"begin_network":begin_network,"end_network":end_network,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
 pub fn status()->Value{STATUS.lock().unwrap().clone()}
 pub fn stop(){STOP.store(true,Ordering::Release);}
 pub fn run_json(data:&[u8])->R<()>{STOP.store(false,Ordering::Release);let c:Config=serde_json::from_slice(data).map_err(|e|e.to_string())?;execute(&c)}
+
+struct UdpBatch{bytes:Vec<u8>,pending:u64,sent:u64,dropped:u64,datagrams:u64}
+impl UdpBatch{
+ fn new()->Self{Self{bytes:Vec::with_capacity(1136),pending:0,sent:0,dropped:0,datagrams:0}}
+ fn flush(&mut self,s:&std::net::UdpSocket){if self.pending==0{return}match s.send(&self.bytes){Ok(n)if n==self.bytes.len()=>{self.sent+=self.pending;self.datagrams+=1;},_=>self.dropped+=self.pending}self.bytes.clear();self.pending=0;}
+ fn counts(&self)->Value{json!({"sent":self.sent,"dropped":self.dropped,"datagrams":self.datagrams})}
+}
