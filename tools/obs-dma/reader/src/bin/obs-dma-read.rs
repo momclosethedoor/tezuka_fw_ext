@@ -18,7 +18,7 @@ type R<T>=Result<T,String>;
  #[serde(default)]save_ordinal:Option<u64>,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
- #[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,
+ #[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
 }
 fn batchdefault()->usize{32}
 fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}fn warmdefault()->f64{5.}
@@ -157,6 +157,12 @@ fn memory()->String{std::fs::read_to_string("/proc/self/status").unwrap_or_defau
  for w in words.chunks_exact(4){a=a.wrapping_add(w[0]&mask);c=c.wrapping_add(w[1]&mask);d=d.wrapping_add(w[2]&mask);e=e.wrapping_add(w[3]&mask);}
  a.wrapping_add(c).wrapping_add(d).wrapping_add(e)
 }
+#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_sum(p:*const u8,n:usize)->u64;}
+fn neon_sum(b:&[u8])->u64{
+ assert_eq!(b.len()%8,0);assert_eq!(b.as_ptr() as usize%8,0);
+ #[cfg(target_arch="arm")] {unsafe{obs_neon_sum(b.as_ptr(),b.len())}}
+ #[cfg(not(target_arch="arm"))] {aligned_sum(b)}
+}
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn execute(c:&Config)->R<()>{
@@ -182,7 +188,7 @@ fn execute(c:&Config)->R<()>{
  let mut sent=0u64;let mut transport_drop=0u64;
  let mut sink=|h:Header,parts:&[&[u8]],overview:&[u8]|->R<()>{
   if records.len()==400000{return Err("bounded metadata trace full".into())}
-  let mut total=0u64;for part in parts{if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
+  let mut total=0u64;for part in parts{if c.neon{total=total.wrapping_add(neon_sum(part));}else if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
   let needs_owned=c.check||(!saved&&c.save_ordinal==Some(h.ordinal));
   let joined=if needs_owned{parts.concat()}else{Vec::new()};let full=joined.as_slice();
   if c.check{let mut power=vec![0.;4096];view::decode(full,overview,&mut power)?;}
@@ -203,7 +209,7 @@ fn execute(c:&Config)->R<()>{
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
  drop(sink);
  let after=io.counters()?;let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":sent,"udp_drop":transport_drop,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":sent,"udp_drop":transport_drop,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 fn main(){unsafe{libc::signal(libc::SIGINT,signal as libc::sighandler_t);libc::signal(libc::SIGTERM,signal as libc::sighandler_t);}
  let args:Vec<_>=std::env::args().collect();if args.len()!=2{eprintln!("obs-dma-read config.json (explicit RAM-loader+DMA module prerequisites)");std::process::exit(2)}

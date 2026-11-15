@@ -31,7 +31,8 @@ jobs:
           rustup toolchain install 1.94.0 --profile minimal --target armv7-unknown-linux-gnueabihf
           cargo +1.94.0 test --locked --manifest-path tools/obs-dma/reader/Cargo.toml --bin obs-dma-read view::tests -- --nocapture
           cargo +1.94.0 test --locked --manifest-path tools/obs-dma/reader/Cargo.toml --bin obs-dma-read rate_tests -- --nocapture
-          RUSTFLAGS='-C target-cpu=cortex-a9' cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-dma/reader/Cargo.toml --config "target.armv7-unknown-linux-gnueabihf.linker=\"$PWD/output/nano/host/bin/arm-linux-gcc\""
+          output/nano/host/bin/arm-linux-gcc -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-dma/reader/neon_sum.c -o "$PWD/neon_sum.o"
+          RUSTFLAGS="-C target-cpu=cortex-a9 -C link-arg=$PWD/neon_sum.o" cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-dma/reader/Cargo.toml --config "target.armv7-unknown-linux-gnueabihf.linker=\"$PWD/output/nano/host/bin/arm-linux-gcc\""
           mkdir artifact
           cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-dma-read artifact/
           cp tools/obs-dma/reader/target/armv7-unknown-linux-gnueabihf/release/obs-view-check artifact/
