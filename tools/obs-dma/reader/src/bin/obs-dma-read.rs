@@ -18,6 +18,7 @@ type R<T>=Result<T,String>;
  #[serde(default)]save_ordinal:Option<u64>,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
+ #[serde(default)]aligned:bool,
 }
 fn batchdefault()->usize{32}
 fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}fn warmdefault()->f64{5.}
@@ -141,6 +142,13 @@ impl PairIo for Hardware{
 }
 fn cpu()->f64{let mut r=std::mem::MaybeUninit::<libc::rusage>::zeroed();unsafe{libc::getrusage(libc::RUSAGE_SELF,r.as_mut_ptr());let r=r.assume_init();(r.ru_utime.tv_sec+r.ru_stime.tv_sec)as f64+(r.ru_utime.tv_usec+r.ru_stime.tv_usec)as f64/1e6}}
 fn memory()->String{std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines().filter(|s|s.starts_with("VmRSS:")||s.starts_with("VmHWM:")).collect::<Vec<_>>().join("\n")}
+#[inline(never)]fn aligned_sum(b:&[u8])->u64{
+ assert_eq!(b.as_ptr() as usize%8,0);assert_eq!(b.len()%64,0);
+ let words=unsafe{std::slice::from_raw_parts(b.as_ptr().cast::<u64>(),b.len()/8)};
+ let mask=(1u64<<50)-1;let(mut a,mut c,mut d,mut e)=(0u64,0u64,0u64,0u64);
+ for w in words.chunks_exact(4){a=a.wrapping_add(w[0]&mask);c=c.wrapping_add(w[1]&mask);d=d.wrapping_add(w[2]&mask);e=e.wrapping_add(w[3]&mask);}
+ a.wrapping_add(c).wrapping_add(d).wrapping_add(e)
+}
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn execute(c:&Config)->R<()>{
@@ -164,7 +172,7 @@ fn execute(c:&Config)->R<()>{
  let start=Instant::now();let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(400000);let mut checksum=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut saved=false;
  let mut sink=|h:Header,parts:&[&[u8]],overview:&[u8]|->R<()>{
   if records.len()==400000{return Err("bounded metadata trace full".into())}
-  let mut total=0u64;for part in parts{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}checksum=checksum.wrapping_add(std::hint::black_box(total));
+  let mut total=0u64;for part in parts{if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
   let full=parts.first().copied().unwrap_or(&[]);
   if c.check{let mut power=vec![0.;4096];view::decode(full,overview,&mut power)?;}
   if !saved&&c.save_ordinal==Some(h.ordinal){std::fs::write(c.output.join("record.bin"),full).map_err(|e|e.to_string())?;std::fs::write(c.output.join("record.view"),overview).map_err(|e|e.to_string())?;saved=true;}
@@ -192,6 +200,7 @@ fn main(){unsafe{libc::signal(libc::SIGINT,signal as libc::sighandler_t);libc::s
 
 #[cfg(test)]mod rate_tests{
  use super::*;
+ #[test]fn aligned_all_bins_exact(){let words:Vec<u64>=(0..4096u64).map(|i|i.wrapping_mul(0x9e3779b97f4a7c15)).collect();let bytes=unsafe{std::slice::from_raw_parts(words.as_ptr().cast::<u8>(),32768)};let expected=words.iter().fold(0u64,|s,w|s.wrapping_add(w&((1u64<<50)-1)));assert_eq!(aligned_sum(bytes),expected);assert_eq!(aligned_sum(&bytes[..4352]).wrapping_add(aligned_sum(&bytes[4352..])),expected);}
  fn vector()->Vec<u8>{let p=std::path::PathBuf::from(std::env::var("OBS_VIEW_VECTOR_ROOT").unwrap()).join("mode0/ordinal-0-k2.hex");let s=std::fs::read_to_string(p).unwrap().split_whitespace().collect::<String>();(0..s.len()).step_by(2).map(|j|u8::from_str_radix(&s[j..j+2],16).unwrap()).collect()}
  #[test]fn direct_split_matches_full_all_bins_and_metadata(){
   let v=vector();let h=continuous::header_revision(&v,3).unwrap();assert_eq!(continuous::header_prefix(&v[..512],3).unwrap(),h);
