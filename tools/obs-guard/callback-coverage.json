@@ -1,0 +1,197 @@
+[
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_clk_factor_recalc_rate",
+    "return_type": "unsigned long"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_clk_factor_round_rate",
+    "return_type": "long"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_clk_factor_set_rate",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_bbpll_recalc_rate",
+    "return_type": "unsigned long"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_bbpll_round_rate",
+    "return_type": "long"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_bbpll_set_rate",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_rfpll_recalc_rate",
+    "return_type": "unsigned long"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_rfpll_determine_rate",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_rfpll_set_rate",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_rfpll_dummy_recalc_rate",
+    "return_type": "unsigned long"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_rfpll_dummy_set_rate",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_clk_mux_get_parent",
+    "return_type": "u8"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_clk_mux_set_parent",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_rx_rfpll_rate_change",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_tx_rfpll_rate_change",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_store",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_show",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_reg_access",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_lo_write",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_lo_read",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_set_agc_mode",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_get_agc_mode",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_set_rf_port",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_get_rf_port",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_rx_write",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_rx_read",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_tx_read",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_read_raw",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_write_raw",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_phy_read_avail",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_debugfs_read",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_debugfs_write",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_fir_bin_write",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_fir_bin_read",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_gt_bin_write",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361.c",
+    "function": "ad9361_gt_bin_read",
+    "return_type": "ssize_t"
+  },
+  {
+    "file": "ad9361_conv.c",
+    "function": "ad9361_read_raw",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361_conv.c",
+    "function": "ad9361_write_raw",
+    "return_type": "int"
+  },
+  {
+    "file": "ad9361_conv.c",
+    "function": "ad9361_post_setup",
+    "return_type": "int"
+  }
+]
