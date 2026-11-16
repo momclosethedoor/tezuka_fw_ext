@@ -65,7 +65,10 @@ impl Hardware{
  fn r64(&self,o:usize)->u64{self.r(o)as u64|((self.r(o+4)as u64)<<32)}
  fn live64(&self,o:usize)->u64{loop{let hi=self.r(o+4);let lo=self.r(o);if hi==self.r(o+4){return(hi as u64)<<32|lo as u64}}}
  fn sync(&mut self,region:u32,offset:u32,len:u32,cpu:bool)->R<()>{let t=Instant::now();let s=Sync{region,offset,len,for_cpu:cpu as u32};if unsafe{libc::ioctl(self.device.as_raw_fd(),0x4f02,&s)}!=0{return Err(format!("DMA sync: {}",std::io::Error::last_os_error()))}compiler_fence(Ordering::SeqCst);self.sync_ns+=t.elapsed().as_nanos();self.sync_calls+=1;Ok(())}
- fn copy(&mut self,region:u32,off:usize,out:&mut[u8])->R<()>{self.ensure_sync(region,off as u32,out.len()as u32)?;let p=if region==0{self.full.ptr}else{self.overview.ptr};let t=Instant::now();unsafe{std::ptr::copy_nonoverlapping(p.add(off),out.as_mut_ptr(),out.len())};self.copy_ns+=t.elapsed().as_nanos();self.actual_copy_bytes+=out.len() as u64;self.ranges.push((region,off as u32,out.len()as u32));Ok(())}
+ fn copy(&mut self,region:u32,off:usize,out:&mut[u8])->R<()>{self.ensure_sync(region,off as u32,out.len()as u32)?;let p=if region==0{self.full.ptr}else{self.overview.ptr};let t=Instant::now();
+  #[cfg(target_arch="arm")] unsafe{obs_neon_copy(out.as_mut_ptr(),p.add(off),out.len())};
+  #[cfg(not(target_arch="arm"))] unsafe{std::ptr::copy_nonoverlapping(p.add(off),out.as_mut_ptr(),out.len())};
+  self.copy_ns+=t.elapsed().as_nanos();self.actual_copy_bytes+=out.len() as u64;self.ranges.push((region,off as u32,out.len()as u32));Ok(())}
  fn ensure_sync(&mut self,region:u32,off:u32,len:u32)->R<()>{
   if !self.covered.iter().any(|&(r,o,n)|r==region && off>=o && off+len<=o+n){self.sync(region,off,len,true)?;}Ok(())
  }
@@ -176,7 +179,7 @@ fn memory()->String{std::fs::read_to_string("/proc/self/status").unwrap_or_defau
  for w in words.chunks_exact(4){a=a.wrapping_add(w[0]&mask);c=c.wrapping_add(w[1]&mask);d=d.wrapping_add(w[2]&mask);e=e.wrapping_add(w[3]&mask);}
  a.wrapping_add(c).wrapping_add(d).wrapping_add(e)
 }
-#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_sum(p:*const u8,n:usize)->u64;}
+#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_sum(p:*const u8,n:usize)->u64;fn obs_neon_copy(dst:*mut u8,src:*const u8,n:usize);}
 fn neon_sum(b:&[u8])->u64{
  assert_eq!(b.len()%8,0);assert_eq!(b.as_ptr() as usize%8,0);
  #[cfg(target_arch="arm")] {unsafe{obs_neon_sum(b.as_ptr(),b.len())}}

@@ -1,6 +1,18 @@
 #include <arm_neon.h>
 #include <stdint.h>
 #include <stddef.h>
+/* Private copy of exactly the owned span. No speculative read beyond it. */
+void obs_neon_copy(uint8_t *dst,const uint8_t *src,size_t n){
+ size_t i=0;
+ for(;i+64<=n;i+=64){
+  if(i+256<n)__builtin_prefetch(src+i+256,0,3);
+  uint8x16_t a=vld1q_u8(src+i),b=vld1q_u8(src+i+16);
+  uint8x16_t c=vld1q_u8(src+i+32),d=vld1q_u8(src+i+48);
+  vst1q_u8(dst+i,a);vst1q_u8(dst+i+16,b);
+  vst1q_u8(dst+i+32,c);vst1q_u8(dst+i+48,d);
+ }
+ for(;i<n;i++)dst[i]=src[i];
+}
 /* Borrowed committed, still-owned span. All 64-bit payload words participate.
  * Prefetch remains strictly within the given span. No out-of-range touch. */
 uint64_t obs_neon_sum(const uint8_t *p,size_t n){
