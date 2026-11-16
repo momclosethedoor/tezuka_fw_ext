@@ -29,6 +29,10 @@ int main(int argc,char **argv){
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
  int diagnostic=getenv("OBS_FIELD1_DIAGNOSTIC_RAW")&&!strcmp(getenv("OBS_FIELD1_DIAGNOSTIC_RAW"),"1");
  int no_delivery=getenv("OBS_FIELD1_NO_DELIVERY")&&!strcmp(getenv("OBS_FIELD1_NO_DELIVERY"),"1");
+ const char *route_case=getenv("OBS_FIELD1_ROUTE_CASE");
+ int next_on_busy=getenv("OBS_FIELD1_NEXT_ON_BUSY")&&!strcmp(getenv("OBS_FIELD1_NEXT_ON_BUSY"),"1");
+ int route_sock=-1,route_acked=0;unsigned route_id=0;char route_reply[128];size_t route_have=0;
+ if(route_case&&strcmp(route_case,"immediate")&&strcmp(route_case,"delayed")&&strcmp(route_case,"missing_then_correct"))return 2;
  int unqualified_raw=argc==5||(getenv("OBS_FIELD1_UNQUALIFIED_RAW")&&!strcmp(getenv("OBS_FIELD1_UNQUALIFIED_RAW"),"1"));
  FILE *policy=fopen("/tmp/obs007a-field-system/unqualified-raw","r");if(policy){unqualified_raw|=fgetc(policy)=='1';fclose(policy);}
  unsigned ms=strtoul(argv[2],0,0),tag=strtoul(argv[3],0,0);if(!ms||ms>68719||!tag)return 2;
@@ -69,7 +73,16 @@ int main(int argc,char **argv){
  uint64_t current_epoch;unsigned current_position;do{current_epoch=epoch();current_position=rd(0x234);}while(current_epoch!=epoch());
  unsigned advance=2;const char *want_env=getenv("OBS_FIELD1_POSITION"),*count_env=getenv("OBS_FIELD1_POSITIONS");
  if(want_env&&count_env){unsigned wanted=strtoul(want_env,0,0),count=strtoul(count_env,0,0);if(!count||count>128||wanted>=count){wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);return 3;}while((current_position+advance)%count!=wanted)advance++;}
- target=current_epoch+advance;wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();
+ target=current_epoch+advance;
+ if(route_case){
+  uint64_t marker_epoch=((uint64_t)rd(0x250)<<32)|rd(0x24c);
+  route_id=rd(0x240);if(!(rd(0x228)&8)||marker_epoch!=current_epoch){fprintf(stderr,"current-visit field needs matching hardware antenna marker\n");return 3;}
+  target=current_epoch;
+  route_sock=socket(AF_INET,SOCK_STREAM,0);struct timeval tv={1,0};setsockopt(route_sock,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));
+  struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(18008)};inet_pton(AF_INET,"192.168.2.10",&a.sin_addr);
+  if(connect(route_sock,(void*)&a,sizeof(a)))return 3;
+ }
+ wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();
  fprintf(trace,"{\"event\":\"arm\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
  while(now()-start<2){
   ssize_t n=iio_buffer_refill(buf);double t=now();
@@ -78,20 +91,30 @@ int main(int argc,char **argv){
    if((size_t)n>span||bytes+n>8*1024*1024){rc=4;break;}
    memcpy(data+bytes,p,n);fprintf(trace,"{\"event\":\"owned_block\",\"time\":%.9f,\"first\":%zu,\"end\":%zu,\"tag\":%u}\n",t,bytes,bytes+n,tag);bytes+=n;blocks++;
   }else if(n!=-EAGAIN){fprintf(trace,"{\"event\":\"iio_error\",\"code\":%zd}\n",n);rc=4;break;}
-  status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);}
+  status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
+   fprintf(trace,"{\"event\":\"busy\",\"time\":%.9f,\"epoch\":%llu,\"position\":%u,\"map_version\":%u,\"field_status\":%u,\"fld_status\":%u,\"marker_id\":%u}\n",t,(unsigned long long)epoch(),target_position,map_version,status,rd(0x228),rd(0x240));
+   if(next_on_busy){int g=open("/dev/obs_fl_guard",O_RDWR);unsigned v[128]={0};int result=g<0?-1:ioctl(g,0x4603,v);if(g>=0)close(g);fprintf(trace,"{\"event\":\"map_next_during_busy\",\"time\":%.9f,\"result\":%d,\"epoch\":%llu,\"field_status\":%u,\"version\":%u}\n",now(),result,(unsigned long long)epoch(),rd(0x294),rd(0x22c));if(result){rc=8;break;}}
+   if(route_case){char msg[512];int n=snprintf(msg,sizeof(msg),"{\"marker_id\":%u,\"epoch\":%llu,\"version\":%u,\"position\":%u,\"route\":%u,\"a9_send_s\":%.9f,\"test\":\"%s\"}\n",route_id,(unsigned long long)target,map_version,target_position,rd(0x244),now(),route_case);if(sendall(route_sock,msg,n)){rc=8;break;}fprintf(trace,"{\"event\":\"route_request\",\"time\":%.9f,\"marker_id\":%u}\n",now(),route_id);}
+  }
+  if(route_sock>=0&&!route_acked&&busy){
+   ssize_t n=recv(route_sock,route_reply+route_have,sizeof(route_reply)-1-route_have,MSG_DONTWAIT);
+   if(n>0){route_have+=n;route_reply[route_have]=0;if(strchr(route_reply,'\n')){unsigned ack=0;if(sscanf(route_reply,"ACK %u",&ack)!=1||ack!=route_id||rd(0x240)!=route_id||!(rd(0x228)&8)){rc=8;break;}unsigned fs=rd(0x294);wr(0x218,ack);wr(0x220,2);route_acked=1;fprintf(trace,"{\"event\":\"host_ack_applied\",\"time\":%.9f,\"marker_id\":%u,\"field_status_before\":%u,\"field_status_after\":%u,\"fld_status_after\":%u,\"epoch_after\":%llu}\n",now(),ack,fs,rd(0x294),rd(0x228),(unsigned long long)epoch());}}
+   else if(n==0||(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){rc=8;break;}
+  }
   if(!(status&0x81)&&((status>>1)&7)){
    unsigned s0=rd(0x298),st0=rd(0x294);uint64_t e=((uint64_t)rd(0x2a0)<<32)|rd(0x29c);unsigned rt=rd(0x2a4);first=rd(0x2a8);end=rd(0x2ac);
    if(s0!=rd(0x298)||st0!=rd(0x294))continue;
    serial=s0;outcome=(st0>>1)&7;
    if(!done){done=t;fprintf(trace,"{\"event\":\"pl_done\",\"time\":%.9f,\"outcome\":%d,\"epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u}\n",t,outcome,(unsigned long long)e,rt,first,end);}
    if(e!=target||rt!=tag||rd(0x294)&16){rc=5;break;}
-   if(outcome!=1){size_t offsets[8];if(segments(data,bytes,offsets)>=3)break;else continue;}
+   if(outcome!=1){size_t offsets[8];if(segments(data,bytes,offsets)>=3&&(!route_case||route_acked))break;else continue;}
    if(end<first||end>8*1024*1024){rc=5;break;}
-   if(bytes>=end)break;
+   if(bytes>=end&&(!route_case||route_acked))break;
   }
   usleep(100);
  }
  wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);wr(0x38,old_mode);
+ if(route_sock>=0)close(route_sock);
  size_t offsets[8]={0},attempt_first=0,attempt_end=bytes;unsigned nsegments=segments(data,bytes,offsets);int attempt_epoch_proven=0;
  if(!rc&&nsegments>=2&&nsegments<=3){
   attempt_first=offsets[1];

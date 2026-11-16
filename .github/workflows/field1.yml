@@ -2,7 +2,7 @@ name: OBS007A FIELD1 collector
 on:
   push:
     branches: [build/obs007a-hw-release]
-    paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-route-ack.c', '.github/workflows/field1.yml']
+    paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-route-ack.c', 'tools/obs-guard/obs-iq-snapshot.c', '.github/workflows/field1.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -27,10 +27,11 @@ jobs:
           mkdir artifact
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/obs-field1.c -ldl -o artifact/obs-field1
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation tools/obs-guard/obs-route-ack.c -o artifact/obs-route-ack
+          output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/obs-iq-snapshot.c -o artifact/obs-iq-snapshot
           output/nano/host/bin/arm-linux-readelf -h -A artifact/obs-field1 > artifact/elf.txt
           sha256sum tools/obs-guard/obs-field1.c > artifact/source.sha256
           cd artifact
-          sha256sum obs-field1 obs-route-ack elf.txt source.sha256 > SHA256SUMS
+          sha256sum obs-field1 obs-route-ack obs-iq-snapshot elf.txt source.sha256 > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
           name: obs007a-field1-collector

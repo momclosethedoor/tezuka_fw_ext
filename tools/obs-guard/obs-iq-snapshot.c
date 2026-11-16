@@ -5,17 +5,25 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
+#include <string.h>
 #include <time.h>
 #include <errno.h>
 static unsigned readnum(const char *p){FILE*f=fopen(p,"r");unsigned n=0;if(!f||fscanf(f,"%i",&n)!=1)exit(2);fclose(f);return n;}
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 int main(int argc,char**argv){
- if(argc!=2)return 2;
+ int guarded=argc==3&&!strcmp(argv[2],"--guarded-scan");
+ if(argc!=2&&!guarded)return 2;
  int lock=open("/run/obs-recording.lock",O_CREAT|O_RDWR,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 2;
  unsigned base=readnum("/sys/devices/soc0/maia-sdr-recording/recording_base_address"),size=readnum("/sys/devices/soc0/maia-sdr-recording/recording_size");
- if(base!=0x06000000||size!=0x08000000||readnum("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")!=1||readnum("/sys/bus/iio/devices/iio:device0/in_voltage_sampling_frequency")!=61440000)return 3;
+ if(base!=0x06000000||size!=0x08000000)return 3;
+ if(guarded){int fd=open("/dev/obs_fl_guard",O_RDONLY);uint32_t s[128]={0};if(fd<0||ioctl(fd,0x4605,s)||s[0]!=2||s[1]!=2||s[2]||s[112]!=1)return 3;close(fd);}
+ else if(readnum("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")!=1||readnum("/sys/bus/iio/devices/iio:device0/in_voltage_sampling_frequency")!=61440000)return 3;
  int fd=open("/dev/mem",O_RDWR|O_SYNC);volatile uint32_t*r=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x7c460000);if(r==MAP_FAILED)return 4;
- if(r[0x50/4]!=0x324e424f||r[0x224/4]!=0x31444c46||r[0x1e0/4]||r[0x20/4]&1)return 5;
+ if(r[0x50/4]!=0x324e424f||r[0x224/4]!=0x31444c46||r[0x1e0/4]!=(guarded?3u:0u)||r[0x20/4]&1)return 5;
+ /* Guarded mode uses the pre-take Fs readback in the series receipt. PHY
+    callbacks are blocked for the entire lease; do not call SPI from here.
+    No sample-zero timestamp is invented: this recorder has no such latch. */
  (void)r[0xc/4];double start=now();r[0x10/4]=1;__sync_synchronize();usleep(200000);r[0x10/4]=2;__sync_synchronize();
  unsigned irq=0;while(now()-start<2){irq=r[0xc/4];if(irq&2)break;usleep(100);}
  if(!(irq&2)){fprintf(stderr,"recorder FINISHED timeout; allocation remains reserved\n");return 6;}
