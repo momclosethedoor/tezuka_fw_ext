@@ -1,6 +1,6 @@
 //! Full owned copies, immediate cumulative release, independent bounded consumer.
 use super::*;
-use std::sync::{Arc,Mutex,mpsc};
+use std::sync::{Arc,Mutex,Condvar,mpsc};
 
 struct Packet { full:Box<[u64]>, view:Vec<u8>, header:Option<Header>, observed:u64 }
 impl Packet {
@@ -17,9 +17,11 @@ pub(super) fn execute(c:&Config)->R<()> {
  let pool_bytes=capacity*(continuous::BYTES+512);
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"shift544":c.shift544,"owned_pool_records":capacity,"owned_pool_bytes":pool_bytes,"capacity_basis":"one private record per physical ring slot"}))?;
  save(c,"before.json",&io.counters()?)?;
- let (free_tx,free_rx)=mpsc::sync_channel::<Packet>(capacity);
+ // Reuse the most recently returned private allocation. FIFO reuse across all
+ // physical slots forces a full DDR write/read cycle even with an empty queue.
+ let free=Arc::new((Mutex::new((0..capacity).map(|_|Packet::new()).collect::<Vec<_>>()),Condvar::new()));
+ let free_consumer=free.clone();
  let (ready_tx,ready_rx)=mpsc::sync_channel::<Packet>(capacity);
- for _ in 0..capacity{free_tx.send(Packet::new()).map_err(|e|e.to_string())?;}
  let progress=Arc::new(Mutex::new(json!({"consumed":0,"sent":0,"datagrams":0,"dropped":0})));
  let consumer_progress=progress.clone();let udp=c.udp.clone();let trace_limit=c.trace_limit;let check=c.check;
  let consumer=std::thread::spawn(move||->R<(Vec<[u64;7]>,Value)>{
@@ -41,7 +43,7 @@ pub(super) fn execute(c:&Config)->R<()> {
    if consumed%64==0{*consumer_progress.lock().unwrap()=json!({"consumed":consumed,"sent":net.sent,"datagrams":net.datagrams,"dropped":net.dropped});}
    // At most capacity packets exist, so returning this packet cannot fill a
    // capacity-sized free pool while another packet remains in this consumer.
-   free_tx.send(packet).map_err(|e|e.to_string())?;
+   free_consumer.0.lock().unwrap().push(packet);free_consumer.1.notify_one();
   }
   if let Some(s)=&socket{net.flush(s);}
   let v=json!({"consumed":consumed,"sent":net.sent,"datagrams":net.datagrams,"dropped":net.dropped,"checksum":checksum.to_string(),"view_fnv1a64":format!("{view_hash:016x}"),"process_ns":process_ns.to_string(),"trace_omitted":omitted});
@@ -61,7 +63,7 @@ pub(super) fn execute(c:&Config)->R<()> {
   reader.high_water=reader.high_water.max(s.reserved-reader.next);
   let until=s.committed.min(reader.next+c.batch_limit as u64);io.prepare_prefix(reader.next,until)?;
   for ordinal in reader.next..until {
-   let mut packet=match free_rx.try_recv(){Ok(v)=>v,Err(mpsc::TryRecvError::Empty)=>{let wait=Instant::now();pool_waits+=1;let p=free_rx.recv_timeout(Duration::from_secs(1)).map_err(|e|format!("owned consumer stalled: {e}"))?;pool_wait_ns+=wait.elapsed().as_nanos();p},Err(e)=>return Err(e.to_string())};
+   let mut packet={let mut pool=free.0.lock().unwrap();if pool.is_empty(){let wait=Instant::now();pool_waits+=1;let (next,timeout)=free.1.wait_timeout_while(pool,Duration::from_secs(1),|p|p.is_empty()).unwrap();pool=next;pool_wait_ns+=wait.elapsed().as_nanos();if timeout.timed_out()&&pool.is_empty(){return Err("owned consumer stalled".into())}}pool.pop().ok_or("owned pool empty")?};
    let before=start.elapsed().as_nanos()as u64;
    let full=unsafe{std::slice::from_raw_parts_mut(packet.full.as_mut_ptr().cast::<u8>(),32768)};
    let mut copied=0;
