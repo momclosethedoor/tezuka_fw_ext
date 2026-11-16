@@ -14,6 +14,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <arpa/inet.h>
 static volatile uint32_t *r;
 static uint32_t rd(unsigned o){return r[o/4];}
@@ -130,6 +131,7 @@ int main(int argc,char **argv){
     bytes are an explicit diagnostic option; control status reports TIMEOUT. */
  if(no_delivery){fprintf(trace,"{\"event\":\"delivery_disabled\",\"time\":%.9f,\"scope\":\"explicit A9-only bench control\"}\n",now());}
  if(!no_delivery&&((outcome==1&&!rc)||unqualified_raw||diagnostic)&&attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
+  if(getenv("OBS_FIELD1_DELAY_DELIVERY_MS")){unsigned delay=strtoul(getenv("OBS_FIELD1_DELAY_DELIVERY_MS"),0,10);if(delay>2000)return 2;fprintf(trace,"{\"event\":\"bench_delivery_delay\",\"time\":%.9f,\"ms\":%u}\n",now(),delay);fflush(trace);usleep(delay*1000);}
   char command[640],digest[65]={0};snprintf(command,sizeof(command),"sha256sum %s.attempt.real8",argv[1]);FILE *hash=popen(command,"r");int hashed=hash&&fscanf(hash,"%64s",digest)==1;if(hash)pclose(hash);
   if(hashed){
    char meta[2048];uint32_t payload=(uint32_t)(attempt_end-attempt_first);
@@ -141,5 +143,6 @@ int main(int argc,char **argv){
  }
  snprintf(path,sizeof(path),"%s.generation.real8",argv[1]);FILE *f=NULL;if(diagnostic)f=fopen(path,"wx");if(f){fwrite(data,1,bytes,f);fclose(f);}
  snprintf(path,sizeof(path),"%s.json",argv[1]);f=fopen(path,"wx");if(f){fprintf(f,"{\"outcome\":%d,\"error\":%d,\"serial\":%u,\"target_epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u,\"blocks\":%u,\"owned_bytes\":%zu,\"arm_s\":%.9f,\"busy_observed_s\":%.9f,\"done_s\":%.9f,\"timeout_ms\":%u,\"epoch_after\":%llu}\n",outcome,rc,serial,(unsigned long long)target,tag,first,end,blocks,bytes,armed,busy,done,ms,(unsigned long long)epoch());fclose(f);}
+ struct rusage usage;if(!getrusage(RUSAGE_SELF,&usage))fprintf(trace,"{\"event\":\"collector_resources\",\"time\":%.9f,\"user_cpu_s\":%.6f,\"system_cpu_s\":%.6f,\"max_rss_kib\":%ld}\n",now(),usage.ru_utime.tv_sec+usage.ru_utime.tv_usec/1e6,usage.ru_stime.tv_sec+usage.ru_stime.tv_usec/1e6,usage.ru_maxrss);
  fclose(trace);free(data);munmap((void*)r,4096);close(fd);close(lock);return rc?rc:(!outcome?7:0);
 }
