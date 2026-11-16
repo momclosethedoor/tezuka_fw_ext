@@ -1,7 +1,7 @@
 name: OBS007A FIELD1 collector
 on:
   push:
-    branches: [build/obs007a-field-system]
+    branches: [build/obs007a-hw-release]
     paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-route-ack.c', '.github/workflows/field1.yml']
   workflow_dispatch:
 permissions:

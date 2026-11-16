@@ -1,6 +1,7 @@
 //! Explicit, bounded r3 board exerciser. No PL load, RF retune, flash or network.
 mod continuous;
 mod view;
+mod owned;
 use continuous::{Header,Snapshot};
 use view::PairIo;
 use std::{fs::{File,OpenOptions},io::Write,os::fd::AsRawFd,path::PathBuf,sync::atomic::{AtomicBool,Ordering,compiler_fence},time::{Duration,Instant}};
@@ -18,6 +19,8 @@ type R<T>=Result<T,String>;
  #[serde(default)]save_ordinal:Option<u64>,
  #[serde(default)]save_ring:bool,
  #[serde(default="tracedefault")]trace_limit:usize,
+ #[serde(default)]reuse_owned_cache:bool,
+ #[serde(default)]owned_pipeline:bool,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
  #[serde(default)]tx_active:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
@@ -30,7 +33,7 @@ fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}f
 struct Map{ptr:*mut u8,len:usize}
 impl Map{fn new(fd:&File,len:usize,off:i64,write:bool)->R<Self>{let p=unsafe{libc::mmap(std::ptr::null_mut(),len,libc::PROT_READ|if write{libc::PROT_WRITE}else{0},libc::MAP_SHARED,fd.as_raw_fd(),off as libc::off_t)};if p==libc::MAP_FAILED{return Err(std::io::Error::last_os_error().to_string())}Ok(Self{ptr:p.cast(),len})}}
 impl Drop for Map{fn drop(&mut self){unsafe{libc::munmap(self.ptr.cast(),self.len);}}}
-struct Hardware{_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64}
+struct Hardware{_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
 impl Hardware{
  fn open(c:&Config)->R<Self>{
   let read=|p:&str|std::fs::read_to_string(p).map_err(|e|e.to_string());
@@ -53,7 +56,7 @@ impl Hardware{
   for(a,n)in[(info.full,info.full_len),(info.view,info.view_len)]{for(lo,hi)in[(0x06000000,0x0e000000),(0x16000000,0x16040000)]{if a<hi&&a+n as u64>lo{return Err("DMA overlaps stock reserve".into())}}}
   let full=Map::new(&device,info.full_len as usize,0,false)?;let overview=Map::new(&device,info.view_len as usize,0x1000000,false)?;
   let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
-  let h=Self{_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0};
+  let h=Self{_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
   view::geometry(h.r(0xe4),h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))?;if h.r(0x50)!=continuous::ABI{return Err("OBN2 ID".into())}
   Ok(h)
  }
@@ -96,11 +99,24 @@ impl PairIo for Hardware{
  fn prepare_prefix(&mut self,first:u64,end:u64)->R<()>{
   self.covered.clear();if !self.batch_sync||self.release_only||first==end{return Ok(())}
   let count=(end-first) as u32;let slot=(first&511)as u32;
+  if self.reuse_owned_cache && self.shift && self.previous_view!=0 && first.checked_sub(1)==self.retained_synced {
+   // The split lookbehind remains physically owned until this record is read.
+   // The preceding batch synced its entire committed slot. The read-only VMA
+   // cannot dirty it, and PL cannot reuse it before cumulative release.
+   let prev=((slot+511)&511)as u32;
+   self.covered.push((0,prev*32768,32768));
+   self.covered.push((1,prev*2048,2048));
+   self.sync_circular(0,slot*32768,count*32768,16777216)?;
+   self.sync_circular(1,slot*2048,count*2048,1048576)?;
+   self.retained_synced=Some(end-1);self.sync_reused_bytes+=32768+2048;
+   return Ok(())
+  }
   // Every range is a committed prefix plus its still-owned lookbehind. No
   // uncommitted record and no released previous pair may enter this batch.
   let (start,n)=if self.shift&&self.previous_view==0{(((slot+511)&511)*32768+28416,count*32768)}else if self.shift{(((slot+511)&511)*32768,(count+1)*32768)}else{(slot*32768,count*32768)};
   self.sync_circular(0,start,n,16777216)?;
   if self.previous_view!=0{let vstart=if self.shift{((slot+511)&511)*2048}else{slot*2048};self.sync_circular(1,vstart,(count+1)*2048,1048576)?;}
+  self.retained_synced=Some(end-1);
   Ok(())
  }
  fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,slot:usize,full:&mut[u8],overview:&mut[u8],sink:&mut F)->R<()>{
@@ -171,6 +187,7 @@ fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let r
 fn execute(c:&Config)->R<()>{
  if c.trace_limit==0||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000; header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
+ if c.owned_pipeline{return owned::execute(c)}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c)?;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;

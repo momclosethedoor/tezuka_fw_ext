@@ -47,7 +47,14 @@ pub trait PairIo{
     fn copy_view(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;
     fn release(&mut self,run:u32,tail:u64)->Result<(),String>;
 }
-pub struct PairReader{run:u32,next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub high_water:u64}
+/// Copy both products completely before releasing; callers only enqueue private data.
+pub(super) fn copy_release<I:PairIo,F:FnOnce()>(io:&mut I,run:u32,ordinal:u64,full:&mut[u8],overview:&mut[u8],copied:F)->Result<Header,String>{
+ let slot=ordinal as usize&(SLOTS-1);
+ io.copy_full(slot,full)?;let h=c::header_revision(full,3)?;
+ if h.ordinal!=ordinal||view_len(h)!=overview.len(){return Err("owned full/VIEW identity".into())}
+ io.copy_view(slot,overview)?;copied();io.release(run,ordinal+1)?;Ok(h)
+}
+pub struct PairReader{pub(super) run:u32,pub(super) next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub high_water:u64}
 impl PairReader{
     /// Full-payload local consumer, without costly float conversion/reference
     /// comparison. Every counted record is copied in full into owned storage.

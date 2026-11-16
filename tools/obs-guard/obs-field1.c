@@ -28,6 +28,7 @@ int main(int argc,char **argv){
  if(argc==5&&strcmp(argv[4],"--unqualified-raw"))return 2;
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
  int diagnostic=getenv("OBS_FIELD1_DIAGNOSTIC_RAW")&&!strcmp(getenv("OBS_FIELD1_DIAGNOSTIC_RAW"),"1");
+ int no_delivery=getenv("OBS_FIELD1_NO_DELIVERY")&&!strcmp(getenv("OBS_FIELD1_NO_DELIVERY"),"1");
  int unqualified_raw=argc==5||(getenv("OBS_FIELD1_UNQUALIFIED_RAW")&&!strcmp(getenv("OBS_FIELD1_UNQUALIFIED_RAW"),"1"));
  FILE *policy=fopen("/tmp/obs007a-field-system/unqualified-raw","r");if(policy){unqualified_raw|=fgetc(policy)=='1';fclose(policy);}
  unsigned ms=strtoul(argv[2],0,0),tag=strtoul(argv[3],0,0);if(!ms||ms>68719||!tag)return 2;
@@ -104,7 +105,8 @@ int main(int argc,char **argv){
  if(outcome==1&&!rc&&bytes>=end){snprintf(path,sizeof(path),"%s.field.real8",argv[1]);FILE *f=fopen(path,"wx");if(!f)rc=6;else{if(fwrite(data+first,1,end-first,f)!=end-first)rc=6;fclose(f);}}
  /* Ordinary delivery keeps its qualified-field contract. Unqualified raw
     bytes are an explicit diagnostic option; control status reports TIMEOUT. */
- if(((outcome==1&&!rc)||unqualified_raw||diagnostic)&&attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
+ if(no_delivery){fprintf(trace,"{\"event\":\"delivery_disabled\",\"time\":%.9f,\"scope\":\"explicit A9-only bench control\"}\n",now());}
+ if(!no_delivery&&((outcome==1&&!rc)||unqualified_raw||diagnostic)&&attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
   char command[640],digest[65]={0};snprintf(command,sizeof(command),"sha256sum %s.attempt.real8",argv[1]);FILE *hash=popen(command,"r");int hashed=hash&&fscanf(hash,"%64s",digest)==1;if(hash)pclose(hash);
   if(hashed){
    char meta[2048];uint32_t payload=(uint32_t)(attempt_end-attempt_first);

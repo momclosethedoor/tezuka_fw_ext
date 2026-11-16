@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obs007a-field-system]
+    branches: [build/obs007a-hw-release]
     paths: ['tools/obs-agent/**', '.github/workflows/system-agent.yml']
   workflow_dispatch:
 permissions:
@@ -36,6 +36,8 @@ jobs:
       - name: Build main agent with in-process reader and preview
         run: |
           set -euo pipefail
+          rustc +1.94.0 --edition=2024 --test tools/obs-agent/owned-reader-tests.rs -o /tmp/owned-reader-tests
+          /tmp/owned-reader-tests owned_boundary --nocapture
           export PATH="$PWD/output/nano/host/bin:$PATH"
           export OPENBLAS_TARGET=armv7 OPENBLAS_HOSTCC=gcc
           export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
