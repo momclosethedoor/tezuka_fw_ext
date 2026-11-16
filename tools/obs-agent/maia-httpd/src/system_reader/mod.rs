@@ -21,6 +21,8 @@ type R<T>=Result<T,String>;
  #[serde(default="tracedefault")]trace_limit:usize,
  #[serde(default)]reuse_owned_cache:bool,
  #[serde(default)]owned_pipeline:bool,
+ #[serde(default)]read_without_sum:bool,
+ #[serde(default)]send_after_release:bool,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
  #[serde(default)]tx_active:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
@@ -179,7 +181,11 @@ fn memory()->String{std::fs::read_to_string("/proc/self/status").unwrap_or_defau
  for w in words.chunks_exact(4){a=a.wrapping_add(w[0]&mask);c=c.wrapping_add(w[1]&mask);d=d.wrapping_add(w[2]&mask);e=e.wrapping_add(w[3]&mask);}
  a.wrapping_add(c).wrapping_add(d).wrapping_add(e)
 }
-#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_sum(p:*const u8,n:usize)->u64;fn obs_neon_copy(dst:*mut u8,src:*const u8,n:usize);}
+#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_sum(p:*const u8,n:usize)->u64;fn obs_neon_copy(dst:*mut u8,src:*const u8,n:usize);fn obs_neon_read(p:*const u8,n:usize);}
+fn full_read_without_sum(b:&[u8]){
+ #[cfg(target_arch="arm")] unsafe{obs_neon_read(b.as_ptr(),b.len())};
+ #[cfg(not(target_arch="arm"))] for x in b{unsafe{std::ptr::read_volatile(x);}}
+}
 fn neon_sum(b:&[u8])->u64{
  assert_eq!(b.len()%8,0);assert_eq!(b.as_ptr() as usize%8,0);
  #[cfg(target_arch="arm")] {unsafe{obs_neon_sum(b.as_ptr(),b.len())}}
@@ -210,12 +216,12 @@ fn execute(c:&Config)->R<()>{
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let network=std::cell::RefCell::new(UdpBatch::new());let mut status_due=Instant::now();let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  let mut sink=|h:Header,parts:&[&[u8]],overview:&[u8]|->R<()>{
-  let mut total=0u64;for part in parts{if c.neon{total=total.wrapping_add(neon_sum(part));}else if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
+  let mut total=0u64;for part in parts{if c.read_without_sum{full_read_without_sum(part);}else if c.neon{total=total.wrapping_add(neon_sum(part));}else if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
   let needs_owned=c.check||(!saved&&c.save_ordinal==Some(h.ordinal));
   let joined=if needs_owned{parts.concat()}else{Vec::new()};let full=joined.as_slice();
   if c.check{let mut power=vec![0.;4096];view::decode(full,overview,&mut power)?;}
   if !saved&&c.save_ordinal==Some(h.ordinal){std::fs::write(c.output.join("record.bin"),full).map_err(|e|e.to_string())?;std::fs::write(c.output.join("record.view"),overview).map_err(|e|e.to_string())?;saved=true;}
-  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==2{net.flush(sock);}}}
+  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==2&&!c.send_after_release{net.flush(sock);}}}
   if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}Ok(())
  };
  loop{
@@ -240,7 +246,7 @@ fn execute(c:&Config)->R<()>{
    std::fs::write(c.output.join(name),bytes).map_err(|e|e.to_string())?;
   }
  }
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":2,"begin_network":begin_network,"end_network":end_network,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"checksum":checksum.to_string(),"consumer":if c.read_without_sum{"diagnostic volatile read of ALL4096 bins, no sum, no full copy"}else if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":2,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
@@ -251,6 +257,6 @@ pub fn run_json(data:&[u8])->R<()>{STOP.store(false,Ordering::Release);let c:Con
 struct UdpBatch{bytes:Vec<u8>,pending:u64,sent:u64,dropped:u64,datagrams:u64}
 impl UdpBatch{
  fn new()->Self{Self{bytes:Vec::with_capacity(1136),pending:0,sent:0,dropped:0,datagrams:0}}
- fn flush(&mut self,s:&std::net::UdpSocket){if self.pending==0{return}match s.send(&self.bytes){Ok(n)if n==self.bytes.len()=>{self.sent+=self.pending;self.datagrams+=1;},_=>self.dropped+=self.pending}self.bytes.clear();self.pending=0;}
+ fn flush(&mut self,s:&std::net::UdpSocket){if self.pending==0{return}for packet in self.bytes.chunks(1136){let count=(packet.len()/568)as u64;match s.send(packet){Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;},_=>self.dropped+=count}}self.bytes.clear();self.pending=0;}
  fn counts(&self)->Value{json!({"sent":self.sent,"dropped":self.dropped,"datagrams":self.datagrams})}
 }
