@@ -17,11 +17,13 @@ type R<T>=Result<T,String>;
  #[serde(default)]previous_mode:u32,#[serde(default)]discard_cold:bool,#[serde(default)]check:bool,
  #[serde(default)]save_ordinal:Option<u64>,
  #[serde(default)]save_ring:bool,
+ #[serde(default="tracedefault")]trace_limit:usize,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
  #[serde(default)]tx_active:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
 }
 fn batchdefault()->usize{32}
+fn tracedefault()->usize{400000}
 fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}fn warmdefault()->f64{5.}
 #[derive(Default,Debug)]#[repr(C)]struct Info{full:u64,view:u64,full_len:u32,view_len:u32,cached:u32,cache_line:u32,abi:u32,reserved:u32}
 #[repr(C)]struct Sync{region:u32,offset:u32,len:u32,for_cpu:u32}
@@ -167,7 +169,7 @@ fn neon_sum(b:&[u8])->u64{
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn execute(c:&Config)->R<()>{
- if c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: header-only OFF without check/save; batch1..64".into())}
+ if c.trace_limit==0||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000; header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c)?;
@@ -184,18 +186,17 @@ fn execute(c:&Config)->R<()>{
  if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
  if c.command=="rate"{io.prepare(c)?;io.start()?;}
  let mut reader=view::PairReader::attach(io.snapshot()?)?;
- let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(400000);let mut checksum=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut saved=false;
+ let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut checksum=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut saved=false;
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let network=std::cell::RefCell::new(UdpBatch::new());let mut status_due=Instant::now();let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  let mut sink=|h:Header,parts:&[&[u8]],overview:&[u8]|->R<()>{
-  if records.len()==400000{return Err("bounded metadata trace full".into())}
   let mut total=0u64;for part in parts{if c.neon{total=total.wrapping_add(neon_sum(part));}else if c.aligned{total=total.wrapping_add(aligned_sum(part));}else{for w in part.chunks_exact(8){total=total.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())&((1u64<<50)-1));}}}checksum=checksum.wrapping_add(std::hint::black_box(total));
   let needs_owned=c.check||(!saved&&c.save_ordinal==Some(h.ordinal));
   let joined=if needs_owned{parts.concat()}else{Vec::new()};let full=joined.as_slice();
   if c.check{let mut power=vec![0.;4096];view::decode(full,overview,&mut power)?;}
   if !saved&&c.save_ordinal==Some(h.ordinal){std::fs::write(c.output.join("record.bin"),full).map_err(|e|e.to_string())?;std::fs::write(c.output.join("record.view"),overview).map_err(|e|e.to_string())?;saved=true;}
   if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==2{net.flush(sock);}}}
-  records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);Ok(())
+  if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}Ok(())
  };
  loop{
   if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin_network=network.borrow().counts();begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
@@ -219,7 +220,7 @@ fn execute(c:&Config)->R<()>{
    std::fs::write(c.output.join(name),bytes).map_err(|e|e.to_string())?;
   }
  }
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":2,"begin_network":begin_network,"end_network":end_network,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":2,"begin_network":begin_network,"end_network":end_network,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
