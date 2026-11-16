@@ -16,6 +16,7 @@ type R<T>=Result<T,String>;
  #[serde(default="warmdefault")]warmup:f64,#[serde(default)]shift544:bool,
  #[serde(default)]previous_mode:u32,#[serde(default)]discard_cold:bool,#[serde(default)]check:bool,
  #[serde(default)]save_ordinal:Option<u64>,
+ #[serde(default)]save_ring:bool,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
  #[serde(default)]tx_active:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
@@ -210,6 +211,14 @@ fn execute(c:&Config)->R<()>{
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
  drop(sink);
  let after=io.counters()?;let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}
+ if c.save_ring{
+  // Explicit diagnostic export after STOP/DRAINED; RF/SPI ownership remains
+  // with this runtime until the immutable snapshot has been saved.
+  for(region,size,name)in[(0,io.info.full_len as usize,"full-ring.bin"),(1,io.info.view_len as usize,"view-ring.bin")]{
+   let mut bytes=vec![0u8;size];io.copy(region,0,&mut bytes)?;io.give_back()?;
+   std::fs::write(c.output.join(name),bytes).map_err(|e|e.to_string())?;
+  }
+ }
  let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"checksum":checksum.to_string(),"consumer":if c.release_only{"diagnostic header-only release: NO full read or payload consumption"}else if c.direct{"sum of low50 bits of ALL4096 bins directly from two owned DMA spans, release after consumption"}else{"sum of low50 bits of ALL4096 bins after full owned copy"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":2,"begin_network":begin_network,"end_network":end_network,"strategy":{"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 

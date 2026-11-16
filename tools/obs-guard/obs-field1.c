@@ -37,7 +37,8 @@ int main(int argc,char **argv){
  /* PHY sysfs callbacks are intentionally denied while PL owns SPI. The
     guard's take receipt contains actual TX readback, and TX routes are off. */
  int guard=open("/dev/obs_fl_guard",O_RDONLY);uint32_t gs[128]={0};
- if(guard<0||ioctl(guard,0x4605,gs)||gs[0]!=2||gs[1]!=2||gs[2]||gs[112]!=1){fprintf(stderr,"guard TX-off receipt required\n");return 3;}
+ int tx_authorized=getenv("OBS_FIELD1_TX_AUTHORIZED")&&!strcmp(getenv("OBS_FIELD1_TX_AUTHORIZED"),"1");
+ if(guard<0||ioctl(guard,0x4605,gs)||gs[0]!=2||gs[1]!=2||gs[2]||gs[112]!=(tx_authorized?0u:1u)){fprintf(stderr,"guard TX receipt differs from explicit series authorization\n");return 3;}
  close(guard);
  void *lib=dlopen("libiio.so.0",RTLD_NOW);if(!lib){fprintf(stderr,"dlopen: %s\n",dlerror());return 3;}
  LOAD(void*,iio_create_local_context,(void));LOAD(void*,iio_context_find_device,(void*,const char*));
@@ -64,7 +65,10 @@ int main(int argc,char **argv){
  wr(0x288,tag);wr(0x28c,ms*62500u);if(rd(0x288)!=tag||rd(0x28c)!=ms*62500u)return 3;
  wr(0x284,1);double start=now(),armed=0,busy=0,done=0;uint64_t target=0;size_t bytes=0;unsigned blocks=0,status=0,serial=0,first=0,end=0,target_position=0,map_version=0;int outcome=0,rc=0;
  /* A target two visits ahead avoids the multi-register write race. */
- target=epoch()+2;wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();
+ uint64_t current_epoch;unsigned current_position;do{current_epoch=epoch();current_position=rd(0x234);}while(current_epoch!=epoch());
+ unsigned advance=2;const char *want_env=getenv("OBS_FIELD1_POSITION"),*count_env=getenv("OBS_FIELD1_POSITIONS");
+ if(want_env&&count_env){unsigned wanted=strtoul(want_env,0,0),count=strtoul(count_env,0,0);if(!count||count>128||wanted>=count){wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);return 3;}while((current_position+advance)%count!=wanted)advance++;}
+ target=current_epoch+advance;wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();
  fprintf(trace,"{\"event\":\"arm\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
  while(now()-start<2){
   ssize_t n=iio_buffer_refill(buf);double t=now();

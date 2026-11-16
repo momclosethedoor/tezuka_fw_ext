@@ -6,14 +6,14 @@ use serde::Deserialize;
 use serde_json::{Value,json};
 use std::{fs::{File,OpenOptions},os::fd::AsRawFd,path::{Path,PathBuf},net::{SocketAddr,TcpStream},io::Write,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::{Duration,Instant}};
 #[derive(Deserialize)]#[serde(deny_unknown_fields)]
-struct Config{setup:PathBuf,reader:Value,replay:Option<Replay>}
+struct Config{setup:PathBuf,reader:Value,replay:Option<Replay>,#[serde(default)]tx_authorized:bool}
 #[derive(Deserialize,Clone)]#[serde(deny_unknown_fields)]
 struct Replay{file:PathBuf,metadata:PathBuf,destination:String,hz:u32,count:u32,#[serde(default="one")]targets:u32,#[serde(default)]burst:bool}
 fn one()->u32{1}
-struct Inner{running:AtomicBool,stop:AtomicBool,result:Mutex<Value>,delivery:Mutex<Value>}
+struct Inner{running:AtomicBool,stop:AtomicBool,result:Mutex<Value>,delivery:Mutex<Value>,tx_authorized:bool}
 type Shared=Arc<Inner>;
 fn guard_ioctl(fd:&File,cmd:libc::c_ulong)->Result<Value>{let mut s=[0u32;128];ensure!(unsafe{libc::ioctl(fd.as_raw_fd(),cmd,s.as_mut_ptr())}==0,"guard ioctl {cmd:x}: {}",std::io::Error::last_os_error());ensure!(unsafe{libc::ioctl(fd.as_raw_fd(),0x4605,s.as_mut_ptr())}==0&&s[2]==0,"guard status/error");Ok(json!({"abi":s[0],"state":s[1],"error":s[2],"control":s[9],"tx_powerdown":s[112]}))}
-async fn status(State(s):State<Shared>)->Json<Value>{Json(json!({"kind":"OBS007A-real8-byte-delivery","running":s.running.load(Ordering::Acquire),"reader":crate::system_reader::status(),"result":s.result.lock().unwrap().clone(),"delivery":s.delivery.lock().unwrap().clone(),"software_video_decoder":false,"tx_authorized":false}))}
+async fn status(State(s):State<Shared>)->Json<Value>{Json(json!({"kind":"OBS007A-real8-byte-delivery","running":s.running.load(Ordering::Acquire),"reader":crate::system_reader::status(),"result":s.result.lock().unwrap().clone(),"delivery":s.delivery.lock().unwrap().clone(),"software_video_decoder":false,"tx_authorized":s.tx_authorized}))}
 async fn stop(State(s):State<Shared>)->Json<Value>{s.stop.store(true,Ordering::Release);crate::system_reader::stop();Json(json!({"stop_requested":true}))}
 pub(crate) fn mono()->f64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t)};t.tv_sec as f64+t.tv_nsec as f64*1e-9}
 fn replay(q:Replay,s:Shared,warmup:f64)->Result<Value>{
@@ -41,11 +41,13 @@ pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  ensure!(std::fs::read_to_string("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()=="1","TX must be off");
  ensure!(c.reader["boot_id"].as_str()==Some(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()),"boot mismatch");
  let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard")?;let mut setup=std::fs::read(&c.setup)?;
- ensure!(setup.len()==12488&&setup[12332..12336]==[0;4],"calibrated map with physical TX off; kernel guard validates layout");
+ ensure!(setup.len()==12488,"calibrated map layout");
+ let rf_on=u32::from_le_bytes(setup[12332..12336].try_into().unwrap());
+ ensure!((rf_on==0&&!c.tx_authorized&&c.reader["tx_active"]!=true)||(rf_on==1&&c.tx_authorized&&c.reader["tx_active"]==true),"RF-on requires explicit operator-series authorization and declared reader mode");
  ensure!(unsafe{libc::ioctl(guard.as_raw_fd(),0x4601,setup.as_mut_ptr())}==0,"guard load");
  let taken=match guard_ioctl(&guard,0x4602){Ok(v)=>v,Err(e)=>{let _=guard_ioctl(&guard,0x4604);return Err(e)}};
- if taken["state"]!=2||(taken["control"]!=3&&taken["control"]!=7){let _=guard_ioctl(&guard,0x4604);anyhow::bail!("guard take receipt: {taken}")}
- let state=Arc::new(Inner{running:AtomicBool::new(true),stop:AtomicBool::new(false),result:Mutex::new(json!({"guard_take":taken})),delivery:Mutex::new(json!({"sent":0,"replay":c.replay.is_some()}))});
+ if taken["state"]!=2||(taken["control"]!=3&&taken["control"]!=7)||taken["tx_powerdown"]!=json!(if rf_on==1{0}else{1}){let _=guard_ioctl(&guard,0x4604);anyhow::bail!("guard take receipt: {taken}")}
+ let state=Arc::new(Inner{running:AtomicBool::new(true),stop:AtomicBool::new(false),result:Mutex::new(json!({"guard_take":taken})),delivery:Mutex::new(json!({"sent":0,"replay":c.replay.is_some()})),tx_authorized:c.tx_authorized});
  let worker=state.clone();let data=serde_json::to_vec(&c.reader)?;let out=PathBuf::from(c.reader["output"].as_str().unwrap());let warmup=c.reader["warmup"].as_f64().unwrap_or(5.);
  let replay_thread=c.replay.map(|q|{let s=state.clone();std::thread::spawn(move||replay(q,s,warmup))});
  let acquisition=std::thread::spawn(move||{
