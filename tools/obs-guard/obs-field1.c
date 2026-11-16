@@ -24,9 +24,11 @@ static unsigned segments(const uint8_t *p,size_t n,size_t *offsets){unsigned cou
 static int sendall(int s,const void *p,size_t n){const uint8_t *b=p;while(n){ssize_t k=send(s,b,n,0);if(k<=0)return -1;b+=k;n-=k;}return 0;}
 #define LOAD(ret,n,args) ret(*n)args=dlsym(lib,#n);if(!n){fprintf(stderr,"missing %s\n",#n);return 3;}
 int main(int argc,char **argv){
- if(argc!=4){fprintf(stderr,"usage: obs-field1 output-prefix timeout-ms tag\n");return 2;}
+ if(argc!=4&&argc!=5){fprintf(stderr,"usage: obs-field1 output-prefix timeout-ms tag [--unqualified-raw]\n");return 2;}
+ if(argc==5&&strcmp(argv[4],"--unqualified-raw"))return 2;
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
  int diagnostic=getenv("OBS_FIELD1_DIAGNOSTIC_RAW")&&!strcmp(getenv("OBS_FIELD1_DIAGNOSTIC_RAW"),"1");
+ int unqualified_raw=argc==5||(getenv("OBS_FIELD1_UNQUALIFIED_RAW")&&!strcmp(getenv("OBS_FIELD1_UNQUALIFIED_RAW"),"1"));
  unsigned ms=strtoul(argv[2],0,0),tag=strtoul(argv[3],0,0);if(!ms||ms>68719||!tag)return 2;
  int lock=open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 2;
  int fd=open("/dev/mem",O_RDWR|O_SYNC);r=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x7c460000);
@@ -91,12 +93,12 @@ int main(int argc,char **argv){
  }
  /* A timeout still delivers native FM bytes. Qualification and assembly are
     separate outcomes; an unproven range remains an explicitly marked capture. */
- snprintf(path,sizeof(path),"%s.attempt.real8",argv[1]);FILE *attempt=NULL;if(outcome==1||diagnostic)attempt=fopen(path,"wx");if(attempt){fwrite(data+attempt_first,1,attempt_end-attempt_first,attempt);fclose(attempt);}
+ snprintf(path,sizeof(path),"%s.attempt.real8",argv[1]);FILE *attempt=NULL;if(outcome==1||unqualified_raw||diagnostic)attempt=fopen(path,"wx");if(attempt){fwrite(data+attempt_first,1,attempt_end-attempt_first,attempt);fclose(attempt);}
  snprintf(path,sizeof(path),"%s.attempt.json",argv[1]);attempt=fopen(path,"wx");if(attempt){fprintf(attempt,"{\"qualified_field\":%s,\"epoch_proven\":%s,\"outcome\":%d,\"epoch\":%llu,\"tag\":%u,\"first\":%zu,\"end\":%zu,\"segments\":%u,\"fm_triggered\":true,\"range_rule\":\"new-generation marker; FIELD accept reset; post-completion recall reset\"}\n",outcome==1&&!rc?"true":"false",attempt_epoch_proven?"true":"false",outcome,(unsigned long long)target,tag,attempt_first,attempt_end,nsegments);fclose(attempt);}
  if(outcome==1&&!rc&&bytes>=end){snprintf(path,sizeof(path),"%s.field.real8",argv[1]);FILE *f=fopen(path,"wx");if(!f)rc=6;else{if(fwrite(data+first,1,end-first,f)!=end-first)rc=6;fclose(f);}}
  /* Ordinary delivery keeps its qualified-field contract. Unqualified raw
     bytes are an explicit diagnostic option; control status reports TIMEOUT. */
- if(((outcome==1&&!rc)||diagnostic)&&attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
+ if(((outcome==1&&!rc)||unqualified_raw||diagnostic)&&attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
   char command[640],digest[65]={0};snprintf(command,sizeof(command),"sha256sum %s.attempt.real8",argv[1]);FILE *hash=popen(command,"r");int hashed=hash&&fscanf(hash,"%64s",digest)==1;if(hash)pclose(hash);
   if(hashed){
    char meta[2048];uint32_t payload=(uint32_t)(attempt_end-attempt_first);
