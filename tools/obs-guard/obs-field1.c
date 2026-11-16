@@ -26,6 +26,7 @@ static int sendall(int s,const void *p,size_t n){const uint8_t *b=p;while(n){ssi
 int main(int argc,char **argv){
  if(argc!=4){fprintf(stderr,"usage: obs-field1 output-prefix timeout-ms tag\n");return 2;}
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
+ int diagnostic=getenv("OBS_FIELD1_DIAGNOSTIC_RAW")&&!strcmp(getenv("OBS_FIELD1_DIAGNOSTIC_RAW"),"1");
  unsigned ms=strtoul(argv[2],0,0),tag=strtoul(argv[3],0,0);if(!ms||ms>68719||!tag)return 2;
  int lock=open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 2;
  int fd=open("/dev/mem",O_RDWR|O_SYNC);r=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x7c460000);
@@ -90,11 +91,12 @@ int main(int argc,char **argv){
  }
  /* A timeout still delivers native FM bytes. Qualification and assembly are
     separate outcomes; an unproven range remains an explicitly marked capture. */
- snprintf(path,sizeof(path),"%s.attempt.real8",argv[1]);FILE *attempt=fopen(path,"wx");if(attempt){fwrite(data+attempt_first,1,attempt_end-attempt_first,attempt);fclose(attempt);}
+ snprintf(path,sizeof(path),"%s.attempt.real8",argv[1]);FILE *attempt=NULL;if(outcome==1||diagnostic)attempt=fopen(path,"wx");if(attempt){fwrite(data+attempt_first,1,attempt_end-attempt_first,attempt);fclose(attempt);}
  snprintf(path,sizeof(path),"%s.attempt.json",argv[1]);attempt=fopen(path,"wx");if(attempt){fprintf(attempt,"{\"qualified_field\":%s,\"epoch_proven\":%s,\"outcome\":%d,\"epoch\":%llu,\"tag\":%u,\"first\":%zu,\"end\":%zu,\"segments\":%u,\"fm_triggered\":true,\"range_rule\":\"new-generation marker; FIELD accept reset; post-completion recall reset\"}\n",outcome==1&&!rc?"true":"false",attempt_epoch_proven?"true":"false",outcome,(unsigned long long)target,tag,attempt_first,attempt_end,nsegments);fclose(attempt);}
  if(outcome==1&&!rc&&bytes>=end){snprintf(path,sizeof(path),"%s.field.real8",argv[1]);FILE *f=fopen(path,"wx");if(!f)rc=6;else{if(fwrite(data+first,1,end-first,f)!=end-first)rc=6;fclose(f);}}
- /* Deliver the capture even when PL could not qualify vertical sync. */
- if(attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
+ /* Ordinary delivery keeps its qualified-field contract. Unqualified raw
+    bytes are an explicit diagnostic option; control status reports TIMEOUT. */
+ if(((outcome==1&&!rc)||diagnostic)&&attempt_end>attempt_first&&attempt_end-attempt_first<=2097152){
   char command[640],digest[65]={0};snprintf(command,sizeof(command),"sha256sum %s.attempt.real8",argv[1]);FILE *hash=popen(command,"r");int hashed=hash&&fscanf(hash,"%64s",digest)==1;if(hash)pclose(hash);
   if(hashed){
    char meta[2048];uint32_t payload=(uint32_t)(attempt_end-attempt_first);
@@ -104,7 +106,7 @@ int main(int argc,char **argv){
    fprintf(trace,"{\"event\":\"capture_delivery\",\"time\":%.9f,\"bytes\":%u,\"sent\":%s,\"qualified_field\":%s}\n",now(),payload,sent?"true":"false",outcome==1&&!rc?"true":"false");close(s);
   }
  }
- snprintf(path,sizeof(path),"%s.generation.real8",argv[1]);FILE *f=fopen(path,"wx");if(f){fwrite(data,1,bytes,f);fclose(f);}
+ snprintf(path,sizeof(path),"%s.generation.real8",argv[1]);FILE *f=NULL;if(diagnostic)f=fopen(path,"wx");if(f){fwrite(data,1,bytes,f);fclose(f);}
  snprintf(path,sizeof(path),"%s.json",argv[1]);f=fopen(path,"wx");if(f){fprintf(f,"{\"outcome\":%d,\"error\":%d,\"serial\":%u,\"target_epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u,\"blocks\":%u,\"owned_bytes\":%zu,\"arm_s\":%.9f,\"busy_observed_s\":%.9f,\"done_s\":%.9f,\"timeout_ms\":%u,\"epoch_after\":%llu}\n",outcome,rc,serial,(unsigned long long)target,tag,first,end,blocks,bytes,armed,busy,done,ms,(unsigned long long)epoch());fclose(f);}
  fclose(trace);free(data);munmap((void*)r,4096);close(fd);close(lock);return rc?rc:(!outcome?7:0);
 }
