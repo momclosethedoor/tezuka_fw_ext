@@ -3,7 +3,7 @@ use super::*;
 fn mark(io:&mut Hardware,start:Instant,read:u64)->R<Value>{Ok(json!({"time":start.elapsed().as_secs_f64(),"full_read":read,"cpu_seconds":cpu(),"memory":memory(),"regs":io.counters()?,"sync_ns":io.sync_ns.to_string(),"sync_calls":io.sync_calls}))}
 pub(super) fn execute(c:&Config)->R<()>{
  let scope=c.diagnostic_sync.as_deref().unwrap();
- if !matches!(scope,"none"|"header")||c.mode!=1||!c.shift544||c.udp.is_some()||c.save_ring||c.owned_pipeline{return Err("discard diagnostic: fixed split544 VIEW512, no network/ring export/private queue".into())}
+ if !matches!(scope,"none"|"header"|"all")||c.mode!=1||!c.shift544||c.previous_mode!=1||c.udp.is_some()||c.save_ring||c.owned_pipeline{return Err("discard diagnostic: fixed split544 VIEW512, no network/ring export/private queue".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c)?;io.prepare(c)?;io.start()?;
  let initial=io.snapshot()?;let run=initial.cookie;let mut next=initial.released;let mut read=0u64;
@@ -17,6 +17,7 @@ pub(super) fn execute(c:&Config)->R<()>{
   let s=io.snapshot()?;
   if s.cookie!=run||s.released!=next||s.committed<next||s.committed>s.reserved||s.fault{return Err("discard cursor/fault".into())}
   let until=s.committed.min(next+c.batch_limit as u64);
+  if scope=="all"{io.prepare_prefix(next,until)?;}
   for ordinal in next..until{
    let slot=(ordinal&511)as usize;let prev=(slot+511)&511;let prefix=prev*32768+28928;
    // Only the second diagnostic invalidates the eight header cache lines.
@@ -49,6 +50,6 @@ pub(super) fn execute(c:&Config)->R<()>{
  // A boundary visit may have been counted just before the end snapshot.
  if last_counted==Some(end_epoch){unique=unique.saturating_sub(1);if end_epoch>=anchor{let p=((end_epoch-anchor)%64)as usize;per_position[p]=per_position[p].saturating_sub(1);}}
  let expected=end_epoch.saturating_sub(begin_epoch).saturating_sub(1);
- save(c,"result.json",&json!({"kind":"diagnostic-read-release-discard","sync_scope":scope,"payload_valid":false,"metadata_coherent_by_contract":scope=="header","begin":begin,"end":end,"after":after,"full_read_total":read,"bytes_read":read*33280,"valid_metadata":valid,"stale_metadata":stale,"invalid_metadata":invalid,"reversed_epochs":reversed,"useful_expected":expected,"useful_received":unique,"useful_missing":expected.saturating_sub(unique),"map_version":version,"map_epoch":anchor,"useful_per_position":per_position.as_slice(),"held_repeated_records":duplicates,"inside_hold_missing_bracketed":inside_hold_missing,"first_gap":first_gap,"measured":{"high_water":io.physical_high_water,"max_release_interval_us":io.max_release_gap_us},"sync_calls":io.sync_calls,"sync_ns":io.sync_ns.to_string(),"payload_saved":false,"payload_sent":false,"spectrum_rows_saved":false,"checksum":false}))?;
+ save(c,"result.json",&json!({"kind":"diagnostic-read-release-discard","sync_scope":scope,"payload_valid":false,"metadata_coherent_by_contract":scope!="none","begin":begin,"end":end,"after":after,"full_read_total":read,"bytes_read":read*33280,"valid_metadata":valid,"stale_metadata":stale,"invalid_metadata":invalid,"reversed_epochs":reversed,"useful_expected":expected,"useful_received":unique,"useful_missing":if scope!="none"&&stale==0&&invalid==0&&reversed==0{Some(expected.saturating_sub(unique))}else{None},"untrusted_missing_from_observed_headers":expected.saturating_sub(unique),"map_version":version,"map_epoch":anchor,"useful_per_position":per_position.as_slice(),"held_repeated_records":duplicates,"inside_hold_missing_bracketed":inside_hold_missing,"first_gap":first_gap,"measured":{"high_water":io.physical_high_water,"max_release_interval_us":io.max_release_gap_us},"sync_calls":io.sync_calls,"sync_ns":io.sync_ns.to_string(),"payload_saved":false,"payload_sent":false,"spectrum_rows_saved":false,"checksum":false}))?;
  Ok(())
 }
