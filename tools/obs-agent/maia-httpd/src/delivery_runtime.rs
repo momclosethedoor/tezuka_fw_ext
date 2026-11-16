@@ -42,7 +42,9 @@ pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  ensure!(c.reader["boot_id"].as_str()==Some(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()),"boot mismatch");
  let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard")?;let mut setup=std::fs::read(&c.setup)?;
  ensure!(setup.len()==12488&&setup[12332..12336]==[0;4],"calibrated map with physical TX off; kernel guard validates layout");
- ensure!(unsafe{libc::ioctl(guard.as_raw_fd(),0x4601,setup.as_mut_ptr())}==0,"guard load");let taken=guard_ioctl(&guard,0x4602)?;ensure!(taken["state"]==2&&taken["control"]==3,"guard take");
+ ensure!(unsafe{libc::ioctl(guard.as_raw_fd(),0x4601,setup.as_mut_ptr())}==0,"guard load");
+ let taken=match guard_ioctl(&guard,0x4602){Ok(v)=>v,Err(e)=>{let _=guard_ioctl(&guard,0x4604);return Err(e)}};
+ if taken["state"]!=2||(taken["control"]!=3&&taken["control"]!=7){let _=guard_ioctl(&guard,0x4604);anyhow::bail!("guard take receipt: {taken}")}
  let state=Arc::new(Inner{running:AtomicBool::new(true),stop:AtomicBool::new(false),result:Mutex::new(json!({"guard_take":taken})),delivery:Mutex::new(json!({"sent":0,"replay":c.replay.is_some()}))});
  let worker=state.clone();let data=serde_json::to_vec(&c.reader)?;let out=PathBuf::from(c.reader["output"].as_str().unwrap());let warmup=c.reader["warmup"].as_f64().unwrap_or(5.);
  let replay_thread=c.replay.map(|q|{let s=state.clone();std::thread::spawn(move||replay(q,s,warmup))});
