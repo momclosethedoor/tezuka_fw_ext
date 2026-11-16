@@ -27,3 +27,18 @@ fn mock()->Mock{Mock{full:hex("tools/obs-agent/maia-httpd/tests/view/mode1/ordin
  let mut io=mock();let mut full=vec![0;32768];let mut v=vec![0;512];
  assert!(view::copy_release(&mut io,7,1,&mut full,&mut v,||panic!("wrong identity")).is_err());assert_eq!(io.released,0);
 }
+#[test] fn owned_boundary_direct_read_releases_before_sink_and_preserves_view(){
+ use std::{rc::Rc,cell::Cell};
+ struct Direct{m:Mock,read:Rc<Cell<usize>>,phase:Rc<Cell<u32>>}
+ impl PairIo for Direct{
+  fn snapshot(&mut self)->Result<continuous::Snapshot,String>{Ok(continuous::Snapshot{cookie:7,committed:1,reserved:1,..Default::default()})}
+  fn copy_full(&mut self,_:usize,_:&mut[u8])->Result<(),String>{panic!("no full copy in direct path")}
+  fn copy_view(&mut self,_:usize,_:&mut[u8])->Result<(),String>{panic!("borrowed view")}
+  fn visit_pair<F:FnMut(continuous::Header,&[&[u8]],&[u8])->Result<(),String>>(&mut self,_:usize,_:&mut[u8],_:&mut[u8],sink:&mut F)->Result<(),String>{sink(continuous::header_revision(&self.m.full,3)?,&[&self.m.full],&self.m.view)}
+  fn release(&mut self,run:u32,tail:u64)->Result<(),String>{assert_eq!(self.read.get(),32768);assert_eq!(self.phase.get(),0);self.m.release(run,tail)?;self.phase.set(1);Ok(())}
+ }
+ let read=Rc::new(Cell::new(0));let phase=Rc::new(Cell::new(0));let m=mock();let expected=m.view.clone();
+ let mut io=Direct{m,read:read.clone(),phase:phase.clone()};let mut reader=view::PairReader::attach(io.snapshot().unwrap()).unwrap();
+ reader.service_released(&mut io,|p|{assert_eq!(phase.get(),0);read.set(read.get()+p.len());},|h,v|{assert_eq!(phase.get(),1);assert_eq!(h.ordinal,0);assert_eq!(v,expected);phase.set(2);Ok(())}).unwrap();
+ assert_eq!(phase.get(),2);assert_eq!(reader.read,1);assert!(io.m.full.iter().all(|&b|b==0xcc));
+}
