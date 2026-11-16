@@ -1,7 +1,6 @@
 //! Explicit, bounded r3 board exerciser. No PL load, RF retune, flash or network.
 mod continuous;
 mod view;
-mod owned;
 mod discard;
 use continuous::{Header,Snapshot};
 use view::PairIo;
@@ -176,22 +175,10 @@ impl PairIo for Hardware{
 }
 fn cpu()->f64{let mut r=std::mem::MaybeUninit::<libc::rusage>::zeroed();unsafe{libc::getrusage(libc::RUSAGE_SELF,r.as_mut_ptr());let r=r.assume_init();(r.ru_utime.tv_sec+r.ru_stime.tv_sec)as f64+(r.ru_utime.tv_usec+r.ru_stime.tv_usec)as f64/1e6}}
 fn memory()->String{std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines().filter(|s|s.starts_with("VmRSS:")||s.starts_with("VmHWM:")).collect::<Vec<_>>().join("\n")}
-#[inline(never)]fn aligned_sum(b:&[u8])->u64{
- assert_eq!(b.as_ptr() as usize%8,0);assert_eq!(b.len()%64,0);
- let words=unsafe{std::slice::from_raw_parts(b.as_ptr().cast::<u64>(),b.len()/8)};
- let mask=(1u64<<50)-1;let(mut a,mut c,mut d,mut e)=(0u64,0u64,0u64,0u64);
- for w in words.chunks_exact(4){a=a.wrapping_add(w[0]&mask);c=c.wrapping_add(w[1]&mask);d=d.wrapping_add(w[2]&mask);e=e.wrapping_add(w[3]&mask);}
- a.wrapping_add(c).wrapping_add(d).wrapping_add(e)
-}
-#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_sum(p:*const u8,n:usize)->u64;fn obs_neon_copy(dst:*mut u8,src:*const u8,n:usize);fn obs_neon_read(p:*const u8,n:usize);}
+#[cfg(target_arch="arm")]unsafe extern "C"{fn obs_neon_copy(dst:*mut u8,src:*const u8,n:usize);fn obs_neon_read(p:*const u8,n:usize);}
 fn full_read_without_sum(b:&[u8]){
  #[cfg(target_arch="arm")] unsafe{obs_neon_read(b.as_ptr(),b.len())};
  #[cfg(not(target_arch="arm"))] for x in b{unsafe{std::ptr::read_volatile(x);}}
-}
-fn neon_sum(b:&[u8])->u64{
- assert_eq!(b.len()%8,0);assert_eq!(b.as_ptr() as usize%8,0);
- #[cfg(target_arch="arm")] {unsafe{obs_neon_sum(b.as_ptr(),b.len())}}
- #[cfg(not(target_arch="arm"))] {aligned_sum(b)}
 }
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
