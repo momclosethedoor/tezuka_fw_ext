@@ -1,0 +1,36 @@
+name: OBS007A FIELD1 collector
+on:
+  push:
+    branches: [build/obs007a-field-system]
+    paths: ['tools/obs-guard/obs-field1.c', '.github/workflows/field1.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  collector:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-kernel-kit
+          path: kit
+          run-id: 43645241286
+          github-token: ${{ github.token }}
+      - name: Build collector without video decoding
+        run: |
+          set -euo pipefail
+          echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
+          tar --zstd -xf kit/kernel-kit.tar.zst
+          mkdir artifact
+          output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/obs-field1.c -ldl -o artifact/obs-field1
+          output/nano/host/bin/arm-linux-readelf -h -A artifact/obs-field1 > artifact/elf.txt
+          sha256sum tools/obs-guard/obs-field1.c > artifact/source.sha256
+          cd artifact
+          sha256sum obs-field1 elf.txt source.sha256 > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs007a-field1-collector
+          path: artifact/
