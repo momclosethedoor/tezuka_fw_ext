@@ -8,7 +8,8 @@ use std::{fs::{File,OpenOptions},os::fd::AsRawFd,path::{Path,PathBuf},net::{Sock
 #[derive(Deserialize)]#[serde(deny_unknown_fields)]
 struct Config{setup:PathBuf,reader:Value,replay:Option<Replay>}
 #[derive(Deserialize,Clone)]#[serde(deny_unknown_fields)]
-struct Replay{file:PathBuf,metadata:PathBuf,destination:String,hz:u32,count:u32}
+struct Replay{file:PathBuf,metadata:PathBuf,destination:String,hz:u32,count:u32,#[serde(default="one")]targets:u32,#[serde(default)]burst:bool}
+fn one()->u32{1}
 struct Inner{running:AtomicBool,stop:AtomicBool,result:Mutex<Value>,delivery:Mutex<Value>}
 type Shared=Arc<Inner>;
 fn guard_ioctl(fd:&File,cmd:libc::c_ulong)->Result<Value>{let mut s=[0u32;128];ensure!(unsafe{libc::ioctl(fd.as_raw_fd(),cmd,s.as_mut_ptr())}==0,"guard ioctl {cmd:x}: {}",std::io::Error::last_os_error());ensure!(unsafe{libc::ioctl(fd.as_raw_fd(),0x4605,s.as_mut_ptr())}==0&&s[2]==0,"guard status/error");Ok(json!({"abi":s[0],"state":s[1],"error":s[2],"control":s[9],"tx_powerdown":s[112]}))}
@@ -16,16 +17,16 @@ async fn status(State(s):State<Shared>)->Json<Value>{Json(json!({"kind":"OBS007A
 async fn stop(State(s):State<Shared>)->Json<Value>{s.stop.store(true,Ordering::Release);crate::system_reader::stop();Json(json!({"stop_requested":true}))}
 fn mono()->f64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t)};t.tv_sec as f64+t.tv_nsec as f64*1e-9}
 fn replay(q:Replay,s:Shared,warmup:f64)->Result<Value>{
- ensure!(q.hz==5&&q.count==150,"acceptance replay is 150 fields at 5Hz");
+ ensure!((1..=20).contains(&q.hz)&&(1..=600).contains(&q.count)&&(1..=10).contains(&q.targets),"bounded replay load");
  let bytes=std::fs::read(&q.file)?;let base:Value=serde_json::from_slice(&std::fs::read(&q.metadata)?)?;
  ensure!(base["replay"]==true&&base["payload_bytes"].as_u64()==Some(bytes.len()as u64),"replay provenance/length");
  let mut conn=TcpStream::connect(&q.destination)?;conn.set_write_timeout(Some(Duration::from_millis(500)))?;conn.set_nodelay(true)?;
  while crate::system_reader::status()["time"].as_f64().unwrap_or(0.)<warmup{if !s.running.load(Ordering::Acquire)||s.stop.load(Ordering::Acquire){return Ok(json!({"aborted":true,"sent":0}))}std::thread::sleep(Duration::from_millis(2));}
  let start=Instant::now();let mut trace=Vec::new();let mut sent=0;let mut useful=0;
  for i in 0..q.count{
-  let due=Duration::from_secs_f64(i as f64/q.hz as f64);while start.elapsed()<due{if s.stop.load(Ordering::Acquire){break}std::thread::sleep(due.saturating_sub(start.elapsed()).min(Duration::from_millis(2)));}
+  let due=Duration::from_secs_f64(if q.burst{(i/q.targets) as f64}else{i as f64/q.hz as f64});while start.elapsed()<due{if s.stop.load(Ordering::Acquire){break}std::thread::sleep(due.saturating_sub(start.elapsed()).min(Duration::from_millis(2)));}
   if s.stop.load(Ordering::Acquire)||!s.running.load(Ordering::Acquire){break}
-  let mut meta=base.clone();meta["delivery_id"]=json!(i+1);meta["a9_send_monotonic_s"]=json!(mono());meta["concurrent_scan"]=crate::system_reader::status()["regs"]["fld"].clone();
+  let mut meta=base.clone();meta["delivery_id"]=json!(i+1);meta["replay_target"]=json!(i%q.targets);meta["target_hz"]=json!(base["target_hz"].as_f64().unwrap_or(0.)+(i%q.targets)as f64*100000.);meta["a9_send_monotonic_s"]=json!(mono());meta["concurrent_scan"]=crate::system_reader::status()["regs"]["fld"].clone();
   let header=serde_json::to_vec(&meta)?;let before=mono();conn.write_all(b"R8P1")?;conn.write_all(&(header.len()as u32).to_le_bytes())?;conn.write_all(&(bytes.len()as u32).to_le_bytes())?;conn.write_all(&header)?;
   for piece in bytes.chunks(65536){conn.write_all(piece)?;}
   sent+=1;useful+=bytes.len();trace.push(json!({"id":i+1,"send_start":before,"send_complete":mono(),"bytes":bytes.len()}));
