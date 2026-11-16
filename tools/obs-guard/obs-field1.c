@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 static volatile uint32_t *r;
 static uint32_t rd(unsigned o){return r[o/4];}
 static void wr(unsigned o,uint32_t x){r[o/4]=x;__sync_synchronize();}
@@ -24,8 +25,12 @@ int main(int argc,char **argv){
  int lock=open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 2;
  int fd=open("/dev/mem",O_RDWR|O_SYNC);r=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x7c460000);
  if(r==MAP_FAILED||rd(0x280)!=0x31444c46)return 3;
- FILE *tx=fopen("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown","r");int off=0;if(!tx||fscanf(tx,"%d",&off)!=1||off!=1)return 3;fclose(tx);
- void *lib=dlopen("libiio.so.0",RTLD_NOW);if(!lib)return 3;
+ /* PHY sysfs callbacks are intentionally denied while PL owns SPI. The
+    guard's take receipt contains actual TX readback, and TX routes are off. */
+ int guard=open("/dev/obs_fl_guard",O_RDONLY);uint32_t gs[128]={0};
+ if(guard<0||ioctl(guard,0x4605,gs)||gs[0]!=2||gs[1]!=2||gs[2]||gs[112]!=1){fprintf(stderr,"guard TX-off receipt required\n");return 3;}
+ close(guard);
+ void *lib=dlopen("libiio.so.0",RTLD_NOW);if(!lib){fprintf(stderr,"dlopen: %s\n",dlerror());return 3;}
  LOAD(void*,iio_create_local_context,(void));LOAD(void*,iio_context_find_device,(void*,const char*));
  LOAD(void*,iio_device_find_channel,(void*,const char*,bool));LOAD(void,iio_channel_enable,(void*));
  LOAD(int,iio_context_set_timeout,(void*,unsigned));LOAD(int,iio_device_set_kernel_buffers_count,(void*,unsigned));
@@ -33,12 +38,12 @@ int main(int argc,char **argv){
  LOAD(void*,iio_buffer_start,(void*));LOAD(void*,iio_buffer_end,(void*));
  LOAD(int,iio_buffer_set_blocking_mode,(void*,bool));LOAD(void,iio_buffer_destroy,(void*));LOAD(void,iio_context_destroy,(void*));
  wr(0x290,2);wr(0x284,0);usleep(1000);
- void *ctx=iio_create_local_context();if(!ctx)return 3;
- void *dev=iio_context_find_device(ctx,"cf-ad9361-lpc");if(!dev)return 3;
+ void *ctx=iio_create_local_context();if(!ctx){perror("iio context");return 3;}
+ void *dev=iio_context_find_device(ctx,"cf-ad9361-lpc");if(!dev){fprintf(stderr,"ADC device missing\n");return 3;}
  iio_context_set_timeout(ctx,250);iio_device_set_kernel_buffers_count(dev,4);
  void *ch0=iio_device_find_channel(dev,"voltage0",false),*ch1=iio_device_find_channel(dev,"voltage1",false);if(!ch0||!ch1)return 3;
  iio_channel_enable(ch0);iio_channel_enable(ch1);
- void *buf=iio_device_create_buffer(dev,65536,false);if(!buf)return 3;
+ void *buf=iio_device_create_buffer(dev,65536,false);if(!buf){perror("iio buffer");return 3;}
  if(iio_buffer_set_blocking_mode(buf,false))return 3;
  ssize_t initial=iio_buffer_refill(buf);
  if(initial!=-EAGAIN){fprintf(stderr,"new generation not empty: %zd\n",initial);iio_buffer_destroy(buf);iio_context_destroy(ctx);return 3;}
