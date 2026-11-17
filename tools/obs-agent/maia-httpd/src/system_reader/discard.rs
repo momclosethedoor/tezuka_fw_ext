@@ -44,7 +44,7 @@ pub(super) fn execute(c:&Config)->R<()>{
    }
   }
   if let Some(t)=stopped{if s.drained&&!s.dma_busy&&next==s.committed{break}if t.elapsed()>Duration::from_secs(5){return Err("discard drain timeout".into())}}
-  if next==s.committed{std::thread::sleep(Duration::from_micros(50));}
+  if next==s.committed{std::hint::spin_loop();} // Diagnostic CSR-only polling; no timer delay.
  }
  let s=io.snapshot()?;io.release(run,s.committed)?;let after=io.counters()?;
  // A boundary visit may have been counted just before the end snapshot.

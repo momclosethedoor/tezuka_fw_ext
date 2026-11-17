@@ -38,6 +38,7 @@ pub trait PairIo{
     fn snapshot(&mut self)->Result<Snapshot,String>;
     fn fast_snapshot(&mut self)->Result<Snapshot,String>{self.snapshot()}
     fn batch_limit(&self)->usize{512}
+    fn phase_timing(&self)->bool{false}
     fn full_read(&self)->bool{true}
     fn prepare_prefix(&mut self,_first:u64,_end:u64)->Result<(),String>{Ok(())}
     fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->Result<(),String>>(&mut self,slot:usize,full:&mut[u8],view:&mut[u8],sink:&mut F)->Result<(),String>{
@@ -55,11 +56,12 @@ pub(super) fn copy_release<I:PairIo,F:FnOnce()>(io:&mut I,run:u32,ordinal:u64,fu
  if h.ordinal!=ordinal||view_len(h)!=overview.len(){return Err("owned full/VIEW identity".into())}
  io.copy_view(slot,overview)?;copied();io.release(run,ordinal+1)?;Ok(h)
 }
-pub struct PairReader{pub(super) run:u32,pub(super) next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub high_water:u64}
+pub struct PairReader{pub full_read_ns:u128,pub view_own_ns:u128,pub after_release_ns:u128,pub(super) run:u32,pub(super) next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub high_water:u64}
 impl PairReader{
     /// Finish all DMA reads, release, then expose only the small owned VIEW.
     /// No full-spectrum queue or checksum is part of this path.
     pub fn service_released<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
+        let phase=io.phase_timing();
         let s=io.fast_snapshot()?;
         if s.cookie!=self.run||s.released!=self.next||s.committed<self.next||s.committed>s.reserved||s.reserved-self.next>SLOTS as u64{return Err("r3 cursor/owner violation".into())}
         self.high_water=self.high_water.max(s.reserved-self.next);
@@ -70,15 +72,21 @@ impl PairReader{
             let mut header=None;let mut n=0;
             io.visit_pair(ordinal as usize&(SLOTS-1),&mut self.full,&mut self.view,&mut |h,parts,v|{
                 if h.ordinal!=ordinal{return Err("r3 ordinal mismatch; no release".into())}
+                let t=phase.then(std::time::Instant::now);
                 n=v.len();owned_view[..n].copy_from_slice(v);header=Some(h);
+                if let Some(t)=t{self.view_own_ns+=t.elapsed().as_nanos();}
+                let t=phase.then(std::time::Instant::now);
                 for part in parts{read(part);}
+                if let Some(t)=t{self.full_read_ns+=t.elapsed().as_nanos();}
                 Ok(())
             })?;
             io.release(self.run,ordinal+1)?;
             self.next=ordinal+1;self.visited+=1;
             if io.full_read(){self.read+=1;self.consumed+=1;}
             // The DMA slot may already be overwritten here.
+            let t=phase.then(std::time::Instant::now);
             sink(header.ok_or("missing header")?,&owned_view[..n])?;
+            if let Some(t)=t{self.after_release_ns+=t.elapsed().as_nanos();}
         }
         if s.fault{return Err("r3 fatal after committed prefix".into())}Ok(s)
     }
@@ -103,7 +111,7 @@ impl PairReader{
     }
     pub fn attach(s:Snapshot)->Result<Self,String>{
         if s.cookie==0||s.fault||s.released>s.committed||s.committed>s.reserved||s.reserved-s.released>SLOTS as u64{return Err("r3 attach cursors".into())}
-        Ok(Self{run:s.cookie,next:s.released,full:vec![0;c::BYTES],view:vec![0;VIEW_BYTES],power:vec![0.;c::BINS],read:0,consumed:0,visited:0,high_water:s.reserved-s.released})
+        Ok(Self{full_read_ns:0,view_own_ns:0,after_release_ns:0,run:s.cookie,next:s.released,full:vec![0;c::BYTES],view:vec![0;VIEW_BYTES],power:vec![0.;c::BINS],read:0,consumed:0,visited:0,high_water:s.reserved-s.released})
     }
     /// Sink consumes all 4096 bins synchronously or copies them into its own
     /// bounded storage. A socket client must never be this sink.

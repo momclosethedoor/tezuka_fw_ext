@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <poll.h>
 #include "obs-transport-queue.h"
 static struct transport_queue queue;
 #include <sys/resource.h>
@@ -73,7 +74,13 @@ static int packet_pump(void){
 /* Control packets are bounded setup/teardown work, outside live block service. */
 static int packet(const char *meta,const void *raw,size_t n){
  if(packet_begin(meta,raw,n))return -1;
- for(;;){int rc=packet_pump();if(rc)return rc>0?0:-1;usleep(100);}
+ for(;;){
+  int rc=packet_pump();if(rc)return rc>0?0:-1;
+  struct pollfd fd={video_sock,POLLOUT,0};
+  double remaining=1.0-(now()-tx.started);if(remaining<=0){packet_abort();return -1;}
+  int ready=poll(&fd,1,(int)(remaining*1000)+1);
+  if(ready<0&&errno!=EINTR){packet_abort();return -1;}
+ }
 }
 /* Session metadata may be reused; every attempt still destroys its old DMA
    buffer, creates an empty generation and assigns a fresh stream tag. */
@@ -90,7 +97,6 @@ static int missed_early(const char *prefix,unsigned tag,uint64_t target,uint64_t
 #define LOAD(ret,n,args) ret(*n)args=dlsym(lib,#n);if(!n){fprintf(stderr,"missing %s\n",#n);return 3;}
 static int capture(int argc,char **argv){
  double capture_enter=now();
- int idle_only=getenv("OBS_FIELD1_IDLE_ONLY")&&!strcmp(getenv("OBS_FIELD1_IDLE_ONLY"),"1");
  if(argc!=4&&argc!=5){fprintf(stderr,"usage: obs-field1 output-prefix timeout-ms tag [--unqualified-raw]\n");return 2;}
  if(argc==5&&strcmp(argv[4],"--unqualified-raw"))return 2;
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
@@ -118,7 +124,7 @@ static int capture(int argc,char **argv){
  const char *scheduled=getenv("OBS_FIELD1_TARGET_EPOCH");
  if(scheduled){
   uint64_t requested=strtoull(scheduled,NULL,10);double wait_start=now();
-  while(epoch()+512<requested && now()-wait_start<5.0)usleep(1000);
+  while(epoch()+512<requested && now()-wait_start<5.0){__asm__ __volatile__("yield" ::: "memory");}
   uint64_t current=epoch();if(requested<current+2){
    int miss=missed_early(argv[1],tag,requested,current,now()-capture_enter);
    munmap((void*)r,4096);close(fd);close(lock);return miss;
@@ -131,8 +137,13 @@ static int capture(int argc,char **argv){
  LOAD(int,iio_context_set_timeout,(void*,unsigned));LOAD(int,iio_device_set_kernel_buffers_count,(void*,unsigned));
  LOAD(void*,iio_device_create_buffer,(void*,size_t,bool));LOAD(ssize_t,iio_buffer_refill,(void*));
  LOAD(void*,iio_buffer_start,(void*));LOAD(void*,iio_buffer_end,(void*));
+ LOAD(int,iio_buffer_get_poll_fd,(void*));
  LOAD(int,iio_buffer_set_blocking_mode,(void*,bool));LOAD(void,iio_buffer_destroy,(void*));LOAD(void,iio_context_destroy,(void*));
- uint32_t old_mode=rd(0x38);wr(0x290,2);wr(0x284,0);wr(0x38,1);usleep(1000);
+ uint32_t old_mode=rd(0x38);wr(0x290,2);
+ double cancel_deadline=now()+0.1;
+ while(rd(0x294)&0xc1){if(now()>cancel_deadline){fprintf(stderr,"FIELD CANCEL deadline\n");return 3;}}
+ wr(0x284,0);wr(0x38,1);
+ if(rd(0x284)!=0||rd(0x38)!=1){fprintf(stderr,"stream/mode readback\n");return 3;}
  void *ctx=session_context?session_context:iio_create_local_context();if(!ctx){perror("iio context");return 3;}
  double context_ready=now();if(reuse_context){session_context=ctx;session_library=lib;}
  void *dev=iio_context_find_device(ctx,"cf-ad9361-lpc");if(!dev){fprintf(stderr,"ADC device missing\n");return 3;}
@@ -151,6 +162,7 @@ static int capture(int argc,char **argv){
  if(depth){transport_depth=strtoul(depth,NULL,10);if(transport_depth>8||(transport_depth>1&&(transport_depth&(transport_depth-1))))return 3;}
  if(tq_reset(&queue,transport_depth,block_bytes))return 3;
  if(iio_buffer_set_blocking_mode(buf,false))return 3;
+ int iio_poll_fd=iio_buffer_get_poll_fd(buf);if(iio_poll_fd<0){fprintf(stderr,"IIO poll fd unavailable\n");return 3;}
  ssize_t initial=iio_buffer_refill(buf);
  if(initial!=-EAGAIN){fprintf(stderr,"new generation not empty: %zd\n",initial);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);return 3;}
  /* stream_run=0 suppresses FM output while a fresh empty DMA generation is created.
@@ -200,7 +212,7 @@ static int capture(int argc,char **argv){
  size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
  double refill_s=0,copy_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
  double loop_due=now(),loop_gap_max_s=0;unsigned copied_refills=0,send_with_iio_owned=0;int fault_seen=0;
- double sleep_s=0,sleep_max_s=0;unsigned sleep_calls=0,progress_turns=0;
+ double ready_wait_s=0,ready_wait_max_s=0;unsigned ready_wait_calls=0,progress_turns=0;
  double service_started=now();struct timespec cpu_begin,cpu_end;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_begin);
  while(!rc&&now()-start<CAPTURE_SECONDS){
   size_t received_before=received_bytes;uint64_t accepted_before=wire_accepted;
@@ -288,19 +300,27 @@ static int capture(int argc,char **argv){
    if(bytes>=end&&!pending_bytes&&!queue.count&&(!route_case||route_acked))break;
   }
  idle_service:
-  /* A completed copy/send is work, not a reason to delay the next block.
-     EAGAIN without progress still sleeps; no busy polling or new thread. */
-  if(received_bytes!=received_before||wire_accepted!=accepted_before){
-   progress_turns++;if(idle_only)continue;
+  /* Never delay ready work. Only the descriptors that can unblock service
+     enter poll; its timeout is the capture/packet deadline, not a cadence. */
+  if(received_bytes!=received_before||wire_accepted!=accepted_before){progress_turns++;continue;}
+  struct pollfd ready_fds[3];nfds_t ready_count=0;
+  if(!input_closed&&!held_bytes&&(transport_depth||!pending_bytes))
+   ready_fds[ready_count++]=(struct pollfd){iio_poll_fd,POLLIN|POLLOUT,0};
+  if(tx.active)ready_fds[ready_count++]=(struct pollfd){video_sock,POLLOUT,0};
+  if(route_sock>=0&&!route_acked)ready_fds[ready_count++]=(struct pollfd){route_sock,POLLIN,0};
+  if(ready_count){
+   double limit=start+CAPTURE_SECONDS;if(tx.active&&tx.started+1.0<limit)limit=tx.started+1.0;
+   double remaining=limit-now();if(remaining<=0)continue;
+   double t0=now();int ready=poll(ready_fds,ready_count,(int)(remaining*1000)+1);
+   double dt=now()-t0;ready_wait_s+=dt;if(dt>ready_wait_max_s)ready_wait_max_s=dt;ready_wait_calls++;
+   if(ready<0&&errno!=EINTR){rc=4;break;}
+   for(nfds_t i=0;i<ready_count;i++)if(ready_fds[i].revents&(POLLERR|POLLHUP|POLLNVAL)){rc=4;break;}
   }
-  {double t0=now();usleep(100);double dt=now()-t0;sleep_s+=dt;
-   if(dt>sleep_max_s)sleep_max_s=dt;
-   sleep_calls++;}
  }
  clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_end);
  double service_wall_s=now()-service_started;
  double service_cpu_s=(cpu_end.tv_sec-cpu_begin.tv_sec)+(cpu_end.tv_nsec-cpu_begin.tv_nsec)*1e-9;
- fprintf(trace,"{\"event\":\"service_wait\",\"time\":%.9f,\"idle_only\":%s,\"sleep_calls\":%u,\"sleep_s\":%.9f,\"sleep_max_s\":%.9f,\"progress_turns\":%u,\"service_wall_s\":%.9f,\"service_cpu_s\":%.9f}\n",now(),idle_only?"true":"false",sleep_calls,sleep_s,sleep_max_s,progress_turns,service_wall_s,service_cpu_s);
+ fprintf(trace,"{\"event\":\"service_wait\",\"time\":%.9f,\"policy\":\"descriptor-readiness-no-sleep\",\"ready_wait_calls\":%u,\"ready_wait_s\":%.9f,\"ready_wait_max_s\":%.9f,\"progress_turns\":%u,\"service_wall_s\":%.9f,\"service_cpu_s\":%.9f}\n",now(),ready_wait_calls,ready_wait_s,ready_wait_max_s,progress_turns,service_wall_s,service_cpu_s);
  if(tx.active){packet_abort();if(!rc)rc=9;}
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
  fprintf(trace,"{\"event\":\"iio_return_order\",\"time\":%.9f,\"copied_refills\":%u,\"send_with_iio_owned\":%u}\n",now(),copied_refills,send_with_iio_owned);
@@ -328,13 +348,13 @@ int main(int argc,char **argv){
  if(argc==2&&!strcmp(argv[1],"--session")){
   reuse_context=getenv("OBS_FIELD1_REUSE_CONTEXT")&&!strcmp(getenv("OBS_FIELD1_REUSE_CONTEXT"),"1");
   char line[768],prefix[512],extra;unsigned ms,tag;int rc=0;
-  double due=now();unsigned interval_ms=getenv("OBS_FIELD1_INTERVAL_MS")?strtoul(getenv("OBS_FIELD1_INTERVAL_MS"),0,10):0;
+  unsigned interval_ms=getenv("OBS_FIELD1_INTERVAL_MS")?strtoul(getenv("OBS_FIELD1_INTERVAL_MS"),0,10):0;
+  if(interval_ms){fprintf(stderr,"session uses exact epochs; timer-paced interval is retired\n");return 2;}
   while(fgets(line,sizeof(line),stdin)){
    unsigned long long requested=0;int columns=sscanf(line,"%511s %u %u %llu %c",prefix,&ms,&tag,&requested,&extra);
    if(columns!=3&&columns!=4){rc=2;break;}
    if(columns==4){char value[32];snprintf(value,sizeof(value),"%llu",requested);setenv("OBS_FIELD1_TARGET_EPOCH",value,1);}else unsetenv("OBS_FIELD1_TARGET_EPOCH");
    char timeout[32],id[32];snprintf(timeout,sizeof(timeout),"%u",ms);snprintf(id,sizeof(id),"%u",tag);
-   double wait=due-now();if(wait>0)usleep((useconds_t)(wait*1e6));due+=interval_ms/1000.0;
    char *args[]={argv[0],prefix,timeout,id};rc=capture(4,args);
    printf("ATTEMPT %u %d\n",tag,rc);fflush(stdout);
    /* A broken transport/ownership attempt stops the session, never silently
