@@ -50,6 +50,7 @@ static int packet(const char *meta,const void *raw,size_t n){
 }
 #define LOAD(ret,n,args) ret(*n)args=dlsym(lib,#n);if(!n){fprintf(stderr,"missing %s\n",#n);return 3;}
 static int capture(int argc,char **argv){
+ double capture_enter=now();
  if(argc!=4&&argc!=5){fprintf(stderr,"usage: obs-field1 output-prefix timeout-ms tag [--unqualified-raw]\n");return 2;}
  if(argc==5&&strcmp(argv[4],"--unqualified-raw"))return 2;
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
@@ -103,6 +104,18 @@ static int capture(int argc,char **argv){
  unsigned advance=2;const char *want_env=getenv("OBS_FIELD1_POSITION"),*count_env=getenv("OBS_FIELD1_POSITIONS");
  if(want_env&&count_env){unsigned wanted=strtoul(want_env,0,0),count=strtoul(count_env,0,0);if(!count||count>128||wanted>=count){wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);return 3;}while((current_position+advance)%count!=wanted)advance++;}
  target=current_epoch+advance;
+ const char *exact=getenv("OBS_FIELD1_TARGET_EPOCH");
+ if(exact){
+  target=strtoull(exact,NULL,10);
+  if(target<current_epoch+2){
+   fprintf(trace,"{\"event\":\"missed_requested_visit\",\"time\":%.9f,\"requested_epoch\":%llu,\"current_epoch\":%llu,\"setup_s\":%.9f}\n",now(),(unsigned long long)target,(unsigned long long)current_epoch,now()-capture_enter);
+   snprintf(path,sizeof(path),"%s.json",argv[1]);FILE *miss=fopen(path,"wx");
+   if(miss){fprintf(miss,"{\"outcome\":0,\"error\":10,\"not_armed\":true,\"target_epoch\":%llu,\"tag\":%u,\"epoch_after\":%llu,\"setup_s\":%.9f}\n",(unsigned long long)target,tag,(unsigned long long)current_epoch,now()-capture_enter);fclose(miss);}
+   wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);wr(0x38,old_mode);
+   fclose(trace);dlclose(lib);munmap((void*)r,4096);close(fd);close(lock);return 10;
+  }
+ }
+ fprintf(trace,"{\"event\":\"generation_ready\",\"time\":%.9f,\"setup_s\":%.9f,\"requested_epoch\":%llu}\n",now(),now()-capture_enter,(unsigned long long)target);
  if(route_case){
   uint64_t marker_epoch=((uint64_t)rd(0x250)<<32)|rd(0x24c);
   route_id=rd(0x240);if(!(rd(0x228)&8)||marker_epoch!=current_epoch){fprintf(stderr,"current-visit field needs matching hardware antenna marker\n");return 3;}
@@ -169,14 +182,17 @@ int main(int argc,char **argv){
   char line[768],prefix[512],extra;unsigned ms,tag;int rc=0;
   double due=now();unsigned interval_ms=getenv("OBS_FIELD1_INTERVAL_MS")?strtoul(getenv("OBS_FIELD1_INTERVAL_MS"),0,10):0;
   while(fgets(line,sizeof(line),stdin)){
-   if(sscanf(line,"%511s %u %u %c",prefix,&ms,&tag,&extra)!=3){rc=2;break;}
+   unsigned long long requested=0;int columns=sscanf(line,"%511s %u %u %llu %c",prefix,&ms,&tag,&requested,&extra);
+   if(columns!=3&&columns!=4){rc=2;break;}
+   if(columns==4){char value[32];snprintf(value,sizeof(value),"%llu",requested);setenv("OBS_FIELD1_TARGET_EPOCH",value,1);}else unsetenv("OBS_FIELD1_TARGET_EPOCH");
    char timeout[32],id[32];snprintf(timeout,sizeof(timeout),"%u",ms);snprintf(id,sizeof(id),"%u",tag);
    double wait=due-now();if(wait>0)usleep((useconds_t)(wait*1e6));due+=interval_ms/1000.0;
    char *args[]={argv[0],prefix,timeout,id};rc=capture(4,args);
    printf("ATTEMPT %u %d\n",tag,rc);fflush(stdout);
    /* A broken transport/ownership attempt stops the session, never silently
       reconnects the middle of a field or presents a partial one as complete. */
-   if(rc)break;
+   if(rc && !(columns==4 && rc==10))break;
+   if(rc==10)rc=0;
   }
   if(video_sock>=0)close(video_sock);
   return rc;
