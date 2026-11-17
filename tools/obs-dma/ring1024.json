@@ -1,0 +1,15 @@
+{
+  "slots": 1024,
+  "full_stride": 32768,
+  "view_stride": 2048,
+  "full_bytes": 33554432,
+  "view_bytes": 2097152,
+  "dma_info_abi": 1,
+  "pl_abi": 3,
+  "mmap_full_offset": 0,
+  "mmap_view_offset": 16777216,
+  "kernel_release": "6.12.77",
+  "lifetime": "pinned until reboot",
+  "cached_default": true,
+  "hardware_acceptance": "NOT RUN"
+}

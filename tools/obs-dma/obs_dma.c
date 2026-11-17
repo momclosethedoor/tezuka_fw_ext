@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Temporary r3 DMA owner. Allocations are pinned until reboot, never file close.
  * Load only after the RAM loader restored the real Maia platform device.
- * ABI 1: INFO 0x4f01, SYNC 0x4f02. mmap offset0=full, offset16MiB=view.
+ * ABI 1: INFO 0x4f01, SYNC 0x4f02. mmap selectors: offset0=full (32MiB), offset16MiB=view (2MiB).
  * CPU mappings are read-only. The single reader syncs after commit and before
  * cumulative release; mmap/close/errors never give allocation back to Linux. */
 #include <linux/module.h>
@@ -17,7 +17,7 @@
 static bool cached = true;
 module_param(cached, bool, 0444);
 struct region { void *cpu; struct page *page; dma_addr_t dma; size_t len; };
-static struct region regions[2] = { {.len=0x1000000}, {.len=0x100000} };
+static struct region regions[2] = { {.len=0x2000000}, {.len=0x200000} };
 static struct device *dev;
 static void __iomem *csr;
 static atomic_t opened=ATOMIC_INIT(0);
@@ -84,6 +84,7 @@ static int __init begin(void)
  int i,err=-ENODEV;
  csr=ioremap(0x7c460000,0x1000); if(!csr) return -ENOMEM;
  if(readl(csr+0x50)!=0x324e424f || readl(csr+0xe4)!=3 || (readl(csr+0x64)&3)) goto fail;
+ if(readl(csr+0x1c0)!=1024 || readl(csr+0x1c4)!=32768 || readl(csr+0x1c8)!=2048) { err=-EINVAL; goto fail; }
  dev=bus_find_device_by_name(&platform_bus_type,NULL,"7c460000.maia-sdr"); if(!dev) goto fail;
  err=dma_set_mask_and_coherent(dev,DMA_BIT_MASK(32)); if(err) goto fail;
  for(i=0;i<2;i++) {

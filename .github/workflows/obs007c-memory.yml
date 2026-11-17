@@ -1,0 +1,48 @@
+name: OBS007C RAM memory ring1024
+on:
+  push:
+    branches: [build/obs007c-arm-mode]
+    paths: ['tools/obs-dma/obs_dma.c', 'tools/obs-dma/ring1024.json', '.github/workflows/obs007c-memory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  memory:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-kernel-kit
+          path: kit
+          run-id: 43645241286
+          github-token: ${{ github.token }}
+      - name: Verify pinned kernel and build RAM module only
+        run: |
+          set -euo pipefail
+          echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
+          tar --zstd -xf kit/kernel-kit.tar.zst
+          mkdir artifact
+          python3 tools/obs-dma/check_kernel.py output/nano/build/linux-custom | tee artifact/kernel-check.txt
+          make -C "$PWD/output/nano/build/linux-custom" M="$PWD/tools/obs-dma" ARCH=arm CROSS_COMPILE="$PWD/output/nano/host/bin/arm-linux-" modules
+          cp tools/obs-dma/obs_dma.ko tools/obs-dma/obs_dma.c tools/obs-dma/ring1024.json artifact/
+          cp output/nano/build/linux-custom/.config artifact/kernel.config
+          cp output/nano/build/linux-custom/Module.symvers artifact/
+          output/nano/host/bin/arm-linux-readelf -h -A artifact/obs_dma.ko > artifact/elf.txt
+          git rev-parse HEAD > artifact/commit.txt
+          echo "$GITHUB_RUN_ID" > artifact/run-id.txt
+          python3 - <<'PY'
+          import hashlib,json,pathlib,os
+          p=pathlib.Path('artifact')
+          manifest={'commit':os.environ['GITHUB_SHA'],'run_id':os.environ['GITHUB_RUN_ID'],'files':{f.name:{'bytes':f.stat().st_size,'sha256':hashlib.sha256(f.read_bytes()).hexdigest()} for f in sorted(p.iterdir())}}
+          (p/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          PY
+          cd artifact
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: OBS-007C-memory-ring1024
+          path: artifact/
+          if-no-files-found: error
