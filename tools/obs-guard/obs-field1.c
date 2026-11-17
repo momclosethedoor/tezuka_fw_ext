@@ -48,6 +48,18 @@ static int packet(const char *meta,const void *raw,size_t n){
  if(rc){close(video_sock);video_sock=-1;return -1;}
  wire_bytes+=sizeof(header)+m+n;wire_chunks++;return 0;
 }
+/* Session metadata may be reused; every attempt still destroys its old DMA
+   buffer, creates an empty generation and assigns a fresh stream tag. */
+static void *session_context=NULL,*session_library=NULL;
+static int reuse_context=0;
+static void context_done(void (*destroy)(void*),void *ctx){if(!reuse_context)destroy(ctx);}
+static void library_done(void *lib){if(!reuse_context)dlclose(lib);}
+static int missed_early(const char *prefix,unsigned tag,uint64_t target,uint64_t current,double setup){
+ char path[768];snprintf(path,sizeof(path),"%s.json",prefix);FILE *f=fopen(path,"wx");if(!f)return 3;
+ fprintf(f,"{\"outcome\":0,\"error\":10,\"not_armed\":true,\"target_epoch\":%llu,\"tag\":%u,\"epoch_after\":%llu,\"setup_s\":%.9f}\n",(unsigned long long)target,tag,(unsigned long long)current,setup);fclose(f);
+ snprintf(path,sizeof(path),"%s.trace.jsonl",prefix);f=fopen(path,"wx");if(!f)return 3;
+ fprintf(f,"{\"event\":\"missed_before_iio\",\"time\":%.9f,\"requested_epoch\":%llu,\"current_epoch\":%llu}\n",now(),(unsigned long long)target,(unsigned long long)current);fclose(f);return 10;
+}
 #define LOAD(ret,n,args) ret(*n)args=dlsym(lib,#n);if(!n){fprintf(stderr,"missing %s\n",#n);return 3;}
 static int capture(int argc,char **argv){
  double capture_enter=now();
@@ -78,9 +90,14 @@ static int capture(int argc,char **argv){
  const char *scheduled=getenv("OBS_FIELD1_TARGET_EPOCH");
  if(scheduled){
   uint64_t requested=strtoull(scheduled,NULL,10);double wait_start=now();
-  while(epoch()+128<requested && now()-wait_start<5.0)usleep(1000);
+  while(epoch()+512<requested && now()-wait_start<5.0)usleep(1000);
+  uint64_t current=epoch();if(requested<current+2){
+   int miss=missed_early(argv[1],tag,requested,current,now()-capture_enter);
+   munmap((void*)r,4096);close(fd);close(lock);return miss;
+  }
  }
- void *lib=dlopen("libiio.so.0",RTLD_NOW);if(!lib){fprintf(stderr,"dlopen: %s\n",dlerror());return 3;}
+ double prepare_start=now();
+ void *lib=session_library?session_library:dlopen("libiio.so.0",RTLD_NOW);if(!lib){fprintf(stderr,"dlopen: %s\n",dlerror());return 3;}
  LOAD(void*,iio_create_local_context,(void));LOAD(void*,iio_context_find_device,(void*,const char*));
  LOAD(void*,iio_device_find_channel,(void*,const char*,bool));LOAD(void,iio_channel_enable,(void*));
  LOAD(int,iio_context_set_timeout,(void*,unsigned));LOAD(int,iio_device_set_kernel_buffers_count,(void*,unsigned));
@@ -88,29 +105,32 @@ static int capture(int argc,char **argv){
  LOAD(void*,iio_buffer_start,(void*));LOAD(void*,iio_buffer_end,(void*));
  LOAD(int,iio_buffer_set_blocking_mode,(void*,bool));LOAD(void,iio_buffer_destroy,(void*));LOAD(void,iio_context_destroy,(void*));
  uint32_t old_mode=rd(0x38);wr(0x290,2);wr(0x284,0);wr(0x38,1);usleep(1000);
- void *ctx=iio_create_local_context();if(!ctx){perror("iio context");return 3;}
+ void *ctx=session_context?session_context:iio_create_local_context();if(!ctx){perror("iio context");return 3;}
+ double context_ready=now();if(reuse_context){session_context=ctx;session_library=lib;}
  void *dev=iio_context_find_device(ctx,"cf-ad9361-lpc");if(!dev){fprintf(stderr,"ADC device missing\n");return 3;}
  iio_context_set_timeout(ctx,250);iio_device_set_kernel_buffers_count(dev,4);
  void *ch0=iio_device_find_channel(dev,"voltage0",false),*ch1=iio_device_find_channel(dev,"voltage1",false);if(!ch0||!ch1)return 3;
  iio_channel_enable(ch0);iio_channel_enable(ch1);
  void *buf=iio_device_create_buffer(dev,IIO_BLOCK_SAMPLES,false);if(!buf){perror("iio buffer");return 3;}
+ double buffer_ready=now();
  size_t block_bytes=(uint8_t*)iio_buffer_end(buf)-(uint8_t*)iio_buffer_start(buf);
  size_t capture_limit=REAL8_FS*CAPTURE_SECONDS+block_bytes;
  if(iio_buffer_set_blocking_mode(buf,false))return 3;
  ssize_t initial=iio_buffer_refill(buf);
- if(initial!=-EAGAIN){fprintf(stderr,"new generation not empty: %zd\n",initial);iio_buffer_destroy(buf);iio_context_destroy(ctx);return 3;}
+ if(initial!=-EAGAIN){fprintf(stderr,"new generation not empty: %zd\n",initial);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);return 3;}
  /* stream_run=0 suppresses FM output while a fresh empty DMA generation is created.
     No previous generation can contribute bytes to this context. */
  uint64_t sent_before=wire_bytes,chunks_before=wire_chunks;double send_before=wire_send_s;
- if(!no_delivery&&connect_video()){iio_buffer_destroy(buf);iio_context_destroy(ctx);wr(0x38,old_mode);close(fd);close(lock);return 9;}
+ if(!no_delivery&&connect_video()){iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);close(fd);close(lock);return 9;}
  char path[512];snprintf(path,sizeof(path),"%s.trace.jsonl",argv[1]);FILE *trace=fopen(path,"wx");if(!trace)return 3;
+ fprintf(trace,"{\"event\":\"iio_preparation\",\"time\":%.9f,\"context_s\":%.9f,\"buffer_s\":%.9f,\"ready_s\":%.9f,\"reuse_context\":%s}\n",now(),context_ready-prepare_start,buffer_ready-context_ready,now()-prepare_start,reuse_context?"true":"false");
  fprintf(trace,"{\"event\":\"raw_policy_latched\",\"time\":%.9f,\"unqualified_raw\":%s}\n",now(),unqualified_raw?"true":"false");
  wr(0x288,tag);wr(0x28c,ms*62500u);if(rd(0x288)!=tag||rd(0x28c)!=ms*62500u)return 3;
  wr(0x284,1);double start=now(),armed=0,busy=0,done=0;uint64_t target=0;size_t bytes=0;unsigned blocks=0,status=0,serial=0,first=0,end=0,target_position=0,map_version=0;int outcome=0,rc=0;
  /* A target two visits ahead avoids the multi-register write race. */
  uint64_t current_epoch;unsigned current_position;do{current_epoch=epoch();current_position=rd(0x234);}while(current_epoch!=epoch());
  unsigned advance=2;const char *want_env=getenv("OBS_FIELD1_POSITION"),*count_env=getenv("OBS_FIELD1_POSITIONS");
- if(want_env&&count_env){unsigned wanted=strtoul(want_env,0,0),count=strtoul(count_env,0,0);if(!count||count>128||wanted>=count){wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);return 3;}while((current_position+advance)%count!=wanted)advance++;}
+ if(want_env&&count_env){unsigned wanted=strtoul(want_env,0,0),count=strtoul(count_env,0,0);if(!count||count>128||wanted>=count){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);return 3;}while((current_position+advance)%count!=wanted)advance++;}
  target=current_epoch+advance;
  const char *exact=getenv("OBS_FIELD1_TARGET_EPOCH");
  if(exact){
@@ -119,8 +139,8 @@ static int capture(int argc,char **argv){
    fprintf(trace,"{\"event\":\"missed_requested_visit\",\"time\":%.9f,\"requested_epoch\":%llu,\"current_epoch\":%llu,\"setup_s\":%.9f}\n",now(),(unsigned long long)target,(unsigned long long)current_epoch,now()-capture_enter);
    snprintf(path,sizeof(path),"%s.json",argv[1]);FILE *miss=fopen(path,"wx");
    if(miss){fprintf(miss,"{\"outcome\":0,\"error\":10,\"not_armed\":true,\"target_epoch\":%llu,\"tag\":%u,\"epoch_after\":%llu,\"setup_s\":%.9f}\n",(unsigned long long)target,tag,(unsigned long long)current_epoch,now()-capture_enter);fclose(miss);}
-   wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);wr(0x38,old_mode);
-   fclose(trace);dlclose(lib);munmap((void*)r,4096);close(fd);close(lock);return 10;
+   wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
+   fclose(trace);library_done(lib);munmap((void*)r,4096);close(fd);close(lock);return 10;
   }
  }
  fprintf(trace,"{\"event\":\"generation_ready\",\"time\":%.9f,\"setup_s\":%.9f,\"requested_epoch\":%llu}\n",now(),now()-capture_enter,(unsigned long long)target);
@@ -134,7 +154,7 @@ static int capture(int argc,char **argv){
  }
  if(!no_delivery){
   char meta[768];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
-  if(packet(meta,NULL,0)){wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);wr(0x38,old_mode);fclose(trace);close(fd);close(lock);return 9;}
+  if(packet(meta,NULL,0)){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);fclose(trace);close(fd);close(lock);return 9;}
  }
  wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();
  fprintf(trace,"{\"event\":\"arm\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
@@ -168,7 +188,7 @@ static int capture(int argc,char **argv){
   }
   usleep(100);
  }
- wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);iio_context_destroy(ctx);wr(0x38,old_mode);
+ wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
  if(route_sock>=0)close(route_sock);
  /* Only the host interprets the native sync words and assembles pixels.
     END qualifies the provisional byte stream; no ARM frame ACK is returned. */
@@ -181,12 +201,13 @@ static int capture(int argc,char **argv){
  FILE *f=NULL;
  snprintf(path,sizeof(path),"%s.json",argv[1]);f=fopen(path,"wx");if(f){fprintf(f,"{\"outcome\":%d,\"error\":%d,\"serial\":%u,\"target_epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u,\"blocks\":%u,\"owned_bytes\":%zu,\"arm_s\":%.9f,\"busy_observed_s\":%.9f,\"done_s\":%.9f,\"timeout_ms\":%u,\"epoch_after\":%llu}\n",outcome,rc,serial,(unsigned long long)target,tag,first,end,blocks,bytes,armed,busy,done,ms,(unsigned long long)epoch());fclose(f);}
  struct rusage usage;if(!getrusage(RUSAGE_SELF,&usage))fprintf(trace,"{\"event\":\"collector_resources\",\"time\":%.9f,\"user_cpu_s\":%.6f,\"system_cpu_s\":%.6f,\"max_rss_kib\":%ld}\n",now(),usage.ru_utime.tv_sec+usage.ru_utime.tv_usec/1e6,usage.ru_stime.tv_sec+usage.ru_stime.tv_usec/1e6,usage.ru_maxrss);
- fclose(trace);dlclose(lib);munmap((void*)r,4096);close(fd);close(lock);return rc?rc:(!outcome?7:0);
+ fclose(trace);library_done(lib);munmap((void*)r,4096);close(fd);close(lock);return rc?rc:(!outcome?7:0);
 }
 
 int main(int argc,char **argv){
  signal(SIGPIPE,SIG_IGN);
  if(argc==2&&!strcmp(argv[1],"--session")){
+  reuse_context=getenv("OBS_FIELD1_REUSE_CONTEXT")&&!strcmp(getenv("OBS_FIELD1_REUSE_CONTEXT"),"1");
   char line[768],prefix[512],extra;unsigned ms,tag;int rc=0;
   double due=now();unsigned interval_ms=getenv("OBS_FIELD1_INTERVAL_MS")?strtoul(getenv("OBS_FIELD1_INTERVAL_MS"),0,10):0;
   while(fgets(line,sizeof(line),stdin)){
@@ -203,6 +224,8 @@ int main(int argc,char **argv){
    if(rc==10)rc=0;
   }
   if(video_sock>=0)close(video_sock);
+  if(session_context){void (*destroy)(void*)=dlsym(session_library,"iio_context_destroy");if(destroy)destroy(session_context);}
+  if(session_library)dlclose(session_library);
   return rc;
  }
  int rc=capture(argc,argv);if(video_sock>=0)close(video_sock);return rc;
