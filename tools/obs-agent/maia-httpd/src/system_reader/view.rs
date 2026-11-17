@@ -36,6 +36,7 @@ pub fn decode(full:&[u8],view:&[u8],power:&mut[f32])->Result<Header,String>{
 /// and copy to owned memory. OFF never invokes copy_view.
 pub trait PairIo{
     fn snapshot(&mut self)->Result<Snapshot,String>;
+    fn fast_snapshot(&mut self)->Result<Snapshot,String>{self.snapshot()}
     fn batch_limit(&self)->usize{512}
     fn full_read(&self)->bool{true}
     fn prepare_prefix(&mut self,_first:u64,_end:u64)->Result<(),String>{Ok(())}
@@ -59,7 +60,7 @@ impl PairReader{
     /// Finish all DMA reads, release, then expose only the small owned VIEW.
     /// No full-spectrum queue or checksum is part of this path.
     pub fn service_released<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
-        let s=io.snapshot()?;
+        let s=io.fast_snapshot()?;
         if s.cookie!=self.run||s.released!=self.next||s.committed<self.next||s.committed>s.reserved||s.reserved-self.next>SLOTS as u64{return Err("r3 cursor/owner violation".into())}
         self.high_water=self.high_water.max(s.reserved-self.next);
         let end=s.committed.min(self.next+io.batch_limit() as u64);
