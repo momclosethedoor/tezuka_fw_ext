@@ -72,6 +72,14 @@ static int capture(int argc,char **argv){
  int tx_authorized=getenv("OBS_FIELD1_TX_AUTHORIZED")&&!strcmp(getenv("OBS_FIELD1_TX_AUTHORIZED"),"1");
  if(guard<0||ioctl(guard,0x4605,gs)||gs[0]!=2||gs[1]!=2||gs[2]||gs[112]!=(tx_authorized?0u:1u)){fprintf(stderr,"guard TX receipt differs from explicit series authorization\n");return 3;}
  close(guard);
+ /* Exact schedules can be offered seconds in advance. Wait with STREAM_RUN
+    still off, before allocating/arming IIO, so the bounded capture is not
+    consumed by pre-target bytes. Late admission is counted below. */
+ const char *scheduled=getenv("OBS_FIELD1_TARGET_EPOCH");
+ if(scheduled){
+  uint64_t requested=strtoull(scheduled,NULL,10);double wait_start=now();
+  while(epoch()+128<requested && now()-wait_start<5.0)usleep(1000);
+ }
  void *lib=dlopen("libiio.so.0",RTLD_NOW);if(!lib){fprintf(stderr,"dlopen: %s\n",dlerror());return 3;}
  LOAD(void*,iio_create_local_context,(void));LOAD(void*,iio_context_find_device,(void*,const char*));
  LOAD(void*,iio_device_find_channel,(void*,const char*,bool));LOAD(void,iio_channel_enable,(void*));
