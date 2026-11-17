@@ -120,7 +120,9 @@ static int capture(int argc,char **argv){
  void *ctx=session_context?session_context:iio_create_local_context();if(!ctx){perror("iio context");return 3;}
  double context_ready=now();if(reuse_context){session_context=ctx;session_library=lib;}
  void *dev=iio_context_find_device(ctx,"cf-ad9361-lpc");if(!dev){fprintf(stderr,"ADC device missing\n");return 3;}
- iio_context_set_timeout(ctx,250);iio_device_set_kernel_buffers_count(dev,4);
+ unsigned kernel_buffers=4;const char *depth_env=getenv("OBS_IIO_KERNEL_BUFFERS");
+ if(depth_env){kernel_buffers=strtoul(depth_env,NULL,10);if(kernel_buffers<2||kernel_buffers>16||(kernel_buffers&(kernel_buffers-1)))return 3;}
+ if(iio_context_set_timeout(ctx,250)||iio_device_set_kernel_buffers_count(dev,kernel_buffers))return 3;
  void *ch0=iio_device_find_channel(dev,"voltage0",false),*ch1=iio_device_find_channel(dev,"voltage1",false);if(!ch0||!ch1)return 3;
  iio_channel_enable(ch0);iio_channel_enable(ch1);
  unsigned block_samples=IIO_BLOCK_SAMPLES;const char *block_env=getenv("OBS_IIO_BLOCK_SAMPLES");
@@ -138,6 +140,7 @@ static int capture(int argc,char **argv){
  if(!no_delivery&&connect_video()){iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);close(fd);close(lock);return 9;}
  char path[512];snprintf(path,sizeof(path),"%s.trace.jsonl",argv[1]);FILE *trace=fopen(path,"wx");if(!trace)return 3;
  fprintf(trace,"{\"event\":\"iio_preparation\",\"time\":%.9f,\"context_s\":%.9f,\"buffer_s\":%.9f,\"ready_s\":%.9f,\"reuse_context\":%s}\n",now(),context_ready-prepare_start,buffer_ready-context_ready,now()-prepare_start,reuse_context?"true":"false");
+ fprintf(trace,"{\"event\":\"iio_geometry\",\"time\":%.9f,\"kernel_buffers\":%u,\"block_bytes\":%zu}\n",now(),kernel_buffers,block_bytes);
  fprintf(trace,"{\"event\":\"raw_policy_latched\",\"time\":%.9f,\"unqualified_raw\":%s}\n",now(),unqualified_raw?"true":"false");
  wr(0x288,tag);wr(0x28c,ms*62500u);if(rd(0x288)!=tag||rd(0x28c)!=ms*62500u)return 3;
  wr(0x284,1);double start=now(),armed=0,busy=0,done=0;uint64_t target=0;size_t bytes=0;unsigned blocks=0,status=0,serial=0,first=0,end=0,target_position=0,map_version=0;int outcome=0,rc=0;
@@ -183,7 +186,7 @@ static int capture(int argc,char **argv){
    if(!no_delivery){char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,bytes);if(packet(meta,p,(size_t)n)){rc=9;break;}}
    bytes+=(size_t)n;blocks++;
   }else if(n!=-EAGAIN){fprintf(trace,"{\"event\":\"iio_error\",\"code\":%zd}\n",n);rc=4;break;}
-  status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
+  t=now();status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
    fprintf(trace,"{\"event\":\"busy\",\"time\":%.9f,\"epoch\":%llu,\"position\":%u,\"map_version\":%u,\"field_status\":%u,\"fld_status\":%u,\"marker_id\":%u}\n",t,(unsigned long long)epoch(),target_position,map_version,status,rd(0x228),rd(0x240));
    if(next_on_busy){int g=open("/dev/obs_fl_guard",O_RDWR);unsigned v[128]={0};int result=g<0?-1:ioctl(g,0x4603,v);if(g>=0)close(g);fprintf(trace,"{\"event\":\"map_next_during_busy\",\"time\":%.9f,\"result\":%d,\"epoch\":%llu,\"field_status\":%u,\"version\":%u}\n",now(),result,(unsigned long long)epoch(),rd(0x294),rd(0x22c));if(result){rc=8;break;}}
    if(route_case){char msg[512];int n=snprintf(msg,sizeof(msg),"{\"marker_id\":%u,\"epoch\":%llu,\"version\":%u,\"position\":%u,\"route\":%u,\"a9_send_s\":%.9f,\"test\":\"%s\"}\n",route_id,(unsigned long long)target,map_version,target_position,rd(0x244),now(),route_case);if(sendall(route_sock,msg,n)){rc=8;break;}fprintf(trace,"{\"event\":\"route_request\",\"time\":%.9f,\"marker_id\":%u}\n",now(),route_id);}
