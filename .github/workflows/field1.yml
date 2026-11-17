@@ -2,7 +2,7 @@ name: OBS007A FIELD1 collector
 on:
   push:
     branches: [build/obs007c-arm-mode]
-    paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-iio-copy.h', 'tools/obs-guard/test-iio-copy.c', 'tools/obs-guard/obs-watch-policy.h', 'tools/obs-guard/obs-watch-io.h', 'tools/obs-guard/test-watch-io.c', 'tools/obs-guard/test-watch-policy.c', 'tools/obs-guard/obs-transport-queue.h', 'tools/obs-guard/test-transport-queue.c', 'tools/obs-guard/obs-route-ack.c', 'tools/obs-guard/obs-iq-snapshot.c', '.github/workflows/field1.yml']
+    paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-cpu-profile.c', 'tools/obs-guard/obs-iio-copy.h', 'tools/obs-guard/test-iio-copy.c', 'tools/obs-guard/obs-watch-policy.h', 'tools/obs-guard/obs-watch-io.h', 'tools/obs-guard/test-watch-io.c', 'tools/obs-guard/test-watch-policy.c', 'tools/obs-guard/obs-transport-queue.h', 'tools/obs-guard/test-transport-queue.c', 'tools/obs-guard/obs-route-ack.c', 'tools/obs-guard/obs-iq-snapshot.c', '.github/workflows/field1.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -33,6 +33,7 @@ jobs:
           cc -std=c11 -O2 -Wall -Wextra -Werror tools/obs-guard/test-iio-copy.c -o /tmp/test-iio-copy
           /tmp/test-iio-copy
           mkdir artifact
+          output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/obs-cpu-profile.c -o artifact/obs-cpu-profile
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/test-iio-copy.c -o artifact/test-iio-copy
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/obs-field1.c -ldl -o artifact/obs-field1
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation tools/obs-guard/obs-route-ack.c -o artifact/obs-route-ack
@@ -40,7 +41,7 @@ jobs:
           output/nano/host/bin/arm-linux-readelf -h -A artifact/obs-field1 > artifact/elf.txt
           sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-watch-policy.h tools/obs-guard/obs-watch-io.h tools/obs-guard/obs-transport-queue.h tools/obs-guard/obs-iio-copy.h > artifact/source.sha256
           cd artifact
-          sha256sum obs-field1 test-iio-copy obs-route-ack obs-iq-snapshot elf.txt source.sha256 > SHA256SUMS
+          sha256sum obs-field1 obs-cpu-profile test-iio-copy obs-route-ack obs-iq-snapshot elf.txt source.sha256 > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
           name: obs007c-field1-collector
