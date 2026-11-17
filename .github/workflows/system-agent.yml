@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obs007c-arm-mode]
+    branches: [build/obs007c-ring512-perf]
     paths: ['tools/obs-agent/**', '.github/workflows/system-agent.yml']
   workflow_dispatch:
 permissions:
@@ -59,5 +59,5 @@ jobs:
           sha256sum maia-httpd elf.txt source-sha256.txt > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: obs007c-main-agent
+          name: obs007c-ring512-agent
           path: agent-artifact/
