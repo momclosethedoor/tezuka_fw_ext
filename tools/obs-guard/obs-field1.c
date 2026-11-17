@@ -31,7 +31,7 @@ static void wr(unsigned o,uint32_t x){r[o/4]=x;__sync_synchronize();}
 static uint64_t epoch(void){uint32_t h,l,b;do{h=rd(0x184);l=rd(0x180);b=rd(0x184);}while(h!=b);return ((uint64_t)h<<32)|l;}
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 /* One TCP session carries many attempts; the IIO block remains owned until
- * send returns. No field-sized allocation, raw file, checksum or line parser. */
+ * local TCP accepts it, or it is copied to a bounded reusable transport block. */
 static int video_sock=-1;
 static uint64_t wire_bytes=0,wire_chunks=0;
 static double wire_send_s=0;
@@ -44,8 +44,8 @@ static int connect_video(void){
  struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(18009)};inet_pton(AF_INET,"192.168.2.10",&a.sin_addr);
  if(connect(s,(void*)&a,sizeof(a))){close(s);return -1;}if(fcntl(s,F_SETFL,fcntl(s,F_GETFL,0)|O_NONBLOCK)){close(s);return -1;}video_sock=s;return 0;
 }
-/* At most one in-flight packet refers to an owned IIO block. Metadata and
- * header storage are fixed; the payload is never copied into an ARM queue. */
+/* One active packet references either IIO (direct variant) or a protected
+ * transport block. Header and metadata storage are fixed. */
 static struct {uint32_t header[3];char meta[2048];struct iovec vec[3];
  struct msghdr msg;double started;size_t wire_size;int active;} tx;
 static void packet_abort(void){if(video_sock>=0)close(video_sock);video_sock=-1;tx.active=0;}
@@ -197,24 +197,36 @@ static int capture(int argc,char **argv){
  fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
  size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
  double refill_s=0,copy_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
- double loop_due=now(),loop_gap_max_s=0;
+ double loop_due=now(),loop_gap_max_s=0;unsigned copied_refills=0,send_with_iio_owned=0;int fault_seen=0;
  while(!rc&&now()-start<CAPTURE_SECONDS){
   double tick=now();if(tick-loop_due>loop_gap_max_s)loop_gap_max_s=tick-loop_due;loop_due=tick;
   if(transport_depth){
-   /* Refill returns the preceding copied block immediately; a ready next
-      block may remain owned only in the one-buffer comparison variant. */
-   if(!held_bytes&&!input_closed&&(!outcome||(outcome==1&&received_bytes<end)||return_due)){
-    double t0=now();ssize_t n=iio_buffer_refill(buf);double t1=now();refill_s+=t1-t0;
-    if(return_due){if(t1-return_due>iio_hold_max_s)iio_hold_max_s=t1-return_due;return_due=0;}
-    if(n>0){held_bytes=(size_t)n;held_since=t1;}else if(n!=-EAGAIN){rc=4;break;}
-   }
-   if(held_bytes&&(transport_depth>1||!queue.count)){
+   /* Drain a bounded burst before socket work. Each copied DMA block is
+      returned by the very next refill, including when refill yields EAGAIN.
+      Only depth=1 or sustained overload can leave a newly dequeued block held. */
+   unsigned budget=kernel_buffers+1;
+   while(!input_closed&&budget--){
+    if(!held_bytes&&(!outcome||(outcome==1&&received_bytes<end)||return_due)){
+     double t0=now();ssize_t n=iio_buffer_refill(buf);double t1=now();refill_s+=t1-t0;
+     if(return_due){if(t1-return_due>iio_hold_max_s)iio_hold_max_s=t1-return_due;return_due=0;copied_refills++;}
+     if(n>0){held_bytes=(size_t)n;held_since=t1;}else if(n!=-EAGAIN){rc=4;break;}
+    }
+    if(!held_bytes||!(transport_depth>1||!queue.count))break;
     uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
     if(held_bytes>span||received_bytes+held_bytes>capture_limit){rc=4;break;}
     double t0=now();int pushed=no_delivery?0:tq_push(&queue,p,held_bytes,received_bytes);copy_s+=now()-t0;
     if(pushed){rc=4;break;}
     received_bytes+=held_bytes;received_blocks++;if(no_delivery){bytes=received_bytes;blocks=received_blocks;}
     return_due=held_since;held_bytes=0;
+   }
+   if(rc)break;
+   /* Always return the last copied block before touching the socket, even
+      when the burst budget is exhausted. Preserve any newly dequeued block. */
+   if(return_due&&!input_closed){
+    double t0=now();ssize_t n=iio_buffer_refill(buf);double t1=now();refill_s+=t1-t0;
+    if(t1-return_due>iio_hold_max_s)iio_hold_max_s=t1-return_due;
+    return_due=0;copied_refills++;
+    if(n>0){held_bytes=(size_t)n;held_since=t1;}else if(n!=-EAGAIN){rc=4;break;}
    }
    if(!pending_bytes&&queue.count){
     int slot=tq_start(&queue);if(slot<0){rc=4;break;}
@@ -231,12 +243,14 @@ static int capture(int argc,char **argv){
     else{bytes+=(size_t)n;blocks++;}
    }else if(n!=-EAGAIN){rc=4;break;}
   }
-  if(pending_bytes){double t0=now();int sent=packet_pump();queue_wait_s+=now()-t0;if(sent<0){rc=9;break;}
+  if(pending_bytes){if(transport_depth&&held_bytes)send_with_iio_owned++;double t0=now();int sent=packet_pump();queue_wait_s+=now()-t0;if(sent<0){rc=9;break;}
    if(sent){bytes+=pending_bytes;pending_bytes=0;blocks++;if(transport_depth){if(tq_finish(&queue)){rc=4;break;}}else if(now()-held_since>iio_hold_max_s)iio_hold_max_s=now()-held_since;}
    else send_wait_polls++;
   }
   double t;
-  t=now();status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
+  t=now();status=rd(0x294);
+  if((status&16)&&!fault_seen){fault_seen=1;fprintf(trace,"{\"event\":\"first_stream_fault\",\"time\":%.9f,\"status\":%u,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"queue_blocks\":%u,\"held_bytes\":%zu}\n",t,status,received_bytes,bytes,queue.count,held_bytes);}
+  if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
    fprintf(trace,"{\"event\":\"busy\",\"time\":%.9f,\"epoch\":%llu,\"position\":%u,\"map_version\":%u,\"field_status\":%u,\"fld_status\":%u,\"marker_id\":%u}\n",t,(unsigned long long)epoch(),target_position,map_version,status,rd(0x228),rd(0x240));
    if(next_on_busy){int g=open("/dev/obs_fl_guard",O_RDWR);unsigned v[128]={0};int result=g<0?-1:ioctl(g,0x4603,v);if(g>=0)close(g);fprintf(trace,"{\"event\":\"map_next_during_busy\",\"time\":%.9f,\"result\":%d,\"epoch\":%llu,\"field_status\":%u,\"version\":%u}\n",now(),result,(unsigned long long)epoch(),rd(0x294),rd(0x22c));if(result){rc=8;break;}}
    if(route_case){char msg[512];int n=snprintf(msg,sizeof(msg),"{\"marker_id\":%u,\"epoch\":%llu,\"version\":%u,\"position\":%u,\"route\":%u,\"a9_send_s\":%.9f,\"test\":\"%s\"}\n",route_id,(unsigned long long)target,map_version,target_position,rd(0x244),now(),route_case);if(sendall(route_sock,msg,n)){rc=8;break;}fprintf(trace,"{\"event\":\"route_request\",\"time\":%.9f,\"marker_id\":%u}\n",now(),route_id);}
@@ -251,7 +265,10 @@ static int capture(int argc,char **argv){
    if(s0!=rd(0x298)||st0!=rd(0x294))continue;
    serial=s0;outcome=(st0>>1)&7;
    if(!done){done=t;fprintf(trace,"{\"event\":\"pl_done\",\"time\":%.9f,\"outcome\":%d,\"epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u}\n",t,outcome,(unsigned long long)e,rt,first,end);}
-   if(e!=target||rt!=tag||rd(0x294)&16){rc=5;break;}
+   unsigned final_status=rd(0x294);
+   if(e!=target||rt!=tag||(final_status&16)){
+    fprintf(trace,"{\"event\":\"field_rejected\",\"time\":%.9f,\"status\":%u,\"expected_epoch\":%llu,\"actual_epoch\":%llu,\"expected_tag\":%u,\"actual_tag\":%u}\n",now(),final_status,(unsigned long long)target,(unsigned long long)e,tag,rt);rc=5;break;
+   }
    if(outcome!=1){
     if(transport_depth&&!input_closed){wr(0x284,0);iio_buffer_destroy(buf);buf=NULL;input_closed=1;held_bytes=0;return_due=0;}
     if(pending_bytes||queue.count){usleep(100);continue;}
@@ -269,6 +286,7 @@ static int capture(int argc,char **argv){
  }
  if(tx.active){packet_abort();if(!rc)rc=9;}
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
+ fprintf(trace,"{\"event\":\"iio_return_order\",\"time\":%.9f,\"copied_refills\":%u,\"send_with_iio_owned\":%u}\n",now(),copied_refills,send_with_iio_owned);
  fprintf(trace,"{\"event\":\"transport_phases\",\"time\":%.9f,\"depth\":%u,\"queue_high\":%u,\"queue_drop_blocks\":%llu,\"queue_drop_bytes\":%llu,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"refill_s\":%.9f,\"copy_s\":%.9f,\"send_syscall_s\":%.9f,\"iio_hold_max_s\":%.9f,\"loop_gap_max_s\":%.9f}\n",now(),transport_depth,queue.high,(unsigned long long)queue.dropped_blocks,(unsigned long long)queue.dropped_bytes,received_bytes,bytes,refill_s,copy_s,queue_wait_s,iio_hold_max_s,loop_gap_max_s);
  double payload_complete=now();
  wr(0x290,2);wr(0x284,0);if(buf)iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
