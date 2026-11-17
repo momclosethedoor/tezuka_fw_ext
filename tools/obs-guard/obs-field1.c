@@ -33,7 +33,7 @@ static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);retu
 /* One TCP session carries many attempts; the IIO block remains owned until
  * local TCP accepts it, or it is copied to a bounded reusable transport block. */
 static int video_sock=-1;
-static uint64_t wire_bytes=0,wire_chunks=0;
+static uint64_t wire_bytes=0,wire_chunks=0,wire_accepted=0;
 static double wire_send_s=0;
 static int sendall(int s,const void *p,size_t n){const uint8_t *b=p;while(n){ssize_t k=send(s,b,n,MSG_NOSIGNAL);if(k<0&&errno==EINTR)continue;if(k<=0)return -1;b+=k;n-=k;}return 0;}
 static int connect_video(void){
@@ -63,6 +63,7 @@ static int packet_pump(void){
  ssize_t k=sendmsg(video_sock,&tx.msg,MSG_NOSIGNAL);
  if(k<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return 0;
  if(k<=0){packet_abort();return -1;}
+ wire_accepted+=(size_t)k;
  size_t used=(size_t)k;
  while(tx.msg.msg_iovlen&&used>=tx.msg.msg_iov[0].iov_len){used-=tx.msg.msg_iov[0].iov_len;tx.msg.msg_iov++;tx.msg.msg_iovlen--;}
  if(used&&tx.msg.msg_iovlen){tx.msg.msg_iov[0].iov_base=(uint8_t*)tx.msg.msg_iov[0].iov_base+used;tx.msg.msg_iov[0].iov_len-=used;}
@@ -89,6 +90,7 @@ static int missed_early(const char *prefix,unsigned tag,uint64_t target,uint64_t
 #define LOAD(ret,n,args) ret(*n)args=dlsym(lib,#n);if(!n){fprintf(stderr,"missing %s\n",#n);return 3;}
 static int capture(int argc,char **argv){
  double capture_enter=now();
+ int idle_only=getenv("OBS_FIELD1_IDLE_ONLY")&&!strcmp(getenv("OBS_FIELD1_IDLE_ONLY"),"1");
  if(argc!=4&&argc!=5){fprintf(stderr,"usage: obs-field1 output-prefix timeout-ms tag [--unqualified-raw]\n");return 2;}
  if(argc==5&&strcmp(argv[4],"--unqualified-raw"))return 2;
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
@@ -198,7 +200,10 @@ static int capture(int argc,char **argv){
  size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
  double refill_s=0,copy_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
  double loop_due=now(),loop_gap_max_s=0;unsigned copied_refills=0,send_with_iio_owned=0;int fault_seen=0;
+ double sleep_s=0,sleep_max_s=0;unsigned sleep_calls=0,progress_turns=0;
+ double service_started=now();struct timespec cpu_begin,cpu_end;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_begin);
  while(!rc&&now()-start<CAPTURE_SECONDS){
+  size_t received_before=received_bytes;uint64_t accepted_before=wire_accepted;
   double tick=now();if(tick-loop_due>loop_gap_max_s)loop_gap_max_s=tick-loop_due;loop_due=tick;
   if(transport_depth){
    /* Drain a bounded burst before socket work. Each copied DMA block is
@@ -271,7 +276,7 @@ static int capture(int argc,char **argv){
    }
    if(outcome!=1){
     if(transport_depth&&!input_closed){wr(0x284,0);iio_buffer_destroy(buf);buf=NULL;input_closed=1;held_bytes=0;return_due=0;}
-    if(pending_bytes||queue.count){usleep(100);continue;}
+    if(pending_bytes||queue.count)goto idle_service;
     if(!route_case||route_acked)break;else continue;
    }
    if(end<first||end>capture_limit){rc=5;break;}
@@ -282,8 +287,20 @@ static int capture(int argc,char **argv){
    }
    if(bytes>=end&&!pending_bytes&&!queue.count&&(!route_case||route_acked))break;
   }
-  usleep(100);
+ idle_service:
+  /* A completed copy/send is work, not a reason to delay the next block.
+     EAGAIN without progress still sleeps; no busy polling or new thread. */
+  if(received_bytes!=received_before||wire_accepted!=accepted_before){
+   progress_turns++;if(idle_only)continue;
+  }
+  {double t0=now();usleep(100);double dt=now()-t0;sleep_s+=dt;
+   if(dt>sleep_max_s)sleep_max_s=dt;
+   sleep_calls++;}
  }
+ clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_end);
+ double service_wall_s=now()-service_started;
+ double service_cpu_s=(cpu_end.tv_sec-cpu_begin.tv_sec)+(cpu_end.tv_nsec-cpu_begin.tv_nsec)*1e-9;
+ fprintf(trace,"{\"event\":\"service_wait\",\"time\":%.9f,\"idle_only\":%s,\"sleep_calls\":%u,\"sleep_s\":%.9f,\"sleep_max_s\":%.9f,\"progress_turns\":%u,\"service_wall_s\":%.9f,\"service_cpu_s\":%.9f}\n",now(),idle_only?"true":"false",sleep_calls,sleep_s,sleep_max_s,progress_turns,service_wall_s,service_cpu_s);
  if(tx.active){packet_abort();if(!rc)rc=9;}
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
  fprintf(trace,"{\"event\":\"iio_return_order\",\"time\":%.9f,\"copied_refills\":%u,\"send_with_iio_owned\":%u}\n",now(),copied_refills,send_with_iio_owned);
