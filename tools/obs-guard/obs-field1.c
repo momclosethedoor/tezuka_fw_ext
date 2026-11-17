@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <poll.h>
+#include "obs-watch-io.h"
 #include "obs-transport-queue.h"
 static struct transport_queue queue;
 #include <sys/resource.h>
@@ -86,6 +87,22 @@ static int packet(const char *meta,const void *raw,size_t n){
    buffer, creates an empty generation and assigns a fresh stream tag. */
 static void *session_context=NULL,*session_library=NULL;
 static int reuse_context=0;
+static struct watch_input watching;
+static int watch_active=0,watch_owner=-1;
+static double watch_until=0;
+static unsigned watch_position=0;
+static struct watch_target watch_selected;
+static uint64_t watch_revision=0;
+static unsigned watch_saved_nco,watch_saved_code;static int watch_saved=0;
+/* 11: explicitly removed/replaced; 12: bounded bench window ended.
+ * Neither completion nor cancellation consumes a desired-state flag. */
+static int watch_check(void){
+ if(!watch_active)return 0;
+ if(now()>=watch_until)return 12;
+ if(watch_refresh(&watching))return 13;
+ if(watching.map.version!=rd(0x22c)||watching.map.count!=rd(0x1e8))return 13;
+ return watch_same(&watching.map,watch_position,&watch_selected)?0:11;
+}
 static void context_done(void (*destroy)(void*),void *ctx){if(!reuse_context)destroy(ctx);}
 static void library_done(void *lib){if(!reuse_context)dlclose(lib);}
 static int missed_early(const char *prefix,unsigned tag,uint64_t target,uint64_t current,double setup){
@@ -109,7 +126,7 @@ static int capture(int argc,char **argv){
  int unqualified_raw=argc==5||(getenv("OBS_FIELD1_UNQUALIFIED_RAW")&&!strcmp(getenv("OBS_FIELD1_UNQUALIFIED_RAW"),"1"));
  FILE *policy=fopen("/tmp/obs007a-field-system/unqualified-raw","r");if(policy){unqualified_raw|=fgetc(policy)=='1';fclose(policy);}
  unsigned ms=strtoul(argv[2],0,0),tag=strtoul(argv[3],0,0);if(!ms||ms>68719||!tag)return 2;
- int lock=open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 2;
+ int lock=watch_active?dup(watch_owner):open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 2;
  int fd=open("/dev/mem",O_RDWR|O_SYNC);r=mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x7c460000);
  if(r==MAP_FAILED||rd(0x280)!=0x31444c46)return 3;
  /* PHY sysfs callbacks are intentionally denied while PL owns SPI. The
@@ -174,11 +191,24 @@ static int capture(int argc,char **argv){
  fprintf(trace,"{\"event\":\"iio_geometry\",\"time\":%.9f,\"kernel_buffers\":%u,\"block_bytes\":%zu}\n",now(),kernel_buffers,block_bytes);
  fprintf(trace,"{\"event\":\"raw_policy_latched\",\"time\":%.9f,\"unqualified_raw\":%s}\n",now(),unqualified_raw?"true":"false");
  wr(0x288,tag);wr(0x28c,ms*62500u);if(rd(0x288)!=tag||rd(0x28c)!=ms*62500u)return 3;
- wr(0x284,1);double start=now(),armed=0,busy=0,done=0;uint64_t target=0;size_t bytes=0;unsigned blocks=0,status=0,serial=0,first=0,end=0,target_position=0,map_version=0;int outcome=0,rc=0;
+ double start=now(),armed=0,busy=0,done=0;uint64_t target=0;size_t bytes=0;unsigned blocks=0,status=0,serial=0,first=0,end=0,target_position=0,map_version=0;int outcome=0,rc=0,watch_cancelled=0;uint64_t target_hz=0;
  /* A target two visits ahead avoids the multi-register write race. */
  uint64_t current_epoch;unsigned current_position;do{current_epoch=epoch();current_position=rd(0x234);}while(current_epoch!=epoch());
  unsigned advance=2;const char *want_env=getenv("OBS_FIELD1_POSITION"),*count_env=getenv("OBS_FIELD1_POSITIONS");
  if(want_env&&count_env){unsigned wanted=strtoul(want_env,0,0),count=strtoul(count_env,0,0);if(!count||count>128||wanted>=count){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);return 3;}while((current_position+advance)%count!=wanted)advance++;}
+ if(watch_active){
+  if(watch_refresh(&watching)||watching.map.version!=rd(0x22c)||watching.map.count!=rd(0x1e8))rc=13;
+  int selected=rc?-1:watch_next(&watching.map,current_position,&advance);
+  if(selected<0&&!rc)rc=11;
+  if(!rc){
+   watch_position=(unsigned)selected;watch_selected=watching.map.target[selected];watch_revision=watching.map.revision;
+   target_hz=watch_selected.hz;target_position=watch_position;map_version=watching.map.version;
+   if(!watch_saved){watch_saved_nco=rd(0x30);watch_saved_code=rd(0x40);watch_saved=1;}
+   wr(0x30,watch_selected.nco);wr(0x40,watch_selected.code);
+   if(rd(0x30)!=watch_selected.nco||rd(0x40)!=watch_selected.code)rc=13;
+  }
+  if(rc){iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);fclose(trace);library_done(lib);munmap((void*)r,4096);close(fd);close(lock);return rc;}
+ }
  target=current_epoch+advance;
  const char *exact=getenv("OBS_FIELD1_TARGET_EPOCH");
  if(exact){
@@ -191,6 +221,7 @@ static int capture(int argc,char **argv){
    fclose(trace);library_done(lib);munmap((void*)r,4096);close(fd);close(lock);return 10;
   }
  }
+ wr(0x284,1);
  fprintf(trace,"{\"event\":\"generation_ready\",\"time\":%.9f,\"setup_s\":%.9f,\"requested_epoch\":%llu}\n",now(),now()-capture_enter,(unsigned long long)target);
  if(route_case){
   uint64_t marker_epoch=((uint64_t)rd(0x250)<<32)|rd(0x24c);
@@ -201,12 +232,13 @@ static int capture(int argc,char **argv){
   if(connect(route_sock,(void*)&a,sizeof(a)))return 3;
  }
  if(!no_delivery){
-  char meta[768];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
+  char meta[768];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,\"target_hz\":%llu,\"target_position\":%u,\"map_version\":%u,\"watch_revision\":%llu,\"watch_generation\":%llu,\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,(unsigned long long)target_hz,target_position,map_version,(unsigned long long)(watch_active?watch_revision:0),(unsigned long long)(watch_active?watch_selected.generation:0),block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
   if(packet(meta,NULL,0)){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);fclose(trace);close(fd);close(lock);return 9;}
  }
  /* BEGIN transport can yield. Recheck the exact visit immediately before
     FIELD ARM so a socket delay becomes a counted missed request. */
- if(exact && target<epoch()+2)rc=10;
+ if((exact||watch_active) && target<epoch()+2)rc=10;
+ if(watch_active&&!rc)rc=watch_check();
  if(!rc){wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();}
  fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
  size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
@@ -215,6 +247,14 @@ static int capture(int argc,char **argv){
  double ready_wait_s=0,ready_wait_max_s=0;unsigned ready_wait_calls=0,progress_turns=0;
  double service_started=now();struct timespec cpu_begin,cpu_end;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_begin);
  while(!rc&&now()-start<CAPTURE_SECONDS){
+  if(watch_active&&!watch_cancelled){
+   watch_cancelled=watch_check();
+   if(watch_cancelled){
+    wr(0x290,2);wr(0x284,0);
+    if(buf){iio_buffer_destroy(buf);buf=NULL;}input_closed=1;held_bytes=0;return_due=0;
+    fprintf(trace,"{\"event\":\"watch_cancel\",\"time\":%.9f,\"reason\":%d,\"watch_revision\":%llu,\"current_revision\":%llu}\n",now(),watch_cancelled,(unsigned long long)watch_revision,(unsigned long long)watching.map.revision);
+   }
+  }
   size_t received_before=received_bytes;uint64_t accepted_before=wire_accepted;
   double tick=now();if(tick-loop_due>loop_gap_max_s)loop_gap_max_s=tick-loop_due;loop_due=tick;
   if(transport_depth){
@@ -264,6 +304,7 @@ static int capture(int argc,char **argv){
    if(sent){bytes+=pending_bytes;pending_bytes=0;blocks++;if(transport_depth){if(tq_finish(&queue)){rc=4;break;}}else if(now()-held_since>iio_hold_max_s)iio_hold_max_s=now()-held_since;}
    else send_wait_polls++;
   }
+  if(watch_cancelled){if(pending_bytes||queue.count)goto idle_service;break;}
   double t;
   t=now();status=rd(0x294);
   if((status&16)&&!fault_seen){fault_seen=1;fprintf(trace,"{\"event\":\"first_stream_fault\",\"time\":%.9f,\"status\":%u,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"queue_blocks\":%u,\"held_bytes\":%zu}\n",t,status,received_bytes,bytes,queue.count,held_bytes);}
@@ -303,13 +344,15 @@ static int capture(int argc,char **argv){
   /* Never delay ready work. Only the descriptors that can unblock service
      enter poll; its timeout is the capture/packet deadline, not a cadence. */
   if(received_bytes!=received_before||wire_accepted!=accepted_before){progress_turns++;continue;}
-  struct pollfd ready_fds[3];nfds_t ready_count=0;
+  struct pollfd ready_fds[4];nfds_t ready_count=0;
   if(!input_closed&&!held_bytes&&(transport_depth||!pending_bytes))
    ready_fds[ready_count++]=(struct pollfd){iio_poll_fd,POLLIN|POLLOUT,0};
   if(tx.active)ready_fds[ready_count++]=(struct pollfd){video_sock,POLLOUT,0};
   if(route_sock>=0&&!route_acked)ready_fds[ready_count++]=(struct pollfd){route_sock,POLLIN,0};
+  if(watch_active&&!watch_cancelled)ready_fds[ready_count++]=(struct pollfd){watching.fd,POLLIN,0};
   if(ready_count){
    double limit=start+CAPTURE_SECONDS;if(tx.active&&tx.started+1.0<limit)limit=tx.started+1.0;
+   if(watch_active&&!watch_cancelled&&watch_until<limit)limit=watch_until;
    double remaining=limit-now();if(remaining<=0)continue;
    double t0=now();int ready=poll(ready_fds,ready_count,(int)(remaining*1000)+1);
    double dt=now()-t0;ready_wait_s+=dt;if(dt>ready_wait_max_s)ready_wait_max_s=dt;ready_wait_calls++;
@@ -321,6 +364,8 @@ static int capture(int argc,char **argv){
  double service_wall_s=now()-service_started;
  double service_cpu_s=(cpu_end.tv_sec-cpu_begin.tv_sec)+(cpu_end.tv_nsec-cpu_begin.tv_nsec)*1e-9;
  fprintf(trace,"{\"event\":\"service_wait\",\"time\":%.9f,\"policy\":\"descriptor-readiness-no-sleep\",\"ready_wait_calls\":%u,\"ready_wait_s\":%.9f,\"ready_wait_max_s\":%.9f,\"progress_turns\":%u,\"service_wall_s\":%.9f,\"service_cpu_s\":%.9f}\n",now(),ready_wait_calls,ready_wait_s,ready_wait_max_s,progress_turns,service_wall_s,service_cpu_s);
+ if(!rc&&watch_cancelled)rc=watch_cancelled;
+ if(watch_active&&!rc)rc=watch_check();
  if(tx.active){packet_abort();if(!rc)rc=9;}
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
  fprintf(trace,"{\"event\":\"iio_return_order\",\"time\":%.9f,\"copied_refills\":%u,\"send_with_iio_owned\":%u}\n",now(),copied_refills,send_with_iio_owned);
@@ -333,7 +378,7 @@ static int capture(int argc,char **argv){
     END qualifies the provisional byte stream; no ARM frame ACK is returned. */
  if(!outcome&&!rc)rc=7;
  if(!no_delivery&&video_sock>=0){
-  char meta[1024];snprintf(meta,sizeof(meta),"{\"kind\":\"end\",\"stream_tag\":%u,\"epoch\":%llu,\"target_hz\":0,\"target_position\":%u,\"map_version\":%u,\"serial\":%u,\"first\":%u,\"end\":%u,\"generation_bytes\":%zu,\"pl_outcome\":%d,\"error\":%d,\"qualified_field\":%s,\"a9_send_monotonic_s\":%.9f}",tag,(unsigned long long)target,target_position,map_version,serial,first,end,bytes,outcome,rc,outcome==1&&!rc&&bytes>=end?"true":"false",now());
+  char meta[1024];snprintf(meta,sizeof(meta),"{\"kind\":\"end\",\"stream_tag\":%u,\"epoch\":%llu,\"target_hz\":%llu,\"watch_revision\":%llu,\"watch_generation\":%llu,\"target_position\":%u,\"map_version\":%u,\"serial\":%u,\"first\":%u,\"end\":%u,\"generation_bytes\":%zu,\"pl_outcome\":%d,\"error\":%d,\"qualified_field\":%s,\"a9_send_monotonic_s\":%.9f}",tag,(unsigned long long)target,(unsigned long long)target_hz,(unsigned long long)(watch_active?watch_revision:0),(unsigned long long)(watch_active?watch_selected.generation:0),target_position,map_version,serial,first,end,bytes,outcome,rc,outcome==1&&!rc&&bytes>=end?"true":"false",now());
   if(packet(meta,NULL,0))rc=9;
  }
  fprintf(trace,"{\"event\":\"stream_delivery\",\"time\":%.9f,\"wire_bytes\":%llu,\"messages\":%llu,\"send_s\":%.9f,\"payload_bytes\":%zu,\"error\":%d}\n",now(),(unsigned long long)(wire_bytes-sent_before),(unsigned long long)(wire_chunks-chunks_before),wire_send_s-send_before,bytes,rc);
@@ -343,8 +388,65 @@ static int capture(int argc,char **argv){
  fclose(trace);library_done(lib);munmap((void*)r,4096);close(fd);close(lock);return rc?rc:(!outcome?7:0);
 }
 
+static int watch_session(int argc,char **argv){
+ if(argc!=7){fprintf(stderr,"usage: obs-field1 --watch prefix map.bin seconds timeout-ms first-tag\n");return 2;}
+ if(strspn(argv[2],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[2])||strlen(argv[2])>400)return 2;
+ char *endptr;unsigned seconds=strtoul(argv[4],&endptr,10);if(*endptr||!seconds||seconds>120)return 2;
+ unsigned ms=strtoul(argv[5],&endptr,10);if(*endptr||!ms||ms>1000)return 2;
+ unsigned long long tag0=strtoull(argv[6],&endptr,10);if(*endptr||!tag0||tag0>UINT32_MAX-65536)return 2;
+ /* All watch attempts use bounded copied transport, so cancel returns IIO
+    immediately and can finish any already-started TCP packet from owned RAM. */
+ const char *depth=getenv("OBS_TX_BLOCKS");if(!depth||strtoul(depth,NULL,10)<2)return 2;
+ if(getenv("OBS_FIELD1_ROUTE_CASE")||getenv("OBS_FIELD1_NEXT_ON_BUSY"))return 2;
+ unsetenv("OBS_FIELD1_TARGET_EPOCH");unsetenv("OBS_FIELD1_POSITION");
+ if(watch_open(&watching,argv[3])){fprintf(stderr,"invalid watch map\n");return 13;}
+ watch_owner=open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);
+ if(watch_owner<0||flock(watch_owner,LOCK_EX|LOCK_NB))return 2;
+ reuse_context=1;watch_active=1;watch_until=now()+seconds;int rc=0;unsigned attempts=0;
+ while(now()<watch_until){
+  if(watch_refresh(&watching)){rc=13;break;}
+  if(!watching.map.enabled){
+   struct pollfd f={watching.fd,POLLIN,0};double remaining=watch_until-now();if(remaining<=0)break;
+   if(poll(&f,1,(int)(remaining*1000)+1)<0&&errno!=EINTR){rc=13;break;}
+   continue;
+  }
+  if(attempts>=65536){rc=13;break;}
+  char prefix[512],id[32];snprintf(prefix,sizeof(prefix),"%s-%u",argv[2],attempts+1);snprintf(id,sizeof(id),"%llu",tag0+attempts);
+  char *args[]={argv[0],prefix,argv[5],id};attempts++;rc=capture(4,args);
+  printf("WATCH_ATTEMPT %u %d %llu %u %llu\n",attempts,rc,(unsigned long long)watch_revision,watch_position,(unsigned long long)watch_selected.generation);fflush(stdout);
+  if(rc==12){rc=0;break;}
+  if(rc&&rc!=10&&rc!=11)break;
+  rc=0;
+ }
+ /* Fail closed even if a preparation failure returned before normal cleanup.
+    Keep the session lease until the producer is stopped. Never retake SPI. */
+ int g=open("/dev/obs_fl_guard",O_RDONLY);uint32_t state[128]={0};
+ if(g>=0&&!ioctl(g,0x4605,state)&&state[1]==2&&!state[2]){
+  int mem=open("/dev/mem",O_RDWR|O_SYNC);
+  volatile uint32_t *regs=mem<0?MAP_FAILED:mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,mem,0x7c460000);
+  if(regs!=MAP_FAILED){
+   r=regs;if(rd(0x280)==0x31444c46){
+    wr(0x290,2);wr(0x284,0);double deadline=now()+0.1;
+    while((rd(0x294)&0xc1)&&now()<deadline){}
+    if(rd(0x294)&0xc1)rc=13;
+    if(watch_saved){wr(0x30,watch_saved_nco);wr(0x40,watch_saved_code);}
+   }else rc=13;
+   munmap((void*)regs,4096);
+  }else rc=13;
+  if(mem>=0)close(mem);
+ }
+ if(g>=0)close(g);
+ if(video_sock>=0)close(video_sock);
+ if(session_context){void (*destroy)(void*)=dlsym(session_library,"iio_context_destroy");if(destroy)destroy(session_context);}
+ if(session_library)dlclose(session_library);
+ close(watch_owner);close(watching.fd);
+ printf("WATCH_STOP attempts=%u enabled=%u revision=%llu error=%d\n",attempts,watching.map.enabled,(unsigned long long)watching.map.revision,rc);
+ return rc;
+}
+
 int main(int argc,char **argv){
  signal(SIGPIPE,SIG_IGN);
+ if(argc>1&&!strcmp(argv[1],"--watch"))return watch_session(argc,argv);
  if(argc==2&&!strcmp(argv[1],"--session")){
   reuse_context=getenv("OBS_FIELD1_REUSE_CONTEXT")&&!strcmp(getenv("OBS_FIELD1_REUSE_CONTEXT"),"1");
   char line[768],prefix[512],extra;unsigned ms,tag;int rc=0;
