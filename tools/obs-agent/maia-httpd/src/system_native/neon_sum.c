@@ -5,6 +5,12 @@
  * prevent the compiler from replacing a full read by a pointer observation. */
 void obs_neon_read(const uint8_t *p,size_t n){
  size_t i=0;
+ /* Aligned complete spans only. VLDМ reads 128 bytes per instruction;
+  * every destination is clobbered and memory is volatile. No checksum,
+  * reduction, skipped bins, or access beyond the owned span. */
+ for(;i+128<=n;i+=128){
+  __asm__ volatile("vldmia %0, {d0-d15}"::"r"(p+i):"d0","d1","d2","d3","d4","d5","d6","d7","d8","d9","d10","d11","d12","d13","d14","d15","memory");
+ }
  for(;i+32<=n;i+=32){
   if(i+256<n)__builtin_prefetch(p+i+256,0,3);
   __asm__ volatile("vld1.8 {d0-d3}, [%0]"::"r"(p+i):"d0","d1","d2","d3","memory");

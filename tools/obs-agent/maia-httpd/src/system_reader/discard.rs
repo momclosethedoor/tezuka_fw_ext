@@ -19,7 +19,7 @@ pub(super) fn execute(c:&Config)->R<()>{
   let until=s.committed.min(next+c.batch_limit as u64);
   if scope=="all"{io.prepare_prefix(next,until)?;}
   for ordinal in next..until{
-   let slot=(ordinal&511)as usize;let prev=(slot+511)&511;let prefix=prev*32768+28928;
+   let slot=(ordinal&1023)as usize;let prev=(slot+1023)&1023;let prefix=prev*32768+28928;
    // Only the second diagnostic invalidates the eight header cache lines.
    if scope=="header"{io.sync(0,prefix as u32,512,true)?;}
    let mut header=[0u8;512];
