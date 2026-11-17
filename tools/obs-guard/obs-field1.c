@@ -14,6 +14,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/resource.h>
 #include <signal.h>
 #include <netinet/tcp.h>
@@ -43,7 +44,18 @@ static int connect_video(void){
 }
 static int packet(const char *meta,const void *raw,size_t n){
  size_t m=strlen(meta);uint32_t header[3]={0x32503852,(uint32_t)m,(uint32_t)n};double t=now();
- int rc=sendall(video_sock,header,sizeof(header))||sendall(video_sock,meta,m)||(n&&sendall(video_sock,raw,n));
+ /* One scatter/gather send keeps the tiny header/metadata with its payload.
+    Ownership is retained until every byte has been accepted; partial writes
+    advance the iovecs and never skip or copy the payload. */
+ struct iovec vec[3]={{header,sizeof(header)},{(void*)meta,m},{(void*)raw,n}};
+ struct msghdr msg={.msg_iov=vec,.msg_iovlen=n?3:2};int rc=0;
+ while(msg.msg_iovlen){
+  ssize_t k=sendmsg(video_sock,&msg,MSG_NOSIGNAL);if(k<0&&errno==EINTR)continue;
+  if(k<=0){rc=-1;break;}
+  size_t used=(size_t)k;
+  while(msg.msg_iovlen&&used>=msg.msg_iov[0].iov_len){used-=msg.msg_iov[0].iov_len;msg.msg_iov++;msg.msg_iovlen--;}
+  if(used&&msg.msg_iovlen){msg.msg_iov[0].iov_base=(uint8_t*)msg.msg_iov[0].iov_base+used;msg.msg_iov[0].iov_len-=used;}
+ }
  wire_send_s+=now()-t;
  if(rc){close(video_sock);video_sock=-1;return -1;}
  wire_bytes+=sizeof(header)+m+n;wire_chunks++;return 0;
@@ -158,9 +170,12 @@ static int capture(int argc,char **argv){
   char meta[768];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
   if(packet(meta,NULL,0)){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);fclose(trace);close(fd);close(lock);return 9;}
  }
- wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();
- fprintf(trace,"{\"event\":\"arm\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
- while(now()-start<CAPTURE_SECONDS){
+ /* BEGIN transport can yield. Recheck the exact visit immediately before
+    FIELD ARM so a socket delay becomes a counted missed request. */
+ if(exact && target<epoch()+2)rc=10;
+ if(!rc){wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();}
+ fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
+ while(!rc&&now()-start<CAPTURE_SECONDS){
   ssize_t n=iio_buffer_refill(buf);double t=now();
   if(n>0){
    uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
