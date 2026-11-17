@@ -4,8 +4,9 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include "obs-iio-copy.h"
 struct tq_entry {size_t length,offset;int used;};
-struct transport_queue {uint8_t *memory;size_t stride,allocated;unsigned capacity,count,high,order[8];int active;
+struct transport_queue {uint8_t *memory;size_t stride,allocated;unsigned copy_width,capacity,count,high,order[8];int active;
  struct tq_entry entry[8];uint64_t dropped_bytes,dropped_blocks;};
 static inline int tq_reset(struct transport_queue *q,unsigned capacity,size_t stride){
  if(capacity>8||!stride||stride>262144)return -1;
@@ -25,7 +26,7 @@ static inline int tq_push(struct transport_queue *q,const void *data,size_t n,si
   q->dropped_bytes+=q->entry[q->order[victim]].length;q->dropped_blocks++;tq_remove(q,victim);
  }
  unsigned slot=0;while(slot<q->capacity&&q->entry[slot].used)slot++;if(slot==q->capacity)return -1;
- memcpy(q->memory+slot*q->stride,data,n);q->entry[slot]=(struct tq_entry){n,offset,1};q->order[q->count++]=slot;
+ obs_iio_copy(q->memory+slot*q->stride,data,n,q->copy_width);q->entry[slot]=(struct tq_entry){n,offset,1};q->order[q->count++]=slot;
  if(q->count>q->high){q->high=q->count;}
  return 0;
 }

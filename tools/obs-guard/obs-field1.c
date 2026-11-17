@@ -36,7 +36,9 @@ static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);retu
  * local TCP accepts it, or it is copied to a bounded reusable transport block. */
 static int video_sock=-1;
 static uint64_t wire_bytes=0,wire_chunks=0,wire_accepted=0;
-static double wire_send_s=0;
+static double wire_send_s=0,wire_send_cpu_s=0;
+static int cpu_phases=0;
+static double thread_cpu(void){struct timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static int sendall(int s,const void *p,size_t n){const uint8_t *b=p;while(n){ssize_t k=send(s,b,n,MSG_NOSIGNAL);if(k<0&&errno==EINTR)continue;if(k<=0)return -1;b+=k;n-=k;}return 0;}
 static int connect_video(void){
  if(video_sock>=0)return 0;
@@ -62,7 +64,9 @@ static int packet_begin(const char *meta,const void *raw,size_t n){
 static int packet_pump(void){
  if(!tx.active)return 1;
  if(now()-tx.started>1.0){packet_abort();return -1;}
+ double cpu0=cpu_phases?thread_cpu():0;
  ssize_t k=sendmsg(video_sock,&tx.msg,MSG_NOSIGNAL);
+ if(cpu_phases)wire_send_cpu_s+=thread_cpu()-cpu0;
  if(k<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return 0;
  if(k<=0){packet_abort();return -1;}
  wire_accepted+=(size_t)k;
@@ -118,7 +122,12 @@ static int capture(int argc,char **argv){
  if(argc==5&&strcmp(argv[4],"--unqualified-raw"))return 2;
  if(strspn(argv[1],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[1]))return 2;
 
+ int copy_only=getenv("OBS_FIELD1_COPY_ONLY")&&!strcmp(getenv("OBS_FIELD1_COPY_ONLY"),"1");
  int no_delivery=getenv("OBS_FIELD1_NO_DELIVERY")&&!strcmp(getenv("OBS_FIELD1_NO_DELIVERY"),"1");
+ if(copy_only)no_delivery=1;
+ const char *copy=getenv("OBS_IIO_COPY_WIDTH");unsigned width=copy?strtoul(copy,NULL,10):0;
+ if(width!=0&&width!=32&&width!=64&&width!=128)return 2;
+ queue.copy_width=width;
  const char *route_case=getenv("OBS_FIELD1_ROUTE_CASE");
  int next_on_busy=getenv("OBS_FIELD1_NEXT_ON_BUSY")&&!strcmp(getenv("OBS_FIELD1_NEXT_ON_BUSY"),"1");
  int route_sock=-1,route_acked=0;unsigned route_id=0;char route_reply[128];size_t route_have=0;
@@ -184,7 +193,7 @@ static int capture(int argc,char **argv){
  if(initial!=-EAGAIN){fprintf(stderr,"new generation not empty: %zd\n",initial);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);return 3;}
  /* stream_run=0 suppresses FM output while a fresh empty DMA generation is created.
     No previous generation can contribute bytes to this context. */
- uint64_t sent_before=wire_bytes,chunks_before=wire_chunks;double send_before=wire_send_s;
+ uint64_t sent_before=wire_bytes,chunks_before=wire_chunks;double send_before=wire_send_s,send_cpu_before=wire_send_cpu_s;
  if(!no_delivery&&connect_video()){iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);close(fd);close(lock);return 9;}
  char path[512];snprintf(path,sizeof(path),"%s.trace.jsonl",argv[1]);FILE *trace=fopen(path,"wx");if(!trace)return 3;
  fprintf(trace,"{\"event\":\"iio_preparation\",\"time\":%.9f,\"context_s\":%.9f,\"buffer_s\":%.9f,\"ready_s\":%.9f,\"reuse_context\":%s}\n",now(),context_ready-prepare_start,buffer_ready-context_ready,now()-prepare_start,reuse_context?"true":"false");
@@ -244,7 +253,7 @@ static int capture(int argc,char **argv){
  if(!rc){wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();}
  fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
  size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
- double refill_s=0,copy_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
+ double refill_s=0,copy_s=0,copy_cpu_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
  double loop_due=now(),loop_gap_max_s=0;unsigned copied_refills=0,send_with_iio_owned=0;int fault_seen=0;
  double ready_wait_s=0,ready_wait_max_s=0;unsigned ready_wait_calls=0,progress_turns=0;
  double service_started=now();struct timespec cpu_begin,cpu_end;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&cpu_begin);
@@ -273,7 +282,8 @@ static int capture(int argc,char **argv){
     if(!held_bytes||!(transport_depth>1||!queue.count))break;
     uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
     if(held_bytes>span||received_bytes+held_bytes>capture_limit){rc=4;break;}
-    double t0=now();int pushed=no_delivery?0:tq_push(&queue,p,held_bytes,received_bytes);copy_s+=now()-t0;
+    double t0=now(),cpu0=cpu_phases?thread_cpu():0;int pushed=no_delivery&&!copy_only?0:tq_push(&queue,p,held_bytes,received_bytes);copy_s+=now()-t0;
+    if(cpu_phases)copy_cpu_s+=thread_cpu()-cpu0;
     if(pushed){rc=4;break;}
     received_bytes+=held_bytes;received_blocks++;if(no_delivery){bytes=received_bytes;blocks=received_blocks;}
     return_due=held_since;held_bytes=0;
@@ -287,6 +297,7 @@ static int capture(int argc,char **argv){
     return_due=0;copied_refills++;
     if(n>0){held_bytes=(size_t)n;held_since=t1;}else if(n!=-EAGAIN){rc=4;break;}
    }
+   if(copy_only){while(queue.count){if(tq_start(&queue)<0||tq_finish(&queue)){rc=4;break;}}if(rc)break;}
    if(!pending_bytes&&queue.count){
     int slot=tq_start(&queue);if(slot<0){rc=4;break;}
     struct tq_entry *e=&queue.entry[slot];char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,e->offset);
@@ -373,6 +384,7 @@ static int capture(int argc,char **argv){
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
  fprintf(trace,"{\"event\":\"iio_return_order\",\"time\":%.9f,\"copied_refills\":%u,\"send_with_iio_owned\":%u}\n",now(),copied_refills,send_with_iio_owned);
  fprintf(trace,"{\"event\":\"transport_phases\",\"time\":%.9f,\"depth\":%u,\"queue_high\":%u,\"queue_drop_blocks\":%llu,\"queue_drop_bytes\":%llu,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"refill_s\":%.9f,\"copy_s\":%.9f,\"send_syscall_s\":%.9f,\"iio_hold_max_s\":%.9f,\"loop_gap_max_s\":%.9f}\n",now(),transport_depth,queue.high,(unsigned long long)queue.dropped_blocks,(unsigned long long)queue.dropped_bytes,received_bytes,bytes,refill_s,copy_s,queue_wait_s,iio_hold_max_s,loop_gap_max_s);
+ fprintf(trace,"{\"event\":\"copy_send_cpu\",\"time\":%.9f,\"enabled\":%s,\"copy_width\":%u,\"copy_only\":%s,\"no_delivery\":%s,\"copy_cpu_s\":%.9f,\"send_cpu_s\":%.9f}\n",now(),cpu_phases?"true":"false",width,copy_only?"true":"false",no_delivery?"true":"false",copy_cpu_s,wire_send_cpu_s-send_cpu_before);
  double payload_complete=now();
  wr(0x290,2);wr(0x284,0);if(buf)iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
  fprintf(trace,"{\"event\":\"iio_cleanup\",\"time\":%.9f,\"buffer_destroy_s\":%.9f,\"context_destroy_s\":%.9f,\"tail_after_done_s\":%.9f,\"block_bytes\":%zu}\n",now(),buffer_closed-payload_complete,now()-buffer_closed,done?payload_complete-done:0,block_bytes);
@@ -449,6 +461,7 @@ static int watch_session(int argc,char **argv){
 
 int main(int argc,char **argv){
  signal(SIGPIPE,SIG_IGN);
+ cpu_phases=getenv("OBS_FIELD1_CPU_PHASES")&&!strcmp(getenv("OBS_FIELD1_CPU_PHASES"),"1");
  if(argc>1&&!strcmp(argv[1],"--watch"))return watch_session(argc,argv);
  if(argc==2&&!strcmp(argv[1],"--session")){
   reuse_context=getenv("OBS_FIELD1_REUSE_CONTEXT")&&!strcmp(getenv("OBS_FIELD1_REUSE_CONTEXT"),"1");
