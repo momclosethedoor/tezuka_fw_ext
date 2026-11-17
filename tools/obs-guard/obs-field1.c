@@ -38,6 +38,7 @@ static int video_sock=-1;
 static uint64_t wire_bytes=0,wire_chunks=0,wire_accepted=0;
 static double wire_send_s=0,wire_send_cpu_s=0;
 static int cpu_phases=0;
+static size_t tcp_pump_bytes=0;
 static double thread_cpu(void){struct timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static int sendall(int s,const void *p,size_t n){const uint8_t *b=p;while(n){ssize_t k=send(s,b,n,MSG_NOSIGNAL);if(k<0&&errno==EINTR)continue;if(k<=0)return -1;b+=k;n-=k;}return 0;}
 static int connect_video(void){
@@ -65,7 +66,20 @@ static int packet_pump(void){
  if(!tx.active)return 1;
  if(now()-tx.started>1.0){packet_abort();return -1;}
  double cpu0=cpu_phases?thread_cpu():0;
- ssize_t k=sendmsg(video_sock,&tx.msg,MSG_NOSIGNAL);
+ /* Limit work in one kernel call, independently of the R8P2 block size.
+    IIO service gets another turn after each accepted slice, without a timer.
+    MSG_MORE retains only the unfinished packet's TCP tail. */
+ struct msghdr call=tx.msg;struct iovec pieces[3];int more=0;
+ if(tcp_pump_bytes){
+  size_t left=tcp_pump_bytes,count=0;
+  for(size_t i=0;i<tx.msg.msg_iovlen;i++){
+   if(!left){more=1;break;}
+   pieces[count]=tx.msg.msg_iov[i];if(pieces[count].iov_len>left){pieces[count].iov_len=left;more=1;}
+   left-=pieces[count].iov_len;count++;
+  }
+  call.msg_iov=pieces;call.msg_iovlen=count;
+ }
+ ssize_t k=sendmsg(video_sock,&call,MSG_NOSIGNAL|(more?MSG_MORE:0));
  if(cpu_phases)wire_send_cpu_s+=thread_cpu()-cpu0;
  if(k<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return 0;
  if(k<=0){packet_abort();return -1;}
@@ -384,7 +398,7 @@ static int capture(int argc,char **argv){
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
  fprintf(trace,"{\"event\":\"iio_return_order\",\"time\":%.9f,\"copied_refills\":%u,\"send_with_iio_owned\":%u}\n",now(),copied_refills,send_with_iio_owned);
  fprintf(trace,"{\"event\":\"transport_phases\",\"time\":%.9f,\"depth\":%u,\"queue_high\":%u,\"queue_drop_blocks\":%llu,\"queue_drop_bytes\":%llu,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"refill_s\":%.9f,\"copy_s\":%.9f,\"send_syscall_s\":%.9f,\"iio_hold_max_s\":%.9f,\"loop_gap_max_s\":%.9f}\n",now(),transport_depth,queue.high,(unsigned long long)queue.dropped_blocks,(unsigned long long)queue.dropped_bytes,received_bytes,bytes,refill_s,copy_s,queue_wait_s,iio_hold_max_s,loop_gap_max_s);
- fprintf(trace,"{\"event\":\"copy_send_cpu\",\"time\":%.9f,\"enabled\":%s,\"copy_width\":%u,\"copy_only\":%s,\"no_delivery\":%s,\"copy_cpu_s\":%.9f,\"send_cpu_s\":%.9f}\n",now(),cpu_phases?"true":"false",width,copy_only?"true":"false",no_delivery?"true":"false",copy_cpu_s,wire_send_cpu_s-send_cpu_before);
+ fprintf(trace,"{\"event\":\"copy_send_cpu\",\"time\":%.9f,\"enabled\":%s,\"copy_width\":%u,\"tcp_pump_bytes\":%zu,\"copy_only\":%s,\"no_delivery\":%s,\"copy_cpu_s\":%.9f,\"send_cpu_s\":%.9f}\n",now(),cpu_phases?"true":"false",width,tcp_pump_bytes,copy_only?"true":"false",no_delivery?"true":"false",copy_cpu_s,wire_send_cpu_s-send_cpu_before);
  double payload_complete=now();
  wr(0x290,2);wr(0x284,0);if(buf)iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
  fprintf(trace,"{\"event\":\"iio_cleanup\",\"time\":%.9f,\"buffer_destroy_s\":%.9f,\"context_destroy_s\":%.9f,\"tail_after_done_s\":%.9f,\"block_bytes\":%zu}\n",now(),buffer_closed-payload_complete,now()-buffer_closed,done?payload_complete-done:0,block_bytes);
@@ -462,6 +476,8 @@ static int watch_session(int argc,char **argv){
 int main(int argc,char **argv){
  signal(SIGPIPE,SIG_IGN);
  cpu_phases=getenv("OBS_FIELD1_CPU_PHASES")&&!strcmp(getenv("OBS_FIELD1_CPU_PHASES"),"1");
+ const char *pump=getenv("OBS_TCP_PUMP_BYTES");tcp_pump_bytes=pump?strtoul(pump,NULL,10):0;
+ if(tcp_pump_bytes!=0&&tcp_pump_bytes!=16384&&tcp_pump_bytes!=32768&&tcp_pump_bytes!=65536&&tcp_pump_bytes!=131072)return 2;
  if(argc>1&&!strcmp(argv[1],"--watch"))return watch_session(argc,argv);
  if(argc==2&&!strcmp(argv[1],"--session")){
   reuse_context=getenv("OBS_FIELD1_REUSE_CONTEXT")&&!strcmp(getenv("OBS_FIELD1_REUSE_CONTEXT"),"1");
