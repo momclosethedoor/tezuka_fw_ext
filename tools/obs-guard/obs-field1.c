@@ -232,7 +232,9 @@ static int capture(int argc,char **argv){
   if(connect(route_sock,(void*)&a,sizeof(a)))return 3;
  }
  if(!no_delivery){
-  char meta[768];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,\"target_hz\":%llu,\"target_position\":%u,\"map_version\":%u,\"watch_revision\":%llu,\"watch_generation\":%llu,\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,(unsigned long long)target_hz,target_position,map_version,(unsigned long long)(watch_active?watch_revision:0),(unsigned long long)(watch_active?watch_selected.generation:0),block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
+  char watch_meta[320]="";
+  if(watch_active)snprintf(watch_meta,sizeof(watch_meta),"\"target_hz\":%llu,\"target_position\":%u,\"map_version\":%u,\"watch_revision\":%llu,\"watch_generation\":%llu,",(unsigned long long)target_hz,target_position,map_version,(unsigned long long)watch_revision,(unsigned long long)watch_selected.generation);
+  char meta[1024];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,%s\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,watch_meta,block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
   if(packet(meta,NULL,0)){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);fclose(trace);close(fd);close(lock);return 9;}
  }
  /* BEGIN transport can yield. Recheck the exact visit immediately before
@@ -309,6 +311,7 @@ static int capture(int argc,char **argv){
   t=now();status=rd(0x294);
   if((status&16)&&!fault_seen){fault_seen=1;fprintf(trace,"{\"event\":\"first_stream_fault\",\"time\":%.9f,\"status\":%u,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"queue_blocks\":%u,\"held_bytes\":%zu}\n",t,status,received_bytes,bytes,queue.count,held_bytes);}
   if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
+   if(watch_active&&(target_position!=watch_position||map_version!=watching.map.version)){rc=13;break;}
    fprintf(trace,"{\"event\":\"busy\",\"time\":%.9f,\"epoch\":%llu,\"position\":%u,\"map_version\":%u,\"field_status\":%u,\"fld_status\":%u,\"marker_id\":%u}\n",t,(unsigned long long)epoch(),target_position,map_version,status,rd(0x228),rd(0x240));
    if(next_on_busy){int g=open("/dev/obs_fl_guard",O_RDWR);unsigned v[128]={0};int result=g<0?-1:ioctl(g,0x4603,v);if(g>=0)close(g);fprintf(trace,"{\"event\":\"map_next_during_busy\",\"time\":%.9f,\"result\":%d,\"epoch\":%llu,\"field_status\":%u,\"version\":%u}\n",now(),result,(unsigned long long)epoch(),rd(0x294),rd(0x22c));if(result){rc=8;break;}}
    if(route_case){char msg[512];int n=snprintf(msg,sizeof(msg),"{\"marker_id\":%u,\"epoch\":%llu,\"version\":%u,\"position\":%u,\"route\":%u,\"a9_send_s\":%.9f,\"test\":\"%s\"}\n",route_id,(unsigned long long)target,map_version,target_position,rd(0x244),now(),route_case);if(sendall(route_sock,msg,n)){rc=8;break;}fprintf(trace,"{\"event\":\"route_request\",\"time\":%.9f,\"marker_id\":%u}\n",now(),route_id);}

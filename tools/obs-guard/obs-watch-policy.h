@@ -60,4 +60,3 @@ static inline int watch_update(struct watch_map *old,const struct watch_map *nex
  *old=*next;return 0;
 }
 #endif
-
