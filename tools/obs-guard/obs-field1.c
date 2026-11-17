@@ -111,7 +111,9 @@ static int capture(int argc,char **argv){
  iio_context_set_timeout(ctx,250);iio_device_set_kernel_buffers_count(dev,4);
  void *ch0=iio_device_find_channel(dev,"voltage0",false),*ch1=iio_device_find_channel(dev,"voltage1",false);if(!ch0||!ch1)return 3;
  iio_channel_enable(ch0);iio_channel_enable(ch1);
- void *buf=iio_device_create_buffer(dev,IIO_BLOCK_SAMPLES,false);if(!buf){perror("iio buffer");return 3;}
+ unsigned block_samples=IIO_BLOCK_SAMPLES;const char *block_env=getenv("OBS_IIO_BLOCK_SAMPLES");
+ if(block_env){block_samples=strtoul(block_env,NULL,10);if(block_samples<2048||block_samples>65536||(block_samples&(block_samples-1)))return 3;}
+ void *buf=iio_device_create_buffer(dev,block_samples,false);if(!buf){perror("iio buffer");return 3;}
  double buffer_ready=now();
  size_t block_bytes=(uint8_t*)iio_buffer_end(buf)-(uint8_t*)iio_buffer_start(buf);
  size_t capture_limit=REAL8_FS*CAPTURE_SECONDS+block_bytes;
@@ -188,7 +190,9 @@ static int capture(int argc,char **argv){
   }
   usleep(100);
  }
- wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
+ double payload_complete=now();
+ wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
+ fprintf(trace,"{\"event\":\"iio_cleanup\",\"time\":%.9f,\"buffer_destroy_s\":%.9f,\"context_destroy_s\":%.9f,\"tail_after_done_s\":%.9f,\"block_bytes\":%zu}\n",now(),buffer_closed-payload_complete,now()-buffer_closed,done?payload_complete-done:0,block_bytes);
  if(route_sock>=0)close(route_sock);
  /* Only the host interprets the native sync words and assembles pixels.
     END qualifies the provisional byte stream; no ARM frame ACK is returned. */
