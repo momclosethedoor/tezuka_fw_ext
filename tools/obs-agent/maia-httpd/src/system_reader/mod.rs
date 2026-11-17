@@ -2,6 +2,8 @@
 mod continuous;
 mod view;
 mod discard;
+mod view_batch;
+use view_batch::UdpBatch;
 use continuous::{Header,Snapshot};
 use view::PairIo;
 use std::{fs::{File,OpenOptions},io::Write,os::fd::AsRawFd,path::PathBuf,sync::atomic::{AtomicBool,Ordering,compiler_fence},time::{Duration,Instant}};
@@ -213,7 +215,7 @@ fn execute(c:&Config)->R<()>{
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let network=std::cell::RefCell::new(UdpBatch::new());let mut status_due=Instant::now();let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
-  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==2&&!c.send_after_release{net.flush(sock);}}}
+  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.start_record();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==2&&!c.send_after_release{net.flush(sock);}}}
   if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}Ok(())
  };
  loop{
@@ -221,7 +223,7 @@ fn execute(c:&Config)->R<()>{
   if c.command=="rate"&&(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed)){end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break}
   if status_due.elapsed()>=Duration::from_millis(100){if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();}
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
-  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush(sock);}max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
+  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush_due(sock);}max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released{std::thread::sleep(Duration::from_micros(50));}
  }
@@ -247,9 +249,6 @@ pub fn status()->Value{STATUS.lock().unwrap().clone()}
 pub fn stop(){STOP.store(true,Ordering::Release);}
 pub fn run_json(data:&[u8])->R<()>{STOP.store(false,Ordering::Release);let c:Config=serde_json::from_slice(data).map_err(|e|e.to_string())?;execute(&c)}
 
-struct UdpBatch{phase_on:bool,send_ns:u128,bytes:Vec<u8>,pending:u64,sent:u64,dropped:u64,datagrams:u64}
-impl UdpBatch{
- fn new()->Self{Self{phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),send_ns:0,bytes:Vec::with_capacity(1136),pending:0,sent:0,dropped:0,datagrams:0}}
- fn flush(&mut self,s:&std::net::UdpSocket){if self.pending==0{return}let phase=self.phase_on.then(Instant::now);for packet in self.bytes.chunks(1136){let count=(packet.len()/568)as u64;match s.send(packet){Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;},_=>self.dropped+=count}}self.bytes.clear();self.pending=0;if let Some(t)=phase{self.send_ns+=t.elapsed().as_nanos();}}
- fn counts(&self)->Value{json!({"sent":self.sent,"dropped":self.dropped,"datagrams":self.datagrams,"send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on})}
+impl UdpBatch {
+ fn counts(&self)->Value{json!({"sent":self.sent,"dropped":self.dropped,"datagrams":self.datagrams,"send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,"max_wait_ns":self.max_wait_ns.to_string()})}
 }
