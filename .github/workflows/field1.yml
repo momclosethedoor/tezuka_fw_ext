@@ -2,7 +2,7 @@ name: OBS007A FIELD1 collector
 on:
   push:
     branches: [build/obs007c-arm-mode]
-    paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-route-ack.c', 'tools/obs-guard/obs-iq-snapshot.c', '.github/workflows/field1.yml']
+    paths: ['tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-transport-queue.h', 'tools/obs-guard/test-transport-queue.c', 'tools/obs-guard/obs-route-ack.c', 'tools/obs-guard/obs-iq-snapshot.c', '.github/workflows/field1.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,6 +24,8 @@ jobs:
           set -euo pipefail
           echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
           tar --zstd -xf kit/kernel-kit.tar.zst
+          cc -std=c11 -O2 -Wall -Wextra -Werror tools/obs-guard/test-transport-queue.c -o /tmp/test-transport-queue
+          /tmp/test-transport-queue
           mkdir artifact
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror tools/obs-guard/obs-field1.c -ldl -o artifact/obs-field1
           output/nano/host/bin/arm-linux-gcc -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-misleading-indentation tools/obs-guard/obs-route-ack.c -o artifact/obs-route-ack

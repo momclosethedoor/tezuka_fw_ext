@@ -15,6 +15,8 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include "obs-transport-queue.h"
+static struct transport_queue queue;
 #include <sys/resource.h>
 #include <signal.h>
 #include <netinet/tcp.h>
@@ -143,6 +145,9 @@ static int capture(int argc,char **argv){
  double buffer_ready=now();
  size_t block_bytes=(uint8_t*)iio_buffer_end(buf)-(uint8_t*)iio_buffer_start(buf);
  size_t capture_limit=REAL8_FS*CAPTURE_SECONDS+block_bytes;
+ unsigned transport_depth=0;const char *depth=getenv("OBS_TX_BLOCKS");
+ if(depth){transport_depth=strtoul(depth,NULL,10);if(transport_depth>8||(transport_depth>1&&(transport_depth&(transport_depth-1))))return 3;}
+ if(tq_reset(&queue,transport_depth,block_bytes))return 3;
  if(iio_buffer_set_blocking_mode(buf,false))return 3;
  ssize_t initial=iio_buffer_refill(buf);
  if(initial!=-EAGAIN){fprintf(stderr,"new generation not empty: %zd\n",initial);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);return 3;}
@@ -190,18 +195,47 @@ static int capture(int argc,char **argv){
  if(exact && target<epoch()+2)rc=10;
  if(!rc){wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();}
  fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
- size_t pending_bytes=0;unsigned send_wait_polls=0;
+ size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
+ double refill_s=0,copy_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
+ double loop_due=now(),loop_gap_max_s=0;
  while(!rc&&now()-start<CAPTURE_SECONDS){
-  /* Keep polling FIELD/cancel while TCP is backpressured. Refill cannot reuse
-     the current DMA block until the last payload byte has been sent. */
-  ssize_t n=pending_bytes||(outcome&&outcome!=1)? -EAGAIN:iio_buffer_refill(buf);double t=now();
-  if(n>0){
-   uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
-   if((size_t)n>span||bytes+(size_t)n>capture_limit){rc=4;break;}
-   if(!no_delivery){char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,bytes);if(packet_begin(meta,p,(size_t)n)){rc=9;break;}pending_bytes=(size_t)n;}
-   else{bytes+=(size_t)n;blocks++;}
-  }else if(n!=-EAGAIN){fprintf(trace,"{\"event\":\"iio_error\",\"code\":%zd}\n",n);rc=4;break;}
-  if(pending_bytes){int sent=packet_pump();if(sent<0){rc=9;break;}if(sent){bytes+=pending_bytes;pending_bytes=0;blocks++;}else send_wait_polls++;}
+  double tick=now();if(tick-loop_due>loop_gap_max_s)loop_gap_max_s=tick-loop_due;loop_due=tick;
+  if(transport_depth){
+   /* Refill returns the preceding copied block immediately; a ready next
+      block may remain owned only in the one-buffer comparison variant. */
+   if(!held_bytes&&!input_closed&&(!outcome||(outcome==1&&received_bytes<end)||return_due)){
+    double t0=now();ssize_t n=iio_buffer_refill(buf);double t1=now();refill_s+=t1-t0;
+    if(return_due){if(t1-return_due>iio_hold_max_s)iio_hold_max_s=t1-return_due;return_due=0;}
+    if(n>0){held_bytes=(size_t)n;held_since=t1;}else if(n!=-EAGAIN){rc=4;break;}
+   }
+   if(held_bytes&&(transport_depth>1||!queue.count)){
+    uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
+    if(held_bytes>span||received_bytes+held_bytes>capture_limit){rc=4;break;}
+    double t0=now();int pushed=no_delivery?0:tq_push(&queue,p,held_bytes,received_bytes);copy_s+=now()-t0;
+    if(pushed){rc=4;break;}
+    received_bytes+=held_bytes;received_blocks++;if(no_delivery){bytes=received_bytes;blocks=received_blocks;}
+    return_due=held_since;held_bytes=0;
+   }
+   if(!pending_bytes&&queue.count){
+    int slot=tq_start(&queue);if(slot<0){rc=4;break;}
+    struct tq_entry *e=&queue.entry[slot];char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,e->offset);
+    if(packet_begin(meta,queue.memory+(size_t)slot*queue.stride,e->length)){rc=9;break;}pending_bytes=e->length;
+   }
+  }else{
+   double t0=now();ssize_t n=pending_bytes||(outcome&&outcome!=1)?-EAGAIN:iio_buffer_refill(buf);refill_s+=now()-t0;
+   if(n>0){
+    uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
+    if((size_t)n>span||bytes+(size_t)n>capture_limit){rc=4;break;}
+    held_since=now();received_bytes+=(size_t)n;received_blocks++;
+    if(!no_delivery){char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,bytes);if(packet_begin(meta,p,(size_t)n)){rc=9;break;}pending_bytes=(size_t)n;}
+    else{bytes+=(size_t)n;blocks++;}
+   }else if(n!=-EAGAIN){rc=4;break;}
+  }
+  if(pending_bytes){double t0=now();int sent=packet_pump();queue_wait_s+=now()-t0;if(sent<0){rc=9;break;}
+   if(sent){bytes+=pending_bytes;pending_bytes=0;blocks++;if(transport_depth){if(tq_finish(&queue)){rc=4;break;}}else if(now()-held_since>iio_hold_max_s)iio_hold_max_s=now()-held_since;}
+   else send_wait_polls++;
+  }
+  double t;
   t=now();status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
    fprintf(trace,"{\"event\":\"busy\",\"time\":%.9f,\"epoch\":%llu,\"position\":%u,\"map_version\":%u,\"field_status\":%u,\"fld_status\":%u,\"marker_id\":%u}\n",t,(unsigned long long)epoch(),target_position,map_version,status,rd(0x228),rd(0x240));
    if(next_on_busy){int g=open("/dev/obs_fl_guard",O_RDWR);unsigned v[128]={0};int result=g<0?-1:ioctl(g,0x4603,v);if(g>=0)close(g);fprintf(trace,"{\"event\":\"map_next_during_busy\",\"time\":%.9f,\"result\":%d,\"epoch\":%llu,\"field_status\":%u,\"version\":%u}\n",now(),result,(unsigned long long)epoch(),rd(0x294),rd(0x22c));if(result){rc=8;break;}}
@@ -218,16 +252,26 @@ static int capture(int argc,char **argv){
    serial=s0;outcome=(st0>>1)&7;
    if(!done){done=t;fprintf(trace,"{\"event\":\"pl_done\",\"time\":%.9f,\"outcome\":%d,\"epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u}\n",t,outcome,(unsigned long long)e,rt,first,end);}
    if(e!=target||rt!=tag||rd(0x294)&16){rc=5;break;}
-   if(outcome!=1){if(pending_bytes)continue;if(!route_case||route_acked)break;else continue;}
+   if(outcome!=1){
+    if(transport_depth&&!input_closed){wr(0x284,0);iio_buffer_destroy(buf);buf=NULL;input_closed=1;held_bytes=0;return_due=0;}
+    if(pending_bytes||queue.count){usleep(100);continue;}
+    if(!route_case||route_acked)break;else continue;
+   }
    if(end<first||end>capture_limit){rc=5;break;}
-   if(bytes>=end&&(!route_case||route_acked))break;
+   if(transport_depth&&!input_closed&&received_bytes>=end){
+    wr(0x284,0);double t0=now();iio_buffer_destroy(buf);buf=NULL;input_closed=1;
+    if(return_due&&now()-return_due>iio_hold_max_s){iio_hold_max_s=now()-return_due;}return_due=0;
+    fprintf(trace,"{\"event\":\"iio_released_before_transport\",\"time\":%.9f,\"destroy_s\":%.9f,\"queued_blocks\":%u}\n",now(),now()-t0,queue.count);
+   }
+   if(bytes>=end&&!pending_bytes&&!queue.count&&(!route_case||route_acked))break;
   }
   usleep(100);
  }
  if(tx.active){packet_abort();if(!rc)rc=9;}
  fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
+ fprintf(trace,"{\"event\":\"transport_phases\",\"time\":%.9f,\"depth\":%u,\"queue_high\":%u,\"queue_drop_blocks\":%llu,\"queue_drop_bytes\":%llu,\"received_bytes\":%zu,\"sent_bytes\":%zu,\"refill_s\":%.9f,\"copy_s\":%.9f,\"send_syscall_s\":%.9f,\"iio_hold_max_s\":%.9f,\"loop_gap_max_s\":%.9f}\n",now(),transport_depth,queue.high,(unsigned long long)queue.dropped_blocks,(unsigned long long)queue.dropped_bytes,received_bytes,bytes,refill_s,copy_s,queue_wait_s,iio_hold_max_s,loop_gap_max_s);
  double payload_complete=now();
- wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
+ wr(0x290,2);wr(0x284,0);if(buf)iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
  fprintf(trace,"{\"event\":\"iio_cleanup\",\"time\":%.9f,\"buffer_destroy_s\":%.9f,\"context_destroy_s\":%.9f,\"tail_after_done_s\":%.9f,\"block_bytes\":%zu}\n",now(),buffer_closed-payload_complete,now()-buffer_closed,done?payload_complete-done:0,block_bytes);
  if(route_sock>=0)close(route_sock);
  /* Only the host interprets the native sync words and assembles pixels.
