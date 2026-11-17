@@ -40,25 +40,37 @@ static int connect_video(void){
  struct timeval tv={1,0};int one=1;
  setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));setsockopt(s,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one));
  struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(18009)};inet_pton(AF_INET,"192.168.2.10",&a.sin_addr);
- if(connect(s,(void*)&a,sizeof(a))){close(s);return -1;}video_sock=s;return 0;
+ if(connect(s,(void*)&a,sizeof(a))){close(s);return -1;}if(fcntl(s,F_SETFL,fcntl(s,F_GETFL,0)|O_NONBLOCK)){close(s);return -1;}video_sock=s;return 0;
 }
+/* At most one in-flight packet refers to an owned IIO block. Metadata and
+ * header storage are fixed; the payload is never copied into an ARM queue. */
+static struct {uint32_t header[3];char meta[2048];struct iovec vec[3];
+ struct msghdr msg;double started;size_t wire_size;int active;} tx;
+static void packet_abort(void){if(video_sock>=0)close(video_sock);video_sock=-1;tx.active=0;}
+static int packet_begin(const char *meta,const void *raw,size_t n){
+ size_t m=strlen(meta);if(tx.active||m>=sizeof(tx.meta)||video_sock<0)return -1;
+ memcpy(tx.meta,meta,m);tx.header[0]=0x32503852;tx.header[1]=(uint32_t)m;tx.header[2]=(uint32_t)n;
+ tx.vec[0]=(struct iovec){tx.header,sizeof(tx.header)};tx.vec[1]=(struct iovec){tx.meta,m};tx.vec[2]=(struct iovec){(void*)raw,n};
+ memset(&tx.msg,0,sizeof(tx.msg));tx.msg.msg_iov=tx.vec;tx.msg.msg_iovlen=n?3:2;
+ tx.started=now();tx.wire_size=sizeof(tx.header)+m+n;tx.active=1;return 0;
+}
+/* One nonblocking syscall per pump. 0=pending, 1=finished, -1=failed. */
+static int packet_pump(void){
+ if(!tx.active)return 1;
+ if(now()-tx.started>1.0){packet_abort();return -1;}
+ ssize_t k=sendmsg(video_sock,&tx.msg,MSG_NOSIGNAL);
+ if(k<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return 0;
+ if(k<=0){packet_abort();return -1;}
+ size_t used=(size_t)k;
+ while(tx.msg.msg_iovlen&&used>=tx.msg.msg_iov[0].iov_len){used-=tx.msg.msg_iov[0].iov_len;tx.msg.msg_iov++;tx.msg.msg_iovlen--;}
+ if(used&&tx.msg.msg_iovlen){tx.msg.msg_iov[0].iov_base=(uint8_t*)tx.msg.msg_iov[0].iov_base+used;tx.msg.msg_iov[0].iov_len-=used;}
+ if(tx.msg.msg_iovlen)return 0;
+ wire_send_s+=now()-tx.started;wire_bytes+=tx.wire_size;wire_chunks++;tx.active=0;return 1;
+}
+/* Control packets are bounded setup/teardown work, outside live block service. */
 static int packet(const char *meta,const void *raw,size_t n){
- size_t m=strlen(meta);uint32_t header[3]={0x32503852,(uint32_t)m,(uint32_t)n};double t=now();
- /* One scatter/gather send keeps the tiny header/metadata with its payload.
-    Ownership is retained until every byte has been accepted; partial writes
-    advance the iovecs and never skip or copy the payload. */
- struct iovec vec[3]={{header,sizeof(header)},{(void*)meta,m},{(void*)raw,n}};
- struct msghdr msg={.msg_iov=vec,.msg_iovlen=n?3:2};int rc=0;
- while(msg.msg_iovlen){
-  ssize_t k=sendmsg(video_sock,&msg,MSG_NOSIGNAL);if(k<0&&errno==EINTR)continue;
-  if(k<=0){rc=-1;break;}
-  size_t used=(size_t)k;
-  while(msg.msg_iovlen&&used>=msg.msg_iov[0].iov_len){used-=msg.msg_iov[0].iov_len;msg.msg_iov++;msg.msg_iovlen--;}
-  if(used&&msg.msg_iovlen){msg.msg_iov[0].iov_base=(uint8_t*)msg.msg_iov[0].iov_base+used;msg.msg_iov[0].iov_len-=used;}
- }
- wire_send_s+=now()-t;
- if(rc){close(video_sock);video_sock=-1;return -1;}
- wire_bytes+=sizeof(header)+m+n;wire_chunks++;return 0;
+ if(packet_begin(meta,raw,n))return -1;
+ for(;;){int rc=packet_pump();if(rc)return rc>0?0:-1;usleep(100);}
 }
 /* Session metadata may be reused; every attempt still destroys its old DMA
    buffer, creates an empty generation and assigns a fresh stream tag. */
@@ -178,14 +190,18 @@ static int capture(int argc,char **argv){
  if(exact && target<epoch()+2)rc=10;
  if(!rc){wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();}
  fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
+ size_t pending_bytes=0;unsigned send_wait_polls=0;
  while(!rc&&now()-start<CAPTURE_SECONDS){
-  ssize_t n=iio_buffer_refill(buf);double t=now();
+  /* Keep polling FIELD/cancel while TCP is backpressured. Refill cannot reuse
+     the current DMA block until the last payload byte has been sent. */
+  ssize_t n=pending_bytes||(outcome&&outcome!=1)? -EAGAIN:iio_buffer_refill(buf);double t=now();
   if(n>0){
    uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
    if((size_t)n>span||bytes+(size_t)n>capture_limit){rc=4;break;}
-   if(!no_delivery){char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,bytes);if(packet(meta,p,(size_t)n)){rc=9;break;}}
-   bytes+=(size_t)n;blocks++;
+   if(!no_delivery){char meta[160];snprintf(meta,sizeof(meta),"{\"kind\":\"data\",\"stream_tag\":%u,\"offset\":%zu}",tag,bytes);if(packet_begin(meta,p,(size_t)n)){rc=9;break;}pending_bytes=(size_t)n;}
+   else{bytes+=(size_t)n;blocks++;}
   }else if(n!=-EAGAIN){fprintf(trace,"{\"event\":\"iio_error\",\"code\":%zd}\n",n);rc=4;break;}
+  if(pending_bytes){int sent=packet_pump();if(sent<0){rc=9;break;}if(sent){bytes+=pending_bytes;pending_bytes=0;blocks++;}else send_wait_polls++;}
   t=now();status=rd(0x294);if((status&1)&&!busy){busy=t;target_position=rd(0x234);map_version=rd(0x22c);
    fprintf(trace,"{\"event\":\"busy\",\"time\":%.9f,\"epoch\":%llu,\"position\":%u,\"map_version\":%u,\"field_status\":%u,\"fld_status\":%u,\"marker_id\":%u}\n",t,(unsigned long long)epoch(),target_position,map_version,status,rd(0x228),rd(0x240));
    if(next_on_busy){int g=open("/dev/obs_fl_guard",O_RDWR);unsigned v[128]={0};int result=g<0?-1:ioctl(g,0x4603,v);if(g>=0)close(g);fprintf(trace,"{\"event\":\"map_next_during_busy\",\"time\":%.9f,\"result\":%d,\"epoch\":%llu,\"field_status\":%u,\"version\":%u}\n",now(),result,(unsigned long long)epoch(),rd(0x294),rd(0x22c));if(result){rc=8;break;}}
@@ -202,12 +218,14 @@ static int capture(int argc,char **argv){
    serial=s0;outcome=(st0>>1)&7;
    if(!done){done=t;fprintf(trace,"{\"event\":\"pl_done\",\"time\":%.9f,\"outcome\":%d,\"epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u}\n",t,outcome,(unsigned long long)e,rt,first,end);}
    if(e!=target||rt!=tag||rd(0x294)&16){rc=5;break;}
-   if(outcome!=1){if(!route_case||route_acked)break;else continue;}
+   if(outcome!=1){if(pending_bytes)continue;if(!route_case||route_acked)break;else continue;}
    if(end<first||end>capture_limit){rc=5;break;}
    if(bytes>=end&&(!route_case||route_acked))break;
   }
   usleep(100);
  }
+ if(tx.active){packet_abort();if(!rc)rc=9;}
+ fprintf(trace,"{\"event\":\"send_service\",\"time\":%.9f,\"pending_polls\":%u,\"maximum_owned_payload_blocks\":1}\n",now(),send_wait_polls);
  double payload_complete=now();
  wr(0x290,2);wr(0x284,0);iio_buffer_destroy(buf);double buffer_closed=now();context_done(iio_context_destroy,ctx);wr(0x38,old_mode);
  fprintf(trace,"{\"event\":\"iio_cleanup\",\"time\":%.9f,\"buffer_destroy_s\":%.9f,\"context_destroy_s\":%.9f,\"tail_after_done_s\":%.9f,\"block_bytes\":%zu}\n",now(),buffer_closed-payload_complete,now()-buffer_closed,done?payload_complete-done:0,block_bytes);
