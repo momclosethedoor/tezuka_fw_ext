@@ -2,13 +2,13 @@
 //! A live adapter must own both DMA allocations and implement cache sync in copy.
 #![allow(missing_docs)]
 use super::continuous::{self as c, Header, Snapshot};
-pub const SLOTS:usize=512;
+pub const SLOTS:usize=1024;
 pub const VIEW_BYTES:usize=2048;
 pub const FULL_LENGTH:usize=SLOTS*c::BYTES;
 pub const VIEW_LENGTH:usize=SLOTS*VIEW_BYTES;
 
 pub fn geometry(revision:u32,slots:u32,full:u32,view:u32)->Result<(),String>{
-    if (revision,slots,full,view)!=(3,512,32768,2048){return Err("OBN2 r3 geometry/revision mismatch before START".into())}Ok(())
+    if (revision,slots,full,view)!=(3,1024,32768,2048){return Err("OBN2 r3 geometry/revision mismatch before START".into())}Ok(())
 }
 /// Geometry alone is NOT allocation/ownership proof. Called only after a driver
 /// has returned owned DMA addresses, exact lengths and valid mappings.
@@ -128,12 +128,12 @@ impl PairReader{
  fn root()->std::path::PathBuf{std::env::var("OBS_VIEW_VECTOR_ROOT").unwrap_or_else(|_|"maia-httpd/tests/view".into()).into()}
  fn bytes(p:&std::path::Path)->Vec<u8>{let s=std::fs::read_to_string(p).unwrap();let s=s.split_whitespace().collect::<String>();(0..s.len()).step_by(2).map(|i|u8::from_str_radix(&s[i..i+2],16).unwrap()).collect()}
  #[test]fn all_paired_i5_vectors(){let mut count=0;for mode in 0..4{for entry in std::fs::read_dir(root().join(format!("mode{mode}"))).unwrap(){let p=entry.unwrap().path();if p.extension().is_none_or(|s|s!="hex"){continue}let full=bytes(&p);let view=bytes(&p.with_extension("viewhex"));let mut power=vec![0.;4096];let h=decode(&full,&view,&mut power).unwrap();assert_eq!((h.flags>>3)&3,mode);assert!(c::header(&full).is_err());if !view.is_empty(){let mut bad=view.clone();bad[0]^=1;assert!(decode(&full,&bad,&mut power).is_err());assert!(decode(&full,&view[..view.len()-1],&mut power).is_err());}count+=1;}}assert_eq!(count,16);}
- #[test]fn geometry_and_memory_gate(){assert!(geometry(3,512,32768,2048).is_ok());assert!(geometry(2,8,32768,2048).is_err());assert!(ranges(0x18000000,FULL_LENGTH,0x19000000,VIEW_LENGTH).is_ok());for(a,b,l)in[(0x18000001,0x19000000,FULL_LENGTH),(0x18000000,0x18008000,FULL_LENGTH),(0x18000000,0x19000000,262144)]{assert!(ranges(a,l,b,VIEW_LENGTH).is_err());}}
+ #[test]fn geometry_and_memory_gate(){assert!(geometry(3,1024,32768,2048).is_ok());assert!(geometry(2,8,32768,2048).is_err());assert!(ranges(0x18000000,FULL_LENGTH,0x1a000000,VIEW_LENGTH).is_ok());for(a,b,l)in[(0x18000001,0x1a000000,FULL_LENGTH),(0x18000000,0x18008000,FULL_LENGTH),(0x18000000,0x1a000000,262144)]{assert!(ranges(a,l,b,VIEW_LENGTH).is_err());}}
  #[test]fn wrap_and_mode_from_each_header(){
   struct Mock{full:Vec<u8>,view:Vec<u8>,s:Snapshot,vc:u64}
-  impl PairIo for Mock{fn snapshot(&mut self)->Result<Snapshot,String>{Ok(self.s)}fn copy_full(&mut self,slot:usize,out:&mut[u8])->Result<(),String>{assert_eq!(slot,self.s.released as usize&511);out.copy_from_slice(&self.full);Ok(())}fn copy_view(&mut self,slot:usize,out:&mut[u8])->Result<(),String>{assert_eq!(slot,self.s.released as usize&511);assert_eq!(out.len(),self.view.len());out.copy_from_slice(&self.view);self.vc+=1;Ok(())}fn release(&mut self,run:u32,tail:u64)->Result<(),String>{assert_eq!(run,7);assert_eq!(tail,self.s.released+1);self.s.released=tail;Ok(())}}
+  impl PairIo for Mock{fn snapshot(&mut self)->Result<Snapshot,String>{Ok(self.s)}fn copy_full(&mut self,slot:usize,out:&mut[u8])->Result<(),String>{assert_eq!(slot,self.s.released as usize&1023);out.copy_from_slice(&self.full);Ok(())}fn copy_view(&mut self,slot:usize,out:&mut[u8])->Result<(),String>{assert_eq!(slot,self.s.released as usize&1023);assert_eq!(out.len(),self.view.len());out.copy_from_slice(&self.view);self.vc+=1;Ok(())}fn release(&mut self,run:u32,tail:u64)->Result<(),String>{assert_eq!(run,7);assert_eq!(tail,self.s.released+1);self.s.released=tail;Ok(())}}
   let mut io=Mock{full:vec![],view:vec![],s:Snapshot{cookie:7,committed:0,reserved:0,released:0,..Default::default()},vc:0};let mut r=PairReader::attach(io.s).unwrap();let mut expected_views=0;
-  for ordinal in 0..514u64{let mode=ordinal%4;let p=root().join(format!("mode{mode}/ordinal-0-k2.hex"));io.full=bytes(&p);io.view=bytes(&p.with_extension("viewhex"));for(i,b)in ordinal.to_le_bytes().iter().enumerate(){io.full[(56+i)*8+7]=*b;}io.s.committed+=1;io.s.reserved+=1;if mode!=0{expected_views+=1;}r.service(&mut io,|h,p,v|{assert_eq!(h.ordinal,ordinal);assert_eq!(p.len(),4096);assert_eq!(v.len(),view_len(h));Ok(())}).unwrap();assert_eq!(io.s.released,ordinal+1);}
+  for ordinal in 0..2050u64{let mode=ordinal%4;let p=root().join(format!("mode{mode}/ordinal-0-k2.hex"));io.full=bytes(&p);io.view=bytes(&p.with_extension("viewhex"));for(i,b)in ordinal.to_le_bytes().iter().enumerate(){io.full[(56+i)*8+7]=*b;}io.s.committed+=1;io.s.reserved+=1;if mode!=0{expected_views+=1;}r.service(&mut io,|h,p,v|{assert_eq!(h.ordinal,ordinal);assert_eq!(p.len(),4096);assert_eq!(v.len(),view_len(h));Ok(())}).unwrap();assert_eq!(io.s.released,ordinal+1);}
   assert_eq!(r.consumed,514);assert_eq!(io.vc,expected_views);
  }
 }

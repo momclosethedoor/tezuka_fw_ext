@@ -40,7 +40,7 @@ jobs:
           (p/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
           PY
           cd artifact
-          sha256sum * > SHA256SUMS
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
           name: OBS-007C-memory-ring1024

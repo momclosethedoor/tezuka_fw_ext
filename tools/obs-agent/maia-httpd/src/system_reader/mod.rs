@@ -104,31 +104,31 @@ impl PairIo for Hardware{
  fn full_read(&self)->bool{!self.release_only}
  fn prepare_prefix(&mut self,first:u64,end:u64)->R<()>{
   self.covered.clear();if !self.batch_sync||self.release_only||first==end{return Ok(())}
-  let count=(end-first) as u32;let slot=(first&511)as u32;
+  let count=(end-first) as u32;let slot=(first&1023)as u32;
   if self.reuse_owned_cache && self.shift && self.previous_view!=0 && first.checked_sub(1)==self.retained_synced {
    // The split lookbehind remains physically owned until this record is read.
    // The preceding batch synced its entire committed slot. The read-only VMA
    // cannot dirty it, and PL cannot reuse it before cumulative release.
-   let prev=((slot+511)&511)as u32;
+   let prev=((slot+1023)&1023)as u32;
    self.covered.push((0,prev*32768,32768));
    self.covered.push((1,prev*2048,2048));
-   self.sync_circular(0,slot*32768,count*32768,16777216)?;
-   self.sync_circular(1,slot*2048,count*2048,1048576)?;
+   self.sync_circular(0,slot*32768,count*32768,33554432)?;
+   self.sync_circular(1,slot*2048,count*2048,2097152)?;
    self.retained_synced=Some(end-1);self.sync_reused_bytes+=32768+2048;
    return Ok(())
   }
   // Every range is a committed prefix plus its still-owned lookbehind. No
   // uncommitted record and no released previous pair may enter this batch.
-  let (start,n)=if self.shift&&self.previous_view==0{(((slot+511)&511)*32768+28416,count*32768)}else if self.shift{(((slot+511)&511)*32768,(count+1)*32768)}else{(slot*32768,count*32768)};
-  self.sync_circular(0,start,n,16777216)?;
-  if self.previous_view!=0{let vstart=if self.shift{((slot+511)&511)*2048}else{slot*2048};self.sync_circular(1,vstart,(count+1)*2048,1048576)?;}
+  let (start,n)=if self.shift&&self.previous_view==0{(((slot+1023)&1023)*32768+28416,count*32768)}else if self.shift{(((slot+1023)&1023)*32768,(count+1)*32768)}else{(slot*32768,count*32768)};
+  self.sync_circular(0,start,n,33554432)?;
+  if self.previous_view!=0{let vstart=if self.shift{((slot+1023)&1023)*2048}else{slot*2048};self.sync_circular(1,vstart,(count+1)*2048,2097152)?;}
   self.retained_synced=Some(end-1);
   Ok(())
  }
  fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,slot:usize,full:&mut[u8],overview:&mut[u8],sink:&mut F)->R<()>{
   if self.direct||self.release_only{
    if !self.shift{return Err("direct/header-only requires shift544".into())}
-   let pv=self.previous_view;let prev=(slot+511)&511;let a=prev*32768+28416+pv;let b=slot*32768;
+   let pv=self.previous_view;let prev=(slot+1023)&1023;let a=prev*32768+28416+pv;let b=slot*32768;
    self.ensure_sync(0,a as u32,if self.release_only{512}else{(4352-pv)as u32})?;
    let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(a),if self.release_only{512}else{4352-pv})};
    let h=continuous::header_prefix(prefix,3)?;let n=view::view_len(h);
@@ -150,14 +150,14 @@ impl PairIo for Hardware{
 
  fn snapshot(&mut self)->R<Snapshot>{self.w(0x54,self.valid|32);let status=self.r(0x154);if status&8!=0{return Err("sticky rejected command".into())}
   let physical=self.r64(0x110);let reserved=self.r64(0x108);
-  if reserved<physical||reserved-physical>512{return Err("physical ring ownership".into())}
+  if reserved<physical||reserved-physical>1024{return Err("physical ring ownership".into())}
   self.physical_high_water=self.physical_high_water.max(reserved-physical);
-  if self.shift&&self.active&&self.logical_tail.is_none()&&reserved-physical==512{return Err("first split record lost lookbehind before reader attached; no release".into())}
+  if self.shift&&self.active&&self.logical_tail.is_none()&&reserved-physical==1024{return Err("first split record lost lookbehind before reader attached; no release".into())}
   let logical=self.logical_tail.unwrap_or(physical);
   if logical<physical||logical-physical>1{return Err("split release ownership".into())}
   Ok(Snapshot{committed:self.r64(0x100),reserved:self.r64(0x108),released:logical,input_seq:self.r64(0x118),finished:self.r64(0x128),selected:self.r64(0x130),unselected:self.r64(0x138),dirty_drop:self.r(0x148),stop_drop:self.r(0x14c),stop_input_limit:self.r64(0x158),cookie:self.r(0x150),dropped:self.r(0x140)as u64+self.r(0x144)as u64+self.r(0x160)as u64,running:status&1!=0,dma_busy:status&2!=0,drained:status&16!=0,fault:status&4!=0})}
  fn copy_full(&mut self,slot:usize,out:&mut[u8])->R<()>{if self.shift{
-  let prev=(slot+511)&511;let pv=self.previous_view;let(a,rest)=out.split_at_mut(4352-pv);let(b,c)=rest.split_at_mut(pv);
+  let prev=(slot+1023)&1023;let pv=self.previous_view;let(a,rest)=out.split_at_mut(4352-pv);let(b,c)=rest.split_at_mut(pv);
   self.copy(0,prev*32768+28416+pv,a)?;
   if pv!=0{self.copy(1,prev*2048,b)?;}
   self.copy(0,slot*32768,c)?;
@@ -196,7 +196,7 @@ fn execute(c:&Config)->R<()>{
   io.prepare(c)?;io.start()?;std::thread::sleep(Duration::from_secs_f64(c.seconds));io.stop();let t=Instant::now();while {let s=io.snapshot()?;s.dma_busy||!s.drained||s.committed!=s.reserved}{if t.elapsed()>Duration::from_secs(3){return Err("capture STOP timeout".into())}std::thread::sleep(Duration::from_millis(1));}
   save(c,"unreleased.json",&io.counters()?)?;
   // Heavy whole-ring evidence is outside every rate window, before ANY release.
-  for(r,n)in[(0,0x1000000),(1,0x100000)]{let mut b=vec![0;n];io.copy(r,0,&mut b)?;std::fs::write(c.output.join(if r==0{"full-ring.bin"}else{"view-ring.bin"}),b).map_err(|e|e.to_string())?;io.give_back()?;}
+  for(r,n)in[(0,0x2000000),(1,0x200000)]{let mut b=vec![0;n];io.copy(r,0,&mut b)?;std::fs::write(c.output.join(if r==0{"full-ring.bin"}else{"view-ring.bin"}),b).map_err(|e|e.to_string())?;io.give_back()?;}
   return Ok(())
  }
  if c.command!="rate"&&c.command!="drain"{return Err("command must be capture, drain, rate".into())}
