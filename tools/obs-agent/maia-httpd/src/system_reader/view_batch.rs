@@ -2,18 +2,18 @@ use std::{net::UdpSocket,time::{Duration,Instant}};
 pub struct UdpBatch {
  pub bytes:Vec<u8>,pub pending:u64,pub sent:u64,pub dropped:u64,pub datagrams:u64,
  pub max_records:usize,pub phase_on:bool,pub send_ns:u128,pub coalesce_us:u64,pub max_wait_ns:u128,
- first:Option<Instant>,
+ first:Option<Instant>,record_size:usize,
 }
 impl UdpBatch {
- pub fn configured(coalesce_us:u64,phase_on:bool,max_records:usize)->Self {
+ pub fn configured(coalesce_us:u64,phase_on:bool,max_records:usize,record_size:usize)->Self {
   assert!(matches!(max_records,2|4|8|16));
-  Self{max_records,bytes:Vec::with_capacity(568*max_records),pending:0,sent:0,dropped:0,datagrams:0,
-   phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None}
+  Self{max_records,bytes:Vec::with_capacity(record_size*max_records),pending:0,sent:0,dropped:0,datagrams:0,
+   phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size}
  }
- pub fn new()->Self {
+ pub fn new(record_size:usize)->Self {
   let delay=std::env::var("OBS_VIEW_COALESCE_US").ok().and_then(|s|s.parse::<u64>().ok()).filter(|v|*v<=10000).unwrap_or(0);
   let count=std::env::var("OBS_VIEW_BATCH_RECORDS").ok().and_then(|s|s.parse::<usize>().ok()).filter(|n|matches!(*n,2|4|8|16)).unwrap_or(2);
-  Self::configured(delay,std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),count)
+  Self::configured(delay,std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),count,record_size)
  }
  pub fn start_record(&mut self){if self.pending==0{self.first=Some(Instant::now());}}
  pub fn due(&self,now:Instant)->bool {
@@ -23,7 +23,7 @@ impl UdpBatch {
  pub fn flush(&mut self,s:&UdpSocket){
   if self.pending==0{return}
   let now=Instant::now();if let Some(t)=self.first{self.max_wait_ns=self.max_wait_ns.max(now.duration_since(t).as_nanos());}
-  for packet in self.bytes.chunks(568*self.max_records){let count=(packet.len()/568)as u64;
+  for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
    match s.send(packet){Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;},_=>self.dropped+=count}
   }
   self.bytes.clear();self.pending=0;self.first=None;
@@ -32,11 +32,11 @@ impl UdpBatch {
 }
 #[cfg(test)] mod tests {
  use super::*;
- fn add(q:&mut UdpBatch,value:u8){q.start_record();q.bytes.extend_from_slice(&[value;568]);q.pending+=1;}
+ fn add(q:&mut UdpBatch,value:u8){q.start_record();q.bytes.resize(q.bytes.len()+q.record_size,value);q.pending+=1;}
  #[test] fn owned_boundary_view_batch_pairs_and_preserves_wire_records(){
   let receiver=UdpSocket::bind("127.0.0.1:0").unwrap();receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
   let sender=UdpSocket::bind("127.0.0.1:0").unwrap();sender.connect(receiver.local_addr().unwrap()).unwrap();
-  let mut q=UdpBatch::configured(400,false,2);add(&mut q,11);let first=q.first.unwrap();
+  let mut q=UdpBatch::configured(400,false,2,568);add(&mut q,11);let first=q.first.unwrap();
   assert!(!q.due(first+Duration::from_micros(399)));assert!(q.due(first+Duration::from_micros(400)));
   add(&mut q,22);assert!(q.due(first));q.flush_due(&sender);
   let mut buf=[0u8;1200];assert_eq!(receiver.recv(&mut buf).unwrap(),1136);
@@ -45,18 +45,30 @@ impl UdpBatch {
   add(&mut q,33);q.flush(&sender);assert_eq!(receiver.recv(&mut buf).unwrap(),568);assert_eq!(&buf[..568],&[33;568]);
   assert_eq!((q.sent,q.datagrams,q.dropped),(3,2,0));assert!(!q.due(Instant::now()));
  }
- #[test] fn owned_boundary_view_batch_zero_delay_preserves_control(){let mut q=UdpBatch::configured(0,false,2);add(&mut q,7);assert!(q.due(q.first.unwrap()));}
+ #[test] fn owned_boundary_view_batch_zero_delay_preserves_control(){let mut q=UdpBatch::configured(0,false,2,568);add(&mut q,7);assert!(q.due(q.first.unwrap()));}
  #[test] fn owned_boundary_large_view_datagrams_preserve_every_record(){
   let receiver=UdpSocket::bind("127.0.0.1:0").unwrap();receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
   let sender=UdpSocket::bind("127.0.0.1:0").unwrap();sender.connect(receiver.local_addr().unwrap()).unwrap();
   let mut buf=[0u8;65535];
-  for count in [4usize,8,16]{let mut q=UdpBatch::configured(4000,false,count);
+  for count in [4usize,8,16]{let mut q=UdpBatch::configured(4000,false,count,568);
    for n in 0..count{add(&mut q,n as u8);}
    assert!(q.due(q.first.unwrap()));q.flush_due(&sender);
    assert_eq!(receiver.recv(&mut buf).unwrap(),count*568);
    for n in 0..count{assert_eq!(&buf[n*568..(n+1)*568],&[n as u8;568]);}
    assert_eq!((q.sent,q.datagrams,q.dropped),(count as u64,1,0));
   }
+ }
+ #[test] fn controlled_view_preserves_extended_records_when_batch_splits(){
+  let receiver=UdpSocket::bind("127.0.0.1:0").unwrap();receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+  let sender=UdpSocket::bind("127.0.0.1:0").unwrap();sender.connect(receiver.local_addr().unwrap()).unwrap();
+  let mut q=UdpBatch::configured(0,false,2,576);
+  for n in 1..=3{add(&mut q,n);}
+  q.flush(&sender);
+  let mut buf=[0u8;1500];
+  assert_eq!(receiver.recv(&mut buf).unwrap(),1152);
+  assert_eq!(&buf[..576],&[1;576]);assert_eq!(&buf[576..1152],&[2;576]);
+  assert_eq!(receiver.recv(&mut buf).unwrap(),576);assert_eq!(&buf[..576],&[3;576]);
+  assert_eq!((q.sent,q.datagrams,q.dropped),(3,2,0));
  }
 
 }
