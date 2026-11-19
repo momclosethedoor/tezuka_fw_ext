@@ -1,5 +1,6 @@
 //! Interactive owner for the row99 guarded RAM runtime.
 #![allow(missing_docs)]
+mod plan_math;
 mod tx;
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -48,20 +49,19 @@ struct Config {
     scan_tx: Vec<ScanTxProfile>,
 }
 
-#[derive(Clone, Deserialize, serde::Serialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScanTxProfile {
     pll_hz: u64,
     multiplier: u64,
-    side: i64,
     antenna: u64,
 }
 impl ScanTxProfile {
     fn tone(&self) -> u64 {
         self.pll_hz + FS / 64
     }
-    fn rf(&self, intermediate: u64) -> i64 {
-        (self.multiplier * self.tone()) as i64 + self.side * intermediate as i64
+    fn offset(&self) -> i64 {
+        (self.multiplier * self.tone()) as i64
     }
 }
 
@@ -172,7 +172,7 @@ fn validate(v: &Value) -> Result<()> {
                 enabled |= r["enabled"]
                     .as_bool()
                     .ok_or_else(|| anyhow!("enabled must be boolean"))?;
-                if !r["tx_slot"].is_null() {
+                if !r["tx_slot"].is_null() && r["tx_slot"] != "auto" {
                     int(r, "tx_slot", 0, 7)?;
                 }
             }
@@ -295,11 +295,19 @@ fn put(b: &mut [u8], offset: usize, n: u32) {
 fn put_hz(b: &mut [u8], offset: usize, n: u64) {
     b[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
 }
+
 fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec<u8>, Value)> {
     let mut bytes = template.to_vec();
     let mut locations = Vec::new();
     let mut rf_ranges = Vec::new();
     let mut indexes = Vec::new();
+    let mut planned_ranges = Vec::new();
+    let mut previous_slot = None;
+    let offsets = c
+        .scan_tx
+        .iter()
+        .map(ScanTxProfile::offset)
+        .collect::<Vec<_>>();
     for range in state["scan"]["ranges"]
         .as_array()
         .ok_or_else(|| anyhow!("scan ranges"))?
@@ -309,63 +317,35 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
         }
         let lo = int(range, "lo_hz", 70_000_000, 18_000_000_000)?;
         let hi = int(range, "hi_hz", lo + 120_000, 18_000_000_000)?;
-        let slot = range["tx_slot"].as_u64().map(|s| s as usize);
-        let profile = slot
-            .map(|s| {
-                c.scan_tx
-                    .get(s)
-                    .ok_or_else(|| anyhow!("uncalibrated TX slot {s}"))
-            })
-            .transpose()?;
-        if let Some(p) = profile {
-            let offset = (p.tone() * p.multiplier) as i64;
-            let covered =
-                |rf| (70_000_000..=6_000_000_000).contains(&((rf as i64 - offset) * p.side));
-            ensure!(
-                covered(lo) && covered(hi),
-                "selected RF interval outside mixer IF coverage"
-            );
+        let candidate = |slot: usize| {
+            offsets
+                .get(slot)
+                .and_then(|offset| plan_math::cover(&c.positions, *offset, lo, hi))
+                .map(|(side, indices)| (Some(slot), side, indices))
+        };
+        let (slot, side, positions) = if range["tx_slot"] == "auto" {
+            plan_math::automatic(&c.positions, &offsets, previous_slot, lo, hi)
+                .map(|(slot, side, positions)| (Some(slot), side, positions))
+        } else if let Some(slot) = range["tx_slot"].as_u64() {
+            candidate(slot as usize)
         } else {
-            ensure!(
-                hi <= 6_000_000_000,
-                "selected RF interval outside direct RX coverage"
-            );
+            plan_math::cover(&c.positions, 0, lo, hi).map(|(side, indices)| (None, side, indices))
         }
+        .ok_or_else(|| {
+            anyhow!(
+                "RF {lo}..{hi} Hz has no complete calibrated coverage on requested route/TX slot"
+            )
+        })?;
+        if slot.is_some() {
+            previous_slot = slot;
+        }
+        let profile = slot.map(|s| &c.scan_tx[s]);
+        let image = profile.map(|p| [2 * p.offset() - hi as i64, 2 * p.offset() - lo as i64]);
+        planned_ranges.push(json!({"rf_hz":[lo,hi],"tx_slot":slot,"side_sign":side,
+            "mixer_lo_hz":profile.map(ScanTxProfile::offset),"image_rf_hz":image,
+            "rx_positions":positions.len()}));
         rf_ranges.push([lo, hi]);
-        let mut covered = lo;
-        let direction = profile.map_or(1, |p| p.side);
-        for ordinal in 0..c.positions.len() {
-            let idx = if direction == 1 {
-                ordinal
-            } else {
-                c.positions.len() - 1 - ordinal
-            };
-            let intermediate = c.positions[idx];
-            let rf = profile.map_or(intermediate as i64, |p| p.rf(intermediate));
-            if !(70_000_000..=18_000_000_000).contains(&rf) {
-                continue;
-            }
-            let f = rf as u64;
-            let (a, b) = (f.saturating_sub(23_800_000), f + 23_800_000);
-            if b <= lo || a >= hi {
-                continue;
-            }
-            ensure!(
-                a <= covered,
-                "range begins or crosses outside calibrated RX coverage"
-            );
-            covered = covered.max(b);
-            if let Some((_, _, from, to)) = indexes
-                .iter_mut()
-                .find(|(i, s, _, _)| *i == idx && *s == slot)
-            {
-                *from = lo.min(*from);
-                *to = hi.max(*to);
-            } else {
-                indexes.push((idx, slot, lo, hi));
-            }
-        }
-        ensure!(covered >= hi, "range ends outside calibrated RX coverage");
+        indexes.extend(positions.into_iter().map(|idx| (idx, slot, side, lo, hi)));
     }
     ensure!(
         (1..=128).contains(&indexes.len()),
@@ -383,21 +363,23 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
             .1
             .map_or(direct_antenna, |slot| c.scan_tx[slot].antenna)
     };
-    for (i, &(idx, slot, lo, hi)) in indexes.iter().enumerate() {
+    for (i, &(idx, slot, side, lo, hi)) in indexes.iter().enumerate() {
         let intermediate = c.positions[idx];
         let profile = slot.map(|s| &c.scan_tx[s]);
-        let rf = profile.map_or(intermediate as i64, |p| p.rf(intermediate));
+        let offset = profile.map_or(0, ScanTxProfile::offset);
+        let rf = offset + side * intermediate as i64;
         let antenna = route_at(i);
         locations.push(json!({"rx_lo_hz":intermediate,"rf_center_hz":rf,
-            "side_sign":profile.map_or(1,|p|p.side),"mixer":slot.is_some(),"antenna":antenna,
+            "side_sign":side,"mixer":slot.is_some(),"antenna":antenna,
             "tx_slot":slot,"tx_pll_hz":profile.map(|p|p.pll_hz),"tx_tone_hz":profile.map(|p|p.tone()),
+            "image_rf_center_hz":slot.map(|_|2*offset-rf),"rx_available":slot.is_none(),
             "rf_ranges":[[lo,hi]]}));
         for off in [MAP, NEXT] {
             let entry = off + 32 * i;
             bytes[entry..entry + 32]
                 .copy_from_slice(&template[MAP + 32 * idx..MAP + 32 * (idx + 1)]);
-            let transition =
-                (marker && i == 0) || antenna != route_at((i + indexes.len() - 1) % indexes.len());
+            let transition = (i == 0 && (marker || antenna != direct_antenna))
+                || antenna != route_at((i + indexes.len() - 1) % indexes.len());
             let flags = slot.map_or(0, |s| 4 | ((s as u32) << 8))
                 | if transition {
                     3 | ((antenna as u32) << 16)
@@ -418,7 +400,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
             put_hz(&mut bytes, entry + 24, hi);
         }
     }
-    if let Some(first) = indexes.iter().find_map(|(_, slot, _, _)| *slot) {
+    if let Some(first) = indexes.iter().find_map(|(_, slot, _, _, _)| *slot) {
         put(&mut bytes, 12328, 1);
         // Prepare the TX fastlock executor independently of RF emission.
         put(&mut bytes, 12332, 0);
@@ -426,7 +408,10 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
     } else {
         put(&mut bytes, 12328, 0);
     }
-    Ok((bytes, json!({"rf_ranges":rf_ranges,"positions":locations})))
+    Ok((
+        bytes,
+        json!({"rf_ranges":rf_ranges,"positions":locations,"planned_ranges":planned_ranges}),
+    ))
 }
 
 fn guard(fd: &File, cmd: libc::c_ulong, arg: *mut libc::c_void) -> Result<[u32; 128]> {
@@ -1133,7 +1118,6 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
                 && c.scan_tx.iter().enumerate().all(|(slot, p)| {
                     (70_000_000..=6_000_000_000 - FS / 64).contains(&p.pll_hz)
                         && (1..=2).contains(&p.multiplier)
-                        && matches!(p.side, -1 | 1)
                         && p.antenna <= 7
                         && template[12352 + 16 * slot..12368 + 16 * slot]
                             .iter()
@@ -1220,7 +1204,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         .enumerate()
         .map(|(slot, p)| {
             json!({"slot":slot,"pll_hz":p.pll_hz,"tone_hz":p.tone(),
-        "side":p.side,"multiplier":p.multiplier,"antenna":p.antenna})
+        "multiplier":p.multiplier,"antenna":p.antenna})
         })
         .collect::<Vec<_>>();
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":false,
@@ -1281,3 +1265,62 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
 
 // Owner moves the register mapping to its sole acquisition worker.
 unsafe impl Send for Registers {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_reuses_one_slot_for_each_range_and_mirrors_the_if() {
+        let p = ScanTxProfile {
+            pll_hz: 2_250_000_000,
+            multiplier: 2,
+            antenna: 3,
+        };
+        let c = Config {
+            boot_id: String::new(),
+            setup: "setup".into(),
+            output: "out".into(),
+            view: "127.0.0.1:1".parse().unwrap(),
+            video: "127.0.0.1:2".parse().unwrap(),
+            route: "127.0.0.1:3".parse().unwrap(),
+            positions: vec![
+                1_339_080_000,
+                1_351_080_000,
+                1_363_080_000,
+                1_375_080_000,
+                1_387_080_000,
+            ],
+            scan: Value::Null,
+            analysis: Value::Null,
+            external_mixer: None,
+            scan_tx: vec![p; 8],
+        };
+        let input = json!({"scan":{"ranges":[
+            {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},
+            {"lo_hz":3_114_840_000u64,"hi_hz":3_162_840_000u64,"enabled":true,"tx_slot":"auto"}]},
+            "map_version":3,"route":{"antenna":0}});
+        let (map, desc) = plan(&c, &vec![0u8; 12488], &input, false).unwrap();
+        assert_eq!(desc["planned_ranges"][0]["side_sign"], 1);
+        assert_eq!(desc["planned_ranges"][1]["side_sign"], -1);
+        assert_eq!(
+            desc["planned_ranges"][0]["image_rf_hz"],
+            desc["planned_ranges"][1]["rf_hz"]
+        );
+        assert_eq!(desc["planned_ranges"][1]["tx_slot"], 5);
+        assert_eq!(word(&map, 12328), 1);
+        assert_eq!(word(&map, 12332), 0);
+        assert_eq!(word(&map, 12340), 5);
+        let first_len = desc["planned_ranges"][0]["rx_positions"].as_u64().unwrap() as usize;
+        assert!(first_len > 1);
+        assert_eq!(desc["positions"][first_len]["rx_lo_hz"], 1_387_080_000u64);
+        for i in 0..word(&map, 8) as usize {
+            assert_eq!(word(&map, MAP + 32 * i + 4) & 0x704, 0x504);
+            assert_eq!(word(&map, NEXT + 32 * i + 4) & 0x704, 0x504);
+        }
+        let mut crosses = input.clone();
+        crosses["scan"]["ranges"][0]["lo_hz"] = json!(4_501_000_000u64);
+        crosses["scan"]["ranges"][0]["hi_hz"] = json!(4_503_000_000u64);
+        assert!(plan(&c, &vec![0u8; 12488], &crosses, false).is_err());
+    }
+}
