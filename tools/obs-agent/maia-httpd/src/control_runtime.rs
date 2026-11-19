@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
@@ -47,6 +48,8 @@ struct Config {
     external_mixer: Option<Mixer>,
     #[serde(default)]
     scan_tx: Vec<ScanTxProfile>,
+    #[serde(default)]
+    antenna_bands: BTreeMap<u64, Vec<[u64; 2]>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -167,8 +170,8 @@ fn validate(v: &Value) -> Result<()> {
                 .ok_or_else(|| anyhow!("ranges: 1..16"))?;
             let mut enabled = false;
             for r in ranges {
-                let lo = int(r, "lo_hz", 70_000_000, 18_000_000_000)?;
-                int(r, "hi_hz", lo + 120_000, 18_000_000_000)?;
+                let lo = int(r, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
+                int(r, "hi_hz", lo + 120_000, plan_math::MAX_RF)?;
                 enabled |= r["enabled"]
                     .as_bool()
                     .ok_or_else(|| anyhow!("enabled must be boolean"))?;
@@ -303,10 +306,19 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
     let mut indexes = Vec::new();
     let mut planned_ranges = Vec::new();
     let mut previous_slot = None;
-    let offsets = c
+    let direct_antenna = state["route"]["antenna"].as_u64().unwrap_or(0);
+    let bands = |antenna| c.antenna_bands.get(&antenna).map_or(&[][..], Vec::as_slice);
+    let direct = plan_math::Candidate {
+        offset: 0,
+        antenna_bands: bands(direct_antenna),
+    };
+    let candidates = c
         .scan_tx
         .iter()
-        .map(ScanTxProfile::offset)
+        .map(|p| plan_math::Candidate {
+            offset: p.offset(),
+            antenna_bands: bands(p.antenna),
+        })
         .collect::<Vec<_>>();
     for range in state["scan"]["ranges"]
         .as_array()
@@ -315,37 +327,42 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
         if range["enabled"] != true {
             continue;
         }
-        let lo = int(range, "lo_hz", 70_000_000, 18_000_000_000)?;
-        let hi = int(range, "hi_hz", lo + 120_000, 18_000_000_000)?;
-        let candidate = |slot: usize| {
-            offsets
-                .get(slot)
-                .and_then(|offset| plan_math::cover(&c.positions, *offset, lo, hi))
-                .map(|(side, indices)| (Some(slot), side, indices))
-        };
-        let (slot, side, positions) = if range["tx_slot"] == "auto" {
-            plan_math::automatic(&c.positions, &offsets, previous_slot, lo, hi)
-                .map(|(slot, side, positions)| (Some(slot), side, positions))
-        } else if let Some(slot) = range["tx_slot"].as_u64() {
-            candidate(slot as usize)
+        let lo = int(range, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
+        let hi = int(range, "hi_hz", lo + 120_000, plan_math::MAX_RF)?;
+        let sections = if range["tx_slot"] == "auto" {
+            plan_math::automatic(&c.positions, &candidates, previous_slot, lo, hi)
         } else {
-            plan_math::cover(&c.positions, 0, lo, hi).map(|(side, indices)| (None, side, indices))
+            let slot = range["tx_slot"].as_u64().map(|s| s as usize);
+            slot.map_or(Some(&direct), |s| candidates.get(s))
+                .and_then(|candidate| plan_math::cover(&c.positions, candidate, slot, lo, hi))
+                .map(|segment| vec![segment])
         }
         .ok_or_else(|| {
             anyhow!(
                 "RF {lo}..{hi} Hz has no complete calibrated coverage on requested route/TX slot"
             )
         })?;
-        if slot.is_some() {
-            previous_slot = slot;
-        }
-        let profile = slot.map(|s| &c.scan_tx[s]);
-        let image = profile.map(|p| [2 * p.offset() - hi as i64, 2 * p.offset() - lo as i64]);
-        planned_ranges.push(json!({"rf_hz":[lo,hi],"tx_slot":slot,"side_sign":side,
-            "mixer_lo_hz":profile.map(ScanTxProfile::offset),"image_rf_hz":image,
-            "rx_positions":positions.len()}));
         rf_ranges.push([lo, hi]);
-        indexes.extend(positions.into_iter().map(|idx| (idx, slot, side, lo, hi)));
+        for section in sections {
+            let plan_math::Segment {
+                slot,
+                side,
+                lo,
+                hi,
+                indexes: positions,
+            } = section;
+            if slot.is_some() {
+                previous_slot = slot;
+            }
+            let profile = slot.map(|s| &c.scan_tx[s]);
+            let image = profile.map(|p| [2 * p.offset() - hi as i64, 2 * p.offset() - lo as i64]);
+            planned_ranges.push(json!({"rf_hz":[lo,hi],"tx_slot":slot,"side_sign":side,
+                "antenna":profile.map_or(direct_antenna,|p|p.antenna),
+                "mixer_lo_hz":profile.map(ScanTxProfile::offset),"image_rf_hz":image,
+                "image_overlap_hz":slot.and_then(|s|plan_math::image_overlap(&candidates[s],lo,hi)),
+                "rx_positions":positions.len()}));
+            indexes.extend(positions.into_iter().map(|idx| (idx, slot, side, lo, hi)));
+        }
     }
     ensure!(
         (1..=128).contains(&indexes.len()),
@@ -357,7 +374,6 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
     put(&mut bytes, 16, v);
     put(&mut bytes, 20, v + 1);
     bytes[MAP..NEXT + 4096].fill(0);
-    let direct_antenna = state["route"]["antenna"].as_u64().unwrap_or(0);
     let route_at = |index: usize| {
         indexes[index]
             .1
@@ -980,6 +996,11 @@ fn worker(
                     ("scan", json!(scan)),
                     ("fs_hz", json!(FS)),
                     ("flags", json!(h.flags)),
+                    ("fft_bins", json!(4096)),
+                    (
+                        "view_bins",
+                        json!([0, 512, 1024, 2048][((h.flags >> 3) & 3) as usize]),
+                    ),
                     ("TX_OFF", json!(!tx_active)),
                 ] {
                     s.insert(k.into(), v);
@@ -1085,7 +1106,19 @@ fn worker(
 
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
-    let c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    for (&antenna, bands) in &mut c.antenna_bands {
+        ensure!(
+            antenna <= 7
+                && !bands.is_empty()
+                && bands.len() <= 16
+                && bands
+                    .iter()
+                    .all(|[lo, hi]| *lo >= 70_000_000 && lo < hi && *hi <= plan_math::MAX_RF),
+            "invalid calibrated RF bands for antenna {antenna}"
+        );
+        bands.sort_unstable();
+    }
     validate(&c.scan)?;
     validate(&c.analysis)?;
     ensure!(
@@ -1208,7 +1241,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         })
         .collect::<Vec<_>>();
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":false,
-        "scan_tx_profiles":profiles,"scan_tx_rf":false});
+        "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_max_rf_hz":plan_math::MAX_RF,
+        "antenna_bands":c.antenna_bands});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(
@@ -1295,6 +1329,7 @@ mod tests {
             analysis: Value::Null,
             external_mixer: None,
             scan_tx: vec![p; 8],
+            antenna_bands: BTreeMap::new(),
         };
         let input = json!({"scan":{"ranges":[
             {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},
