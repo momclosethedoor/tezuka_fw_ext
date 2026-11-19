@@ -395,9 +395,10 @@ impl Drop for Registers {
 }
 
 fn tune(state: &mut Value) -> Result<()> {
-    let mode = state["mode"].as_str().unwrap();
-    let center = int(&state[mode], "center_hz", 70_000_000, 6_000_000_000)?;
-    let width = int(&state[mode], "width_hz", 120_000, 48_000_000)?;
+    let video = state["mode"] == "video";
+    let settings = &state[if video { "video" } else { "analysis" }];
+    let center = int(settings, "center_hz", 70_000_000, 6_000_000_000)?;
+    let width = int(settings, "width_hz", 120_000, 48_000_000)?;
     ensure!(
         center - width / 2 >= 70_000_000 && center + width.div_ceil(2) <= 6_000_000_000,
         "selected RF interval not covered"
@@ -407,12 +408,12 @@ fn tune(state: &mut Value) -> Result<()> {
     ensure!(center.abs_diff(lo) <= 10, "RX LO readback");
     state["rx_lo_hz"] = json!(lo);
     state["if_hz"] = json!(center);
-    state["ddc_hz"] = if mode == "video" {
+    state["ddc_hz"] = if video {
         json!(center as i64 - lo as i64)
     } else {
         Value::Null
     };
-    if mode == "analysis" {
+    if !video {
         state["spectrum"] = json!({"rf_ranges":[[center-width/2,center+width.div_ceil(2)]],
             "positions":[{"rx_lo_hz":lo,"rf_center_hz":lo,"side_sign":1,"mixer":false}]});
     }
