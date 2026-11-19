@@ -229,7 +229,7 @@ pub(crate) struct RunControl<'a>{
  pub check:&'a dyn Fn()->R<()>,
 }
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
- if c.trace_limit==0||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000; header-only OFF without check/save; batch1..64".into())}
+ if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
  if c.diagnostic_sync.is_some(){return discard::execute(c)}
  if c.owned_pipeline{return Err("full-copy experiment rejected; use immediate release reader".into())}
@@ -257,7 +257,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(q)=control{if draining.get(){return Ok(())}if !announced.replace(true){(q.started)(h);}}
   if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.start_record();net.bytes.extend_from_slice(if control.is_some(){b"GVIEW4\0\0"}else{b"GVIEW3\0\0"});for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}if let Some(q)=control{net.bytes.extend_from_slice(&q.generation.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}}}
-  if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}Ok(())
+  if c.trace_limit!=0{if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}}Ok(())
  };
  loop{
   if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin_link=interface_counters();begin_network=network.borrow().counts();begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
@@ -284,7 +284,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
  if let Some(err)=route_failure{return Err(err);}
  drop(sink);
- let after=io.counters()?;let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}
+ let after=io.counters()?;if c.trace_limit!=0{let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}}
  if c.save_ring{
   // Explicit diagnostic export after STOP/DRAINED; RF/SPI ownership remains
   // with this runtime until the immutable snapshot has been saved.
