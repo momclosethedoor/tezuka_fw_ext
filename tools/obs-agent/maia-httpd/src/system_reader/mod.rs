@@ -96,6 +96,34 @@ impl Hardware{
   if self.r(0x1bc)!=1||self.r(0x1a8)!=self.info.full as u32||self.r(0x1ac)!=self.info.view as u32{return Err("staged memory validation".into())}Ok(())
  }
  fn start(&mut self)->R<()>{let before=self.snapshot()?.cookie;self.valid=1;self.active=true;self.w(0x54,3);let s=self.snapshot()?;if !s.running||s.cookie!=before+1{return Err("START rejected".into())}self.last_release=Instant::now();Ok(())}
+ fn cold_split(&mut self)->R<Value>{
+  let initial=self.snapshot()?;
+  if !self.shift||initial.cookie!=1||initial.released!=0{return Ok(Value::Null)}
+  let deadline=Instant::now()+Duration::from_secs(1);
+  loop{
+   let s=self.snapshot()?;
+   if !s.running||s.fault||s.cookie!=1||s.released!=0||s.reserved>=view::SLOTS as u64{
+    return Err("cold split lost initial ownership".into())
+   }
+   if s.committed>=2{break}
+   if STOP.load(Ordering::Relaxed)||Instant::now()>=deadline{return Err("cold split header deadline".into())}
+   std::thread::sleep(Duration::from_micros(40));
+  }
+  let mut prefix=[0u8;512];
+  self.copy(0,(view::SLOTS-1)*32768+28416+self.previous_view,&mut prefix)?;
+  if !prefix.iter().skip(7).step_by(8).all(|&byte|byte==0){
+   self.give_back()?;
+   return Ok(Value::Null)
+  }
+  self.copy(0,28416+self.previous_view,&mut prefix)?;
+  let next=continuous::header_prefix(&prefix,3)?;
+  let first_epoch=self.live64(0x198);
+  if next.ordinal!=1||next.epoch<first_epoch{return Err("cold split successor identity".into())}
+  // Advance the logical cursor while retaining physical slot 0 for ordinal 1.
+  self.release(1,1)?;
+  Ok(json!({"discarded":1,"run":1,"ordinal":0,"first_epoch":first_epoch,
+            "next_epoch":next.epoch,"physical_released":self.r64(0x110)}))
+ }
  fn stop(&mut self){self.valid=0;self.w(0x54,4);self.active=false;}
  fn read_snapshot(&mut self,details:bool)->R<Snapshot>{let phase=self.phase_on.then(Instant::now);self.w(0x54,self.valid|32);let status=self.r(0x154);if status&8!=0{return Err("sticky rejected command".into())}
   let physical=self.r64(0x110);let reserved=self.r64(0x108);
@@ -211,7 +239,8 @@ fn execute(c:&Config)->R<()>{
  }
  if c.command!="rate"&&c.command!="drain"{return Err("command must be capture, drain, rate".into())}
  if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
- if c.command=="rate"{io.prepare(c)?;io.start()?;}
+ let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split()?}else{Value::Null};
+ save(c,"cold-start.json",&cold)?;
  let mut reader=view::PairReader::attach(io.snapshot()?)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
@@ -243,7 +272,7 @@ fn execute(c:&Config)->R<()>{
   }
  }
  if io.pressure_on{save(c,"pressure.json",&json!({"columns":["board_monotonic_ns","reserved","committed","physical_released"],"period_min_ms":2,"omitted":io.pressure_omitted,"samples":io.pressure}))?;}
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum","network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum","network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);

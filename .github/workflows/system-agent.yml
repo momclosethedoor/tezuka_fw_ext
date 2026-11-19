@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obs007c-arm-mode]
+    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9]
     paths: ['tools/obs-agent/**', '.github/workflows/system-agent.yml']
   workflow_dispatch:
 permissions:
