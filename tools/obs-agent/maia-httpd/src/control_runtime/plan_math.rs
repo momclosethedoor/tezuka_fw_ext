@@ -1,6 +1,5 @@
 //! Pure RF/IF coverage over ordered, calibrated RX centers.
 pub(super) const MAX_RF: u64 = 18_000_000_000;
-pub(super) const DEFAULT_FILTER_LIMIT: u64 = 12_500_000_000;
 pub(super) const DIRECT_LIMIT: u64 = 6_000_000_000;
 const HALF_USEFUL: u64 = 23_800_000;
 const MIN_IF: i64 = 70_000_000;

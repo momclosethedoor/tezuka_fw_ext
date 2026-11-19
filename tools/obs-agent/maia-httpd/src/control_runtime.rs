@@ -50,24 +50,47 @@ struct Config {
     #[serde(default)]
     scan_tx: Vec<ScanTxProfile>,
     #[serde(default)]
-    antenna_bands: BTreeMap<u64, Vec<[u64; 2]>>,
-    #[serde(default = "filter_limit")]
-    rf_filter_max_hz: u64,
+    antenna_bands: AntennaBands,
     #[serde(default)]
     field_preview: Option<field::Config>,
 }
 
-fn filter_limit() -> u64 {
-    plan_math::DEFAULT_FILTER_LIMIT
+type AntennaBands = BTreeMap<u64, Vec<[u64; 2]>>;
+fn parse_antenna_bands(source: &Value) -> Result<AntennaBands> {
+    if source.is_null() {
+        return Ok(BTreeMap::new());
+    }
+    let mut bands: AntennaBands = serde_json::from_value(source.clone())?;
+    ensure!(
+        !bands.is_empty() && bands.len() <= 8,
+        "antenna_bands must specify 1…8 antennas"
+    );
+    for (&antenna, intervals) in &mut bands {
+        ensure!(
+            antenna <= 7
+                && !intervals.is_empty()
+                && intervals.len() <= 16
+                && intervals
+                    .iter()
+                    .all(|[lo, hi]| *lo >= 70_000_000 && lo < hi && *hi <= plan_math::MAX_RF),
+            "invalid RF bands for antenna {antenna}"
+        );
+        intervals.sort_unstable();
+    }
+    Ok(bands)
 }
-fn scan_limit(c: &Config) -> u64 {
-    let band_max = c.antenna_bands.values().flatten().map(|band| band[1]).max();
-    let fallback = if c.scan_tx.is_empty() {
-        plan_math::DIRECT_LIMIT
-    } else {
-        c.rf_filter_max_hz
-    };
-    band_max.unwrap_or(fallback).min(c.rf_filter_max_hz)
+fn scan_bounds(c: &Config, bands: &AntennaBands) -> [u64; 2] {
+    let entries = bands.values().flatten();
+    let lower = entries.clone().map(|b| b[0]).min().unwrap_or(70_000_000);
+    let upper = entries.map(|b| b[1]).max().unwrap_or_else(|| {
+        c.scan_tx
+            .iter()
+            .map(|p| p.offset() as u64 + plan_math::DIRECT_LIMIT)
+            .max()
+            .unwrap_or(plan_math::DIRECT_LIMIT)
+            .min(plan_math::MAX_RF)
+    });
+    [lower, upper]
 }
 
 #[derive(Clone, Deserialize)]
@@ -198,6 +221,10 @@ fn validate(v: &Value) -> Result<()> {
                 }
             }
             ensure!(!run || enabled, "no enabled range");
+            if let Some(bands) = v.get("antenna_bands") {
+                ensure!(!bands.is_null(), "antenna_bands must be an object");
+                parse_antenna_bands(bands)?;
+            }
         }
         Some("analysis") | Some("video") => {
             int(v, "center_hz", 70_000_000, 18_000_000_000)?;
@@ -332,11 +359,12 @@ struct Visit {
 fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec<u8>, Value)> {
     use plan_math::{Candidate, Segment};
     let direct_antenna = state["route"]["antenna"].as_u64().unwrap_or(0);
-    let bands = |antenna| c.antenna_bands.get(&antenna).map_or(&[][..], Vec::as_slice);
-    let direct_antenna_ids = if c.antenna_bands.is_empty() {
+    let received = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
+    let bands = |antenna| received.get(&antenna).map_or(&[][..], Vec::as_slice);
+    let direct_antenna_ids = if received.is_empty() {
         vec![direct_antenna]
     } else {
-        c.antenna_bands.keys().copied().collect::<Vec<_>>()
+        received.keys().copied().collect::<Vec<_>>()
     };
     let direct = direct_antenna_ids
         .iter()
@@ -352,7 +380,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
         .iter()
         .enumerate()
         .filter_map(|(slot, p)| {
-            if !c.antenna_bands.is_empty() && !c.antenna_bands.contains_key(&p.antenna) {
+            if !received.is_empty() && !received.contains_key(&p.antenna) {
                 return None;
             }
             Some(Candidate {
@@ -377,7 +405,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
     let mut sections = Vec::new();
     let mut intervals = Vec::new();
     let mut previous = Some((None, direct_antenna));
-    let max_rf = scan_limit(c);
+    let [min_rf, max_rf] = scan_bounds(c, &received);
     for row in state["scan"]["ranges"]
         .as_array()
         .ok_or_else(|| anyhow!("scan ranges"))?
@@ -385,7 +413,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
         if row["enabled"] != true {
             continue;
         }
-        let lo = int(row, "lo_hz", 70_000_000, max_rf)?;
+        let lo = int(row, "lo_hz", min_rf, max_rf)?;
         let hi = int(row, "hi_hz", lo + 120_000, max_rf)?;
         let mut list = Vec::new();
         if row["tx_slot"] == "auto" {
@@ -957,6 +985,17 @@ fn worker(
                             pending["route"] = pending["analysis_route"].clone();
                         }
                     }
+                    if op == "scan" {
+                        if request.get("antenna_bands").is_none()
+                            && pending["scan"].get("antenna_bands").is_some()
+                        {
+                            request["antenna_bands"] = pending["scan"]["antenna_bands"].clone();
+                        }
+                        pending["scan_bounds"] = json!(scan_bounds(
+                            &c,
+                            &parse_antenna_bands(&request["antenna_bands"])?
+                        ));
+                    }
                     pending["mode"] = json!(op);
                     pending[op] = request;
                 }
@@ -1279,23 +1318,12 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     if let Some(preview) = &c.field_preview {
         preview.validate()?;
     }
-    ensure!(
-        (70_120_000..=plan_math::MAX_RF).contains(&c.rf_filter_max_hz),
-        "RF filter limit"
-    );
-    for (&antenna, bands) in &mut c.antenna_bands {
-        ensure!(
-            antenna <= 7
-                && !bands.is_empty()
-                && bands.len() <= 16
-                && bands
-                    .iter()
-                    .all(|[lo, hi]| *lo >= 70_000_000 && lo < hi && *hi <= plan_math::MAX_RF),
-            "invalid calibrated RF bands for antenna {antenna}"
-        );
-        bands.sort_unstable();
+    if c.scan.get("antenna_bands").is_none() && !c.antenna_bands.is_empty() {
+        c.scan["antenna_bands"] = json!(c.antenna_bands);
     }
     validate(&c.scan)?;
+    let initial_antenna_bands = parse_antenna_bands(&c.scan["antenna_bands"])?;
+    let bounds = scan_bounds(&c, &initial_antenna_bands);
     validate(&c.analysis)?;
     ensure!(
         c.scan["op"] == "scan" && c.analysis["op"] == "analysis",
@@ -1406,7 +1434,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
-        "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual});
+        "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual,
+        "scan_bounds":bounds});
     let profiles = c
         .scan_tx
         .iter()
@@ -1417,9 +1446,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         })
         .collect::<Vec<_>>();
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
-        "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_max_rf_hz":scan_limit(&c),
-        "scan_min_rf_hz":c.antenna_bands.values().flatten().map(|b|b[0]).min().unwrap_or(70_000_000),
-        "rf_filter_max_hz":c.rf_filter_max_hz,"antenna_bands":c.antenna_bands});
+        "scan_tx_profiles":profiles,"scan_tx_rf":false});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(
@@ -1507,7 +1534,6 @@ mod tests {
             external_mixer: None,
             scan_tx: vec![p; 8],
             antenna_bands: BTreeMap::new(),
-            rf_filter_max_hz: filter_limit(),
             field_preview: None,
         };
         let input = json!({"scan":{"ranges":[
