@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(path)=&args.system_field_input { return maia_httpd::system_runtime::check_field(path,args.system_field_output.as_ref().unwrap()); }
+    if let Some(path)=&args.system_control { return maia_httpd::control_runtime::run(path,args.listen).await; }
     if let Some(path)=&args.system_observations { return maia_httpd::delivery_runtime::run(path,args.listen).await; }
     App::new(&args).await?.run().await
 }

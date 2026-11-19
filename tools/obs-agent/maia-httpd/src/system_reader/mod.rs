@@ -4,7 +4,8 @@ mod view;
 mod discard;
 mod view_batch;
 use view_batch::UdpBatch;
-use continuous::{Header,Snapshot};
+pub(crate) use continuous::Header;
+use continuous::Snapshot;
 use view::PairIo;
 use std::{fs::{File,OpenOptions},io::Write,os::fd::AsRawFd,path::PathBuf,sync::atomic::{AtomicBool,Ordering,compiler_fence},time::{Duration,Instant}};
 use serde::Deserialize;
@@ -220,7 +221,13 @@ fn full_read_without_sum(b:&[u8]){
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
-fn execute(c:&Config)->R<()>{
+pub(crate) struct RunControl<'a>{
+ pub generation:u64,
+ pub stop:&'a AtomicBool,
+ pub started:&'a dyn Fn(Header),
+ pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
+}
+fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.trace_limit==0||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000; header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
  if c.diagnostic_sync.is_some(){return discard::execute(c)}
@@ -242,16 +249,26 @@ fn execute(c:&Config)->R<()>{
  let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split()?}else{Value::Null};
  save(c,"cold-start.json",&cold)?;
  let mut reader=view::PairReader::attach(io.snapshot()?)?;
- let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();
+ let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let network=std::cell::RefCell::new(UdpBatch::new());let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
+ let announced=std::cell::Cell::new(false);let draining=std::cell::Cell::new(false);
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
-  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.start_record();net.bytes.extend_from_slice(b"GVIEW3\0\0");for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}}}
+  if let Some(q)=control{if draining.get(){return Ok(())}if !announced.replace(true){(q.started)(h);}}
+  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=512{return Err("delivery batch requires VIEW512".into())}let mut net=network.borrow_mut();net.start_record();net.bytes.extend_from_slice(if control.is_some(){b"GVIEW4\0\0"}else{b"GVIEW3\0\0"});for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}if let Some(q)=control{net.bytes.extend_from_slice(&q.generation.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}}}
   if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}Ok(())
  };
  loop{
   if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin_link=interface_counters();begin_network=network.borrow().counts();begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
-  if c.command=="rate"&&(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed)){end_link=interface_counters();end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break}
+  if c.command=="rate"&&(control.map_or(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed),|q|q.stop.load(Ordering::Acquire))){end_link=interface_counters();end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break}
+  if let Some(q)=control{if c.scan&&io.r(0x228)&8!=0{
+    let id=io.r(0x240);let epoch=io.live64(0x24c);let version=io.r(0x22c);
+    match (q.route)(id,epoch,version,io.r(0x234),io.r(0x244)){
+      Ok(Some(ack)) if ack==id&&io.r(0x240)==id&&io.r(0x228)&8!=0&&io.r(0x22c)==version=>{io.w(0x218,ack);io.w(0x220,2);},
+      Ok(_)=>{},
+      Err(e)=>{route_failure=Some(e);break;}
+    }
+  }}
   if status_due.elapsed()>=Duration::from_millis(100){if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();}
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
   let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush_due(sock);}max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
@@ -259,8 +276,9 @@ fn execute(c:&Config)->R<()>{
   if s.committed==s.released{std::hint::spin_loop();} // CSR has no completion fd/IRQ; no timer delay.
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
- io.stop();let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush(sock);}if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
+ draining.set(control.is_some());io.stop();let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush(sock);}if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
+ if let Some(err)=route_failure{return Err(err);}
  drop(sink);
  let after=io.counters()?;let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}
  if c.save_ring{
@@ -278,7 +296,8 @@ fn execute(c:&Config)->R<()>{
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
 pub fn status()->Value{STATUS.lock().unwrap().clone()}
 pub fn stop(){STOP.store(true,Ordering::Release);}
-pub fn run_json(data:&[u8])->R<()>{STOP.store(false,Ordering::Release);let c:Config=serde_json::from_slice(data).map_err(|e|e.to_string())?;execute(&c)}
+pub fn run_json(data:&[u8])->R<()>{STOP.store(false,Ordering::Release);let c:Config=serde_json::from_slice(data).map_err(|e|e.to_string())?;execute(&c,None)}
+pub(crate) fn run_controlled(data:&[u8],q:&RunControl<'_>)->R<()>{let c:Config=serde_json::from_slice(data).map_err(|e|e.to_string())?;execute(&c,Some(q))}
 
 impl UdpBatch {
  fn counts(&self)->Value{json!({"sent":self.sent,"dropped":self.dropped,"datagrams":self.datagrams,"send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,"max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string()})}

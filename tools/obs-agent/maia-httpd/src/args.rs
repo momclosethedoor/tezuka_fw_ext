@@ -13,6 +13,9 @@ pub struct Args {
     /// Integrated OBS007A scanner/preview RAM acceptance runtime.
     #[clap(long,conflicts_with_all=["continuous_observations","native_observations"])]
     pub system_observations: Option<PathBuf>,
+    /// Interactive OBS row99 owner configuration.
+    #[clap(long,conflicts_with_all=["system_observations","continuous_observations","native_observations","system_field_input"])]
+    pub system_control: Option<PathBuf>,
     /// Offline check of the in-process native field module, without hardware.
     #[clap(long,requires="system_field_output",conflicts_with="system_observations")]
     pub system_field_input: Option<PathBuf>,
@@ -65,6 +68,7 @@ impl Default for Args {
     fn default() -> Args {
         Args {
             system_observations: None,
+            system_control: None,
             system_field_input: None,
             system_field_output: None,
             continuous_observations: None,
