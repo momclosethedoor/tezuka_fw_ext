@@ -41,6 +41,55 @@ struct Config {
     positions: Vec<u64>,
     scan: Value,
     analysis: Value,
+    #[serde(default)]
+    external_mixer: Option<Mixer>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Mixer {
+    tone_hz: u64,
+    attenuation_mdb: u64,
+    multiplier: u64,
+    side: i64,
+    antenna: u64,
+}
+impl Mixer {
+    fn confirm_tx(&self) -> Result<Value> {
+        ensure!(
+            (70_000_000..=6_000_000_000).contains(&self.tone_hz)
+                && self.attenuation_mdb <= 89750
+                && (1..=2).contains(&self.multiplier)
+                && matches!(self.side, -1 | 1)
+                && self.antenna <= 7,
+            "invalid mixer fixture"
+        );
+        let pll = attr("out_altvoltage1_TX_LO_frequency")?.parse::<u64>()?;
+        ensure!(
+            (pll + FS / 64).abs_diff(self.tone_hz) <= 10,
+            "mixer carrier readback"
+        );
+        ensure!(
+            attr("out_altvoltage1_TX_LO_powerdown")? == "0",
+            "mixer LO off"
+        );
+        let attenuation = attr("out_voltage0_hardwaregain")?
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow!("TX attenuation"))?
+            .parse::<f64>()?;
+        ensure!(
+            (attenuation * 1000.0).round() == -(self.attenuation_mdb as f64),
+            "mixer attenuation readback"
+        );
+        Ok(
+            json!({"on":true,"powerdown":0,"frequency_hz":self.tone_hz,"pll_hz":pll,"attenuation_mdb":self.attenuation_mdb}),
+        )
+    }
+    fn route(&self) -> Value {
+        json!({"kind":"mixer","antenna":self.antenna,"multiplier":self.multiplier,"side":self.side,
+               "owner":"operator + leased IIO adapter"})
+    }
 }
 
 #[derive(Default)]
@@ -103,7 +152,7 @@ fn validate(v: &Value) -> Result<()> {
             ensure!(!run || enabled, "no enabled range");
         }
         Some("analysis") | Some("video") => {
-            int(v, "center_hz", 70_000_000, 6_000_000_000)?;
+            int(v, "center_hz", 70_000_000, 18_000_000_000)?;
             int(
                 v,
                 "width_hz",
@@ -397,25 +446,37 @@ impl Drop for Registers {
 fn tune(state: &mut Value) -> Result<()> {
     let video = state["mode"] == "video";
     let settings = &state[if video { "video" } else { "analysis" }];
-    let center = int(settings, "center_hz", 70_000_000, 6_000_000_000)?;
+    let center = int(settings, "center_hz", 70_000_000, 18_000_000_000)?;
     let width = int(settings, "width_hz", 120_000, 48_000_000)?;
+    let mixer = state["route"]["kind"] == "mixer";
+    let side = state["route"]["side"].as_i64().unwrap_or(1);
+    let offset = if mixer {
+        (state["route"]["multiplier"].as_u64().unwrap()
+            * state["tx"]["frequency_hz"].as_u64().unwrap()) as i64
+    } else {
+        0
+    };
+    let to_if = |rf: u64| (rf as i64 - offset) * side;
+    let intermediate = to_if(center);
+    let a = to_if(center - width / 2);
+    let b = to_if(center + width.div_ceil(2));
     ensure!(
-        center - width / 2 >= 70_000_000 && center + width.div_ceil(2) <= 6_000_000_000,
+        a.min(b) >= 70_000_000 && a.max(b) <= 6_000_000_000,
         "selected RF interval not covered"
     );
     state["rx_gain_db"] = json!(apply_gain(&state["analysis"])?);
-    let lo = set_attr("out_altvoltage0_RX_LO_frequency", center)?.parse::<u64>()?;
-    ensure!(center.abs_diff(lo) <= 10, "RX LO readback");
+    let lo = set_attr("out_altvoltage0_RX_LO_frequency", intermediate)?.parse::<u64>()?;
+    ensure!(intermediate.abs_diff(lo as i64) <= 10, "RX LO readback");
     state["rx_lo_hz"] = json!(lo);
-    state["if_hz"] = json!(center);
+    state["if_hz"] = json!(intermediate);
     state["ddc_hz"] = if video {
-        json!(center as i64 - lo as i64)
+        json!(intermediate - lo as i64)
     } else {
         Value::Null
     };
     if !video {
         state["spectrum"] = json!({"rf_ranges":[[center-width/2,center+width.div_ceil(2)]],
-            "positions":[{"rx_lo_hz":lo,"rf_center_hz":lo,"side_sign":1,"mixer":false}]});
+            "positions":[{"rx_lo_hz":lo,"rf_center_hz":offset+side*lo as i64,"side_sign":side,"mixer":mixer}]});
     }
     Ok(())
 }
@@ -497,7 +558,14 @@ fn continuous(
                 let (mut pos, mut seq) = (0u64, 0u32);
                 let mut bytes = [0u8; 65536];
                 let mut have = 0;
+                let mut lo_check = Instant::now();
                 while !shared.switch.load(Ordering::Acquire) {
+                    if lo_check.elapsed() >= Duration::from_millis(200) {
+                        if let Some(mixer) = &c.external_mixer {
+                            mixer.confirm_tx()?;
+                        }
+                        lo_check = Instant::now();
+                    }
                     match stdout.read(&mut bytes[have..]) {
                         Ok(0) => bail!("IIO real8 ended"),
                         Ok(n) => have += n,
@@ -655,6 +723,19 @@ fn worker(
             let mode = pending["mode"].as_str().unwrap().to_owned();
             pending["k"] = pending[&mode]["k"].clone();
             pending["running"] = json!(mode != "scan" || pending["scan"]["run"] == true);
+            if c.external_mixer.is_some() && op == "tx" {
+                pending["running"] = json!(false);
+                pending["spectrum"] = Value::Null;
+                pending["waiting"] = json!("mixer LO off");
+                return Ok(None);
+            }
+            if let Some(mixer) = &c.external_mixer {
+                ensure!(
+                    mode != "scan" && op != "route",
+                    "mixer bench supports static analysis/video under PS ownership"
+                );
+                pending["tx"] = mixer.confirm_tx()?;
+            }
             if mode == "video" {
                 pending["ddc_fs_hz"] = json!(FS / 4);
             }
@@ -683,12 +764,12 @@ fn worker(
         let result = (|| {
             let mut setup = config_result?;
             let mode = actual.borrow()["mode"].as_str().unwrap().to_owned();
-            if mode == "video" {
-                return continuous(&c, &shared, &actual.borrow(), id, &regs);
-            }
             if actual.borrow()["running"] != true {
                 receipt(&shared, &actual.borrow(), id, None);
                 return Ok(());
+            }
+            if mode == "video" {
+                return continuous(&c, &shared, &actual.borrow(), id, &regs);
             }
             if let Some(setup) = setup.as_mut() {
                 guard(&guard_fd, 0x4601, setup.as_mut_ptr().cast())?;
@@ -701,7 +782,8 @@ fn worker(
             let k = actual.borrow()["k"].clone();
             let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":1,"previous_mode":1,
                 "seconds":1.0,"warmup":0.0,"shift544":true,"settling":0,"batch_limit":64,"direct":true,"batch_sync":true,
-                "neon":true,"hot":scan,"scan":scan,"udp":c.view.to_string(),"trace_limit":0,"send_after_release":true});
+                "neon":true,"hot":scan,"scan":scan,"tx_active":c.external_mixer.is_some(),
+                "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true});
             let started = |h: crate::system_reader::Header| {
                 let mut a = actual.borrow_mut();
                 let version = a["map_version"].clone();
@@ -720,7 +802,7 @@ fn worker(
                     ("scan", json!(scan)),
                     ("fs_hz", json!(FS)),
                     ("flags", json!(h.flags)),
-                    ("TX_OFF", json!(true)),
+                    ("TX_OFF", json!(c.external_mixer.is_none())),
                 ] {
                     s.insert(k.into(), v);
                 }
@@ -745,6 +827,12 @@ fn worker(
                 stop: &shared.switch,
                 started: &started,
                 route: &route_fn,
+                check: &|| {
+                    if let Some(mixer) = &c.external_mixer {
+                        mixer.confirm_tx().map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                },
             };
             crate::system_reader::run_controlled(&serde_json::to_vec(&cfg)?, &q)
                 .map_err(|e| anyhow!(e))
@@ -789,6 +877,13 @@ fn worker(
                 state["running"] = json!(false);
                 state["spectrum"] = Value::Null;
                 state["generation"] = json!(generation);
+                if c.external_mixer.is_some()
+                    && attr("out_altvoltage1_TX_LO_powerdown").as_deref().ok() == Some("1")
+                {
+                    state["tx"]["on"] = json!(false);
+                    state["tx"]["powerdown"] = json!(1);
+                    state["waiting"] = json!("mixer LO off");
+                }
                 receipt(&shared, &state, id, Some(e.to_string()));
             }
         }
@@ -814,10 +909,12 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         attr("in_voltage_sampling_frequency")? == FS.to_string(),
         "expected 61.44 MHz ADC"
     );
-    ensure!(
-        attr("out_altvoltage1_TX_LO_powerdown")? == "1",
-        "TX must be off before startup"
-    );
+    if c.external_mixer.is_none() {
+        ensure!(
+            attr("out_altvoltage1_TX_LO_powerdown")? == "1",
+            "TX must be off before startup"
+        );
+    }
     let template = fs::read(&c.setup)?;
     ensure!(
         template.len() == 12488
@@ -875,11 +972,24 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("scan gain"))?
         .parse::<f64>()?;
-    let initial = json!({"mode":"scan","generation":clock_ns()/1000,"map_version":1,"epoch":0,"boot":c.boot_id,
+    let initial_mode = if c.external_mixer.is_some() {
+        "analysis"
+    } else {
+        "scan"
+    };
+    let tx_readback = match &c.external_mixer {
+        Some(mixer) => mixer.confirm_tx()?,
+        None => json!({"on":false,"powerdown":1,"frequency_hz":tx,"attenuation_mdb":89750}),
+    };
+    let route = match &c.external_mixer {
+        Some(mixer) => mixer.route(),
+        None => json!({"kind":"direct","antenna":0,"multiplier":1,"side":1}),
+    };
+    let initial = json!({"mode":initial_mode,"generation":clock_ns()/1000,"map_version":1,"epoch":0,"boot":c.boot_id,
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
-        "route":{"kind":"direct","antenna":0,"multiplier":1,"side":1},"tx":{"on":false,"powerdown":1,"frequency_hz":tx,"attenuation_mdb":89750}});
+        "route":route,"tx":tx_readback});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(

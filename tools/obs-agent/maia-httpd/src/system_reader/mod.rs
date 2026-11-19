@@ -226,6 +226,7 @@ pub(crate) struct RunControl<'a>{
  pub stop:&'a AtomicBool,
  pub started:&'a dyn Fn(Header),
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
+ pub check:&'a dyn Fn()->R<()>,
 }
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.trace_limit==0||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000; header-only OFF without check/save; batch1..64".into())}
@@ -269,7 +270,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
       Err(e)=>{route_failure=Some(e);break;}
     }
   }}
-  if status_due.elapsed()>=Duration::from_millis(100){if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();}
+  if status_due.elapsed()>=Duration::from_millis(100){
+   if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
+   if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();
+  }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
   let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush_due(sock);}max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
