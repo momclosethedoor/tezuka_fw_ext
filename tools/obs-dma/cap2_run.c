@@ -220,13 +220,14 @@ static void dump(const char *path, const uint32_t *iq, uint32_t n, uint32_t fs)
 
 int main(int argc, char **argv)
 {
-	check(argc == 8, "cap2-run good|reuse|wait-cancel|capture-cancel|miss|video N Fs job reader.json IQ|- epoch_delta");
+	check(argc == 8, "cap2-run good|reuse|wait-cancel|close-wait|capture-cancel|miss|video N Fs job reader.json IQ|- epoch_delta");
 	bool cancel_wait = !strcmp(argv[1], "wait-cancel");
+	bool close_wait = !strcmp(argv[1], "close-wait");
 	bool cancel_capture = !strcmp(argv[1], "capture-cancel");
 	bool miss = !strcmp(argv[1], "miss") || !strcmp(argv[1], "video");
 	bool reuse = !strcmp(argv[1], "reuse");
 	bool good = !strcmp(argv[1], "good") || reuse;
-	check(good || cancel_wait || cancel_capture || miss, "unknown mode");
+	check(good || cancel_wait || close_wait || cancel_capture || miss, "unknown mode");
 	uint32_t n = number(argv[2]), fs = number(argv[3]), job = number(argv[4]);
 	uint32_t epoch_delta = number(argv[7]);
 	check(n && n <= OBS_CAP2_MAX_N && fs && job < UINT32_MAX - 1, "runner job bounds");
@@ -251,6 +252,20 @@ int main(int argc, char **argv)
 	uint32_t wrong = job + 1;
 	check(ioctl(cap_fd, OBS_CAP2_CANCEL, &wrong) == -1 && errno == EPERM, "wrong key");
 	check(ioctl(cap_fd, OBS_CAP2_RELEASE) == -1 && errno == EBUSY, "release before terminal");
+	if (close_wait) {
+		check(!close(cap_fd), "close active last owner");
+		cap_fd = open("/dev/obs_cap2", O_RDWR | O_CLOEXEC);
+		struct obs_cap2_info reopened;
+		struct obs_cap2_receipt terminal;
+		check(cap_fd >= 0 && !ioctl(cap_fd, OBS_CAP2_INFO, &reopened) &&
+		      reopened.base == info.base && reopened.last_job == job, "pinned arena after close");
+		check(!ioctl(cap_fd, OBS_CAP2_STATUS, &terminal) && terminal.job == job &&
+		      state(terminal) == 6 && ((terminal.status >> 4) & 15) == 3 &&
+		      !terminal.captured, "close cancels WAIT and observes terminal");
+		printf("close_wait_job=%u reason=3 count=0 same_pinned_dma=%" PRIx64 "\n",
+		       job, (uint64_t)reopened.base);
+		return 0;
+	}
 	if (cancel_wait)
 		check(!ioctl(cap_fd, OBS_CAP2_CANCEL, &job), "cancel in WAIT");
 	else
@@ -279,6 +294,19 @@ int main(int argc, char **argv)
 	      "READY receipt");
 	const uint32_t *iq = (const uint32_t *)(arena + submit.offset);
 	canaries(arena, info.length, submit.offset, n);
+	if (reuse) {
+		uint32_t *before_replay = malloc(n * sizeof *iq);
+		check(before_replay != NULL, "allocate replay check copy");
+		memcpy(before_replay, iq, n * sizeof *iq);
+		pause_us(10000);
+		struct obs_cap2_receipt retained;
+		check(epoch() > job_epoch + 8 && !ioctl(cap_fd, OBS_CAP2_STATUS, &retained) &&
+		      !memcmp(&retained, &r, sizeof r) && !memcmp(before_replay, iq, n * sizeof *iq),
+		      "retained READY receipt and IQ through old map replay");
+		free(before_replay);
+		canaries(arena, info.length, submit.offset, n);
+		puts("ready_replay_same_receipt_and_iq=1");
+	}
 	dump(argv[6], iq, n, fs);
 	sig0_work *work = NULL;
 	check(!sig0_configure(NULL, NULL), "SIG0 configuration");
