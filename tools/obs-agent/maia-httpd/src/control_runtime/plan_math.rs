@@ -1,16 +1,22 @@
 //! Pure RF/IF coverage over ordered, calibrated RX centers.
-pub(super) const MAX_RF: u64 = 12_500_000_000;
+pub(super) const MAX_RF: u64 = 18_000_000_000;
+pub(super) const DEFAULT_FILTER_LIMIT: u64 = 12_500_000_000;
+pub(super) const DIRECT_LIMIT: u64 = 6_000_000_000;
+const HALF_USEFUL: u64 = 23_800_000;
 const MIN_IF: i64 = 70_000_000;
 const MAX_IF: i64 = 6_000_000_000;
 
 pub(super) struct Candidate<'a> {
     pub offset: i64,
+    pub slot: Option<usize>,
+    pub antenna: u64,
     pub antenna_bands: &'a [[u64; 2]],
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Segment {
     pub slot: Option<usize>,
+    pub antenna: u64,
     pub side: i64,
     pub lo: u64,
     pub hi: u64,
@@ -71,11 +77,11 @@ fn prefix(positions: &[u64], candidate: &Candidate<'_>, lo: u64, hi: u64) -> Opt
             positions.len() - 1 - ordinal
         };
         let rf = offset + side * positions[idx] as i64;
-        if rf < MIN_IF || rf > MAX_RF as i64 + 23_800_000 {
+        if rf < MIN_IF || rf > MAX_RF as i64 + HALF_USEFUL as i64 {
             continue;
         }
         let f = rf as u64;
-        let (a, b) = (f.saturating_sub(23_800_000), f + 23_800_000);
+        let (a, b) = (f.saturating_sub(HALF_USEFUL), f + HALF_USEFUL);
         if candidate.offset == 0 {
             intervals.push((a, b, ordinal, idx));
         } else {
@@ -97,7 +103,8 @@ fn prefix(positions: &[u64], candidate: &Candidate<'_>, lo: u64, hi: u64) -> Opt
         used[ordinal] = Some(idx);
     }
     (covered > lo).then(|| Segment {
-        slot: None,
+        slot: candidate.slot,
+        antenna: candidate.antenna,
         side,
         lo,
         hi: covered,
@@ -108,22 +115,16 @@ fn prefix(positions: &[u64], candidate: &Candidate<'_>, lo: u64, hi: u64) -> Opt
 pub(super) fn cover(
     positions: &[u64],
     candidate: &Candidate<'_>,
-    slot: Option<usize>,
     lo: u64,
     hi: u64,
 ) -> Option<Segment> {
-    let mut segment = prefix(positions, candidate, lo, hi)?;
-    if segment.hi != hi {
-        return None;
-    }
-    segment.slot = slot;
-    Some(segment)
+    prefix(positions, candidate, lo, hi).filter(|segment| segment.hi == hi)
 }
 
 pub(super) fn automatic(
     positions: &[u64],
     candidates: &[Candidate<'_>],
-    mut previous: Option<usize>,
+    mut previous: Option<(Option<usize>, u64)>,
     mut lo: u64,
     hi: u64,
 ) -> Option<Vec<Segment>> {
@@ -131,31 +132,79 @@ pub(super) fn automatic(
     while lo < hi {
         // Farthest contiguous endpoint first. Equal reaches reuse the current
         // slot, then prefer fewer RX positions and the lowest slot number.
-        let segment = candidates
+        let (segment, _) = candidates
             .iter()
             .enumerate()
-            .filter_map(|(slot, candidate)| {
-                let mut segment = prefix(positions, candidate, lo, hi)?;
-                segment.slot = Some(slot);
-                Some(segment)
+            .filter_map(|(index, candidate)| {
+                prefix(positions, candidate, lo, hi).map(|s| (s, index))
             })
-            .min_by_key(|s| {
+            .min_by_key(|(s, index)| {
                 (
                     std::cmp::Reverse(s.hi),
-                    s.slot != previous,
-                    image_overlap(&candidates[s.slot.unwrap()], s.lo, s.hi).unwrap_or(u64::MAX),
+                    previous.is_some_and(|(slot, _)| s.slot.is_some() && slot != s.slot),
+                    previous.is_some_and(|(_, antenna)| antenna != s.antenna),
+                    image_overlap(&candidates[*index], s.lo, s.hi).unwrap_or(u64::MAX),
                     s.indexes.len(),
                     s.slot,
+                    s.antenna,
                 )
             })?;
         lo = segment.hi;
-        previous = segment.slot;
+        previous = Some((segment.slot, segment.antenna));
         plan.push(segment);
         if plan.len() > 128 {
             return None;
         }
     }
     Some(plan)
+}
+
+/// Select an overlap window wholly inside both RF coverage bands. Reuse this
+/// window for an early notice and hold at the subsequent main RX position.
+pub(super) fn handover(
+    positions: &[u64],
+    before: &Candidate<'_>,
+    after: &Candidate<'_>,
+    window: [u64; 2],
+    boundary: u64,
+) -> Option<([u64; 2], usize, i64, usize, i64)> {
+    let mut best = None;
+    for [alo, ahi] in before.antenna_bands {
+        for [blo, bhi] in after.antenna_bands {
+            let lo = window[0].max(*alo).max(*blo);
+            let hi = window[1].min(*ahi).min(*bhi);
+            if hi.saturating_sub(lo) < 2 * HALF_USEFUL || boundary < lo || boundary > hi {
+                continue;
+            }
+            let mid = lo + (hi - lo) / 2;
+            let pick = |candidate: &Candidate<'_>| {
+                positions
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, &f)| {
+                        let offset = candidate.offset;
+                        [1i64, -1]
+                            .into_iter()
+                            .map(move |side| (i, side, offset + side * f as i64))
+                    })
+                    .filter(|(_, _, rf)| {
+                        *rf >= (lo + HALF_USEFUL) as i64 && *rf <= (hi - HALF_USEFUL) as i64
+                    })
+                    .min_by_key(|(_, _, rf)| rf.abs_diff(mid as i64))
+            };
+            let (Some((a, sa, fra)), Some((b, sb, frb))) = (pick(before), pick(after)) else {
+                continue;
+            };
+            let rank = (
+                fra.abs_diff(mid as i64) + frb.abs_diff(mid as i64),
+                std::cmp::Reverse(hi - lo),
+            );
+            if best.as_ref().is_none_or(|(key, _)| rank < *key) {
+                best = Some((rank, ([lo, hi], a, sa, b, sb)));
+            }
+        }
+    }
+    best.map(|(_, value)| value)
 }
 
 #[cfg(test)]
@@ -172,12 +221,21 @@ mod tests {
 
     #[test]
     fn owned_boundary_full_range_uses_one_slot_and_labels_both_images() {
-        let candidates = [LO, 4_410_000_000, LO].map(|offset| Candidate {
-            offset,
+        let candidates = std::array::from_fn::<_, 3, _>(|i| Candidate {
+            offset: [LO, 4_410_000_000, LO][i],
+            slot: Some(i),
+            antenna: 3,
             antenna_bands: &[],
         });
         let upper = automatic(&RX, &candidates, None, 5_841_000_000, 5_889_000_000).unwrap();
-        let lower = automatic(&RX, &candidates, Some(2), 3_114_840_000, 3_162_840_000).unwrap();
+        let lower = automatic(
+            &RX,
+            &candidates,
+            Some((Some(2), 3)),
+            3_114_840_000,
+            3_162_840_000,
+        )
+        .unwrap();
         assert_eq!((upper.len(), upper[0].slot, upper[0].side), (1, Some(0), 1));
         assert_eq!(
             (lower.len(), lower[0].slot, lower[0].side),
@@ -192,7 +250,6 @@ mod tests {
             cover(
                 &[1_250_000_000, 1_450_000_000],
                 &candidates[0],
-                Some(0),
                 5_730_000_000,
                 5_960_000_000
             )
@@ -208,18 +265,31 @@ mod tests {
         let profiles = [
             Candidate {
                 offset: LO,
+                slot: Some(0),
+                antenna: 0,
                 antenna_bands: &a,
             },
             Candidate {
                 offset: LO + 18_000_000,
+                slot: Some(1),
+                antenna: 1,
                 antenna_bands: &b,
             },
             Candidate {
                 offset: LO + 36_000_000,
+                slot: Some(2),
+                antenna: 2,
                 antenna_bands: &c,
             },
         ];
-        let plan = automatic(&RX, &profiles, Some(0), 5_840_000_000, 5_905_000_000).unwrap();
+        let plan = automatic(
+            &RX,
+            &profiles,
+            Some((Some(0), 0)),
+            5_840_000_000,
+            5_905_000_000,
+        )
+        .unwrap();
         assert_eq!(
             plan.iter()
                 .map(|p| (p.slot, p.lo, p.hi))
@@ -231,5 +301,50 @@ mod tests {
         );
         assert!(automatic(&RX, &profiles, None, 5_840_000_000, 5_911_000_000).is_none());
         assert!(automatic(&RX, &profiles, None, 12_500_000_000, 14_000_000_000).is_none());
+    }
+
+    #[test]
+    fn owned_boundary_overlap_profile_is_inside_both_antennas() {
+        let old = [[2_300_000_000, 2_470_000_000]];
+        let new = [[2_385_000_000, 2_550_000_000]];
+        let a = Candidate {
+            offset: 0,
+            slot: None,
+            antenna: 1,
+            antenna_bands: &old,
+        };
+        let b = Candidate {
+            offset: 0,
+            slot: None,
+            antenna: 2,
+            antenna_bands: &new,
+        };
+        let centers = [
+            2_380_000_000,
+            2_400_000_000,
+            2_425_000_000,
+            2_440_000_000,
+            2_465_000_000,
+        ];
+        assert_eq!(
+            handover(
+                &centers,
+                &a,
+                &b,
+                [2_380_000_000, 2_490_000_000],
+                2_470_000_000
+            ),
+            Some(([2_385_000_000, 2_470_000_000], 2, 1, 2, 1))
+        );
+        assert!(
+            handover(
+                &centers,
+                &a,
+                &b,
+                [2_440_000_000, 2_490_000_000],
+                2_470_000_000
+            )
+            .is_none()
+        );
     }
 }

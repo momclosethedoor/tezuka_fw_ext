@@ -50,6 +50,21 @@ struct Config {
     scan_tx: Vec<ScanTxProfile>,
     #[serde(default)]
     antenna_bands: BTreeMap<u64, Vec<[u64; 2]>>,
+    #[serde(default = "filter_limit")]
+    rf_filter_max_hz: u64,
+}
+
+fn filter_limit() -> u64 {
+    plan_math::DEFAULT_FILTER_LIMIT
+}
+fn scan_limit(c: &Config) -> u64 {
+    let band_max = c.antenna_bands.values().flatten().map(|band| band[1]).max();
+    let fallback = if c.scan_tx.is_empty() {
+        plan_math::DIRECT_LIMIT
+    } else {
+        c.rf_filter_max_hz
+    };
+    band_max.unwrap_or(fallback).min(c.rf_filter_max_hz)
 }
 
 #[derive(Clone, Deserialize)]
@@ -299,137 +314,252 @@ fn put_hz(b: &mut [u8], offset: usize, n: u64) {
     b[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
 }
 
+#[derive(Clone, Copy)]
+struct Visit {
+    index: usize,
+    slot: Option<usize>,
+    antenna: u64,
+    side: i64,
+    rf: [u64; 2],
+    transition_only: bool,
+    marker_route: Option<u64>,
+    boundary: bool,
+}
+
 fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec<u8>, Value)> {
-    let mut bytes = template.to_vec();
-    let mut locations = Vec::new();
-    let mut rf_ranges = Vec::new();
-    let mut indexes = Vec::new();
-    let mut planned_ranges = Vec::new();
-    let mut previous_slot = None;
+    use plan_math::{Candidate, Segment};
     let direct_antenna = state["route"]["antenna"].as_u64().unwrap_or(0);
     let bands = |antenna| c.antenna_bands.get(&antenna).map_or(&[][..], Vec::as_slice);
-    let direct = plan_math::Candidate {
-        offset: 0,
-        antenna_bands: bands(direct_antenna),
+    let direct_antenna_ids = if c.antenna_bands.is_empty() {
+        vec![direct_antenna]
+    } else {
+        c.antenna_bands.keys().copied().collect::<Vec<_>>()
     };
-    let candidates = c
-        .scan_tx
+    let direct = direct_antenna_ids
         .iter()
-        .map(|p| plan_math::Candidate {
-            offset: p.offset(),
-            antenna_bands: bands(p.antenna),
+        .map(|&antenna| Candidate {
+            offset: 0,
+            slot: None,
+            antenna,
+            antenna_bands: bands(antenna),
         })
         .collect::<Vec<_>>();
-    for range in state["scan"]["ranges"]
+    let mixer = c
+        .scan_tx
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, p)| {
+            if !c.antenna_bands.is_empty() && !c.antenna_bands.contains_key(&p.antenna) {
+                return None;
+            }
+            Some(Candidate {
+                offset: p.offset(),
+                slot: Some(slot),
+                antenna: p.antenna,
+                antenna_bands: bands(p.antenna),
+            })
+        })
+        .collect::<Vec<_>>();
+    let candidate_for = |segment: &Segment| {
+        let group = if segment.slot.is_some() {
+            &mixer
+        } else {
+            &direct
+        };
+        group
+            .iter()
+            .find(|p| p.slot == segment.slot && p.antenna == segment.antenna)
+            .unwrap()
+    };
+    let mut sections = Vec::new();
+    let mut intervals = Vec::new();
+    let mut previous = Some((None, direct_antenna));
+    let max_rf = scan_limit(c);
+    for row in state["scan"]["ranges"]
         .as_array()
         .ok_or_else(|| anyhow!("scan ranges"))?
     {
-        if range["enabled"] != true {
+        if row["enabled"] != true {
             continue;
         }
-        let lo = int(range, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
-        let hi = int(range, "hi_hz", lo + 120_000, plan_math::MAX_RF)?;
-        let sections = if range["tx_slot"] == "auto" {
-            plan_math::automatic(&c.positions, &candidates, previous_slot, lo, hi)
+        let lo = int(row, "lo_hz", 70_000_000, max_rf)?;
+        let hi = int(row, "hi_hz", lo + 120_000, max_rf)?;
+        let mut list = Vec::new();
+        if row["tx_slot"] == "auto" {
+            list = plan_math::automatic(&c.positions, &mixer, previous, lo, hi)
+                .ok_or_else(|| anyhow!("RF {lo}..{hi} Hz: no complete mixer coverage"))?;
+        } else if let Some(slot) = row["tx_slot"].as_u64() {
+            let profile = mixer
+                .iter()
+                .find(|p| p.slot == Some(slot as usize))
+                .ok_or_else(|| {
+                    anyhow!("TX slot {slot} is unavailable for the configured antennas")
+                })?;
+            list.push(
+                plan_math::cover(&c.positions, profile, lo, hi).ok_or_else(|| {
+                    anyhow!("RF {lo}..{hi} Hz: no complete coverage with TX slot {slot}")
+                })?,
+            );
         } else {
-            let slot = range["tx_slot"].as_u64().map(|s| s as usize);
-            slot.map_or(Some(&direct), |s| candidates.get(s))
-                .and_then(|candidate| plan_math::cover(&c.positions, candidate, slot, lo, hi))
-                .map(|segment| vec![segment])
-        }
-        .ok_or_else(|| {
-            anyhow!(
-                "RF {lo}..{hi} Hz has no complete calibrated coverage on requested route/TX slot"
-            )
-        })?;
-        rf_ranges.push([lo, hi]);
-        for section in sections {
-            let plan_math::Segment {
-                slot,
-                side,
-                lo,
-                hi,
-                indexes: positions,
-            } = section;
-            if slot.is_some() {
-                previous_slot = slot;
+            let direct_hi = hi.min(plan_math::DIRECT_LIMIT);
+            if lo < direct_hi {
+                list = plan_math::automatic(&c.positions, &direct, previous, lo, direct_hi)
+                    .ok_or_else(|| {
+                        anyhow!("RF {lo}..{direct_hi} Hz: no complete calibrated direct coverage")
+                    })?;
             }
-            let profile = slot.map(|s| &c.scan_tx[s]);
-            let image = profile.map(|p| [2 * p.offset() - hi as i64, 2 * p.offset() - lo as i64]);
-            planned_ranges.push(json!({"rf_hz":[lo,hi],"tx_slot":slot,"side_sign":side,
-                "antenna":profile.map_or(direct_antenna,|p|p.antenna),
-                "mixer_lo_hz":profile.map(ScanTxProfile::offset),"image_rf_hz":image,
-                "image_overlap_hz":slot.and_then(|s|plan_math::image_overlap(&candidates[s],lo,hi)),
-                "rx_positions":positions.len()}));
-            indexes.extend(positions.into_iter().map(|idx| (idx, slot, side, lo, hi)));
+            if hi > plan_math::DIRECT_LIMIT {
+                let mixer_lo = lo.max(plan_math::DIRECT_LIMIT);
+                let next = plan_math::automatic(
+                    &c.positions,
+                    &mixer,
+                    list.last().map(|s| (s.slot, s.antenna)).or(previous),
+                    mixer_lo,
+                    hi,
+                )
+                .ok_or_else(|| {
+                    anyhow!("RF {mixer_lo}..{hi} Hz: no complete calibrated mixer coverage")
+                })?;
+                list.extend(next);
+            }
         }
+        intervals.push([lo, hi]);
+        previous = list.last().map(|s| (s.slot, s.antenna)).or(previous);
+        sections.extend(list.into_iter().map(|s| ([lo, hi], s)));
+    }
+    ensure!(!sections.is_empty(), "no calibrated scan position selected");
+    let mut visits = Vec::new();
+    let mut planned = Vec::new();
+    let mut overlaps = Vec::new();
+    for (i, (range, section)) in sections.iter().enumerate() {
+        let ([prev_lo, prev_hi], prior) = &sections[(i + sections.len() - 1) % sections.len()];
+        let candidate = candidate_for(section);
+        let needs_route = prior.antenna != section.antenna
+            || i == 0 && (marker || section.antenna != direct_antenna);
+        let before = visits.len();
+        if needs_route {
+            let handover = if i > 0 && prior.hi == section.lo {
+                plan_math::handover(
+                    &c.positions,
+                    candidate_for(prior),
+                    candidate,
+                    [range[0].min(*prev_lo), range[1].max(*prev_hi)],
+                    section.lo,
+                )
+            } else {
+                None
+            };
+            if let Some((rf, old_idx, old_side, new_idx, new_side)) = handover {
+                visits.push(Visit {
+                    index: old_idx,
+                    slot: prior.slot,
+                    antenna: prior.antenna,
+                    side: old_side,
+                    rf,
+                    transition_only: true,
+                    marker_route: Some(section.antenna),
+                    boundary: false,
+                });
+                visits.push(Visit {
+                    index: new_idx,
+                    slot: section.slot,
+                    antenna: section.antenna,
+                    side: new_side,
+                    rf,
+                    transition_only: true,
+                    marker_route: None,
+                    boundary: true,
+                });
+                overlaps.push(json!({"from":prior.antenna,"to":section.antenna,"rf_hz":rf,
+                    "notify_position":before,"wait_position":before+1,
+                    "old_if_hz":c.positions[old_idx],"new_if_hz":c.positions[new_idx]}));
+            }
+        }
+        let needs_immediate_hold = needs_route && visits.len() == before;
+        let rf = [section.lo, section.hi];
+        for (pos, &index) in section.indexes.iter().enumerate() {
+            let boundary = needs_immediate_hold && pos == 0;
+            visits.push(Visit {
+                index,
+                slot: section.slot,
+                antenna: section.antenna,
+                side: section.side,
+                rf,
+                transition_only: false,
+                marker_route: boundary.then_some(section.antenna),
+                boundary,
+            });
+        }
+        let image = section.slot.map(|_| {
+            [
+                2 * candidate.offset - section.hi as i64,
+                2 * candidate.offset - section.lo as i64,
+            ]
+        });
+        let image_in_band = section
+            .slot
+            .and_then(|_| plan_math::image_overlap(candidate, section.lo, section.hi));
+        planned.push(json!({"rf_hz":rf,"tx_slot":section.slot,"side_sign":section.side,
+            "antenna":section.antenna,"mixer_lo_hz":section.slot.map(|_|candidate.offset),
+            "image_rf_hz":image,"image_overlap_hz":image_in_band,"rx_positions":section.indexes.len(),
+            "transition":if !needs_route {"none"} else if needs_immediate_hold {"hold_at_entry"} else {"overlap"}}));
     }
     ensure!(
-        (1..=128).contains(&indexes.len()),
-        "calibrated scan map needs 1…128 positions"
+        (1..=128).contains(&visits.len()),
+        "compiled primary plus overlap map exceeds 128 positions"
     );
-    let v = int(state, "map_version", 1, 0x7fff_fffe)? as u32;
-    put(&mut bytes, 8, indexes.len() as u32);
-    put(&mut bytes, 12, indexes.len() as u32);
-    put(&mut bytes, 16, v);
-    put(&mut bytes, 20, v + 1);
+    let version = int(state, "map_version", 1, 0x7fff_fffe)? as u32;
+    let mut bytes = template.to_vec();
+    put(&mut bytes, 8, visits.len() as u32);
+    put(&mut bytes, 12, visits.len() as u32);
+    put(&mut bytes, 16, version);
+    put(&mut bytes, 20, version + 1);
     bytes[MAP..NEXT + 4096].fill(0);
-    let route_at = |index: usize| {
-        indexes[index]
-            .1
-            .map_or(direct_antenna, |slot| c.scan_tx[slot].antenna)
-    };
-    for (i, &(idx, slot, side, lo, hi)) in indexes.iter().enumerate() {
-        let intermediate = c.positions[idx];
-        let profile = slot.map(|s| &c.scan_tx[s]);
+    let mut locations = Vec::with_capacity(visits.len());
+    for (i, v) in visits.iter().enumerate() {
+        let intermediate = c.positions[v.index];
+        let profile = v.slot.map(|slot| &c.scan_tx[slot]);
         let offset = profile.map_or(0, ScanTxProfile::offset);
-        let rf = offset + side * intermediate as i64;
-        let antenna = route_at(i);
-        locations.push(json!({"rx_lo_hz":intermediate,"rf_center_hz":rf,
-            "side_sign":side,"mixer":slot.is_some(),"antenna":antenna,
-            "tx_slot":slot,"tx_pll_hz":profile.map(|p|p.pll_hz),"tx_tone_hz":profile.map(|p|p.tone()),
-            "image_rf_center_hz":slot.map(|_|2*offset-rf),"rx_available":slot.is_none(),
-            "rf_ranges":[[lo,hi]]}));
-        for off in [MAP, NEXT] {
-            let entry = off + 32 * i;
-            bytes[entry..entry + 32]
-                .copy_from_slice(&template[MAP + 32 * idx..MAP + 32 * (idx + 1)]);
-            let transition = (i == 0 && (marker || antenna != direct_antenna))
-                || antenna != route_at((i + indexes.len() - 1) % indexes.len());
-            let flags = slot.map_or(0, |s| 4 | ((s as u32) << 8))
-                | if transition {
-                    3 | ((antenna as u32) << 16)
-                } else {
-                    0
-                };
+        let rf = offset + v.side * intermediate as i64;
+        locations.push(json!({"rx_lo_hz":intermediate,"rf_center_hz":rf,"side_sign":v.side,
+            "mixer":v.slot.is_some(),"antenna":v.antenna,"rf_ranges":[v.rf],
+            "tx_slot":v.slot,"tx_pll_hz":profile.map(|p|p.pll_hz),"tx_tone_hz":profile.map(ScanTxProfile::tone),
+            "image_rf_center_hz":v.slot.map(|_|2*offset-rf),"rx_available":v.slot.is_none()&&!v.transition_only,
+            "transition_only":v.transition_only,"marker_route":v.marker_route,"hold_boundary":v.boundary}));
+        let flags = v.slot.map_or(0, |slot| 4 | ((slot as u32) << 8))
+            | v.marker_route.map_or(0, |ant| 1 | ((ant as u32) << 16))
+            | if v.boundary { 2 } else { 0 };
+        for page in [MAP, NEXT] {
+            let entry = page + 32 * i;
+            let previous = MAP + 32 * v.index;
+            bytes[entry..entry + 32].copy_from_slice(&template[previous..previous + 32]);
             put(&mut bytes, entry + 4, flags);
             put(
                 &mut bytes,
                 entry + 8,
-                if transition {
-                    v.wrapping_add(i as u32)
+                if v.marker_route.is_some() {
+                    version.wrapping_add(i as u32)
                 } else {
                     0
                 },
             );
-            put_hz(&mut bytes, entry + 16, lo);
-            put_hz(&mut bytes, entry + 24, hi);
+            put_hz(&mut bytes, entry + 16, v.rf[0]);
+            put_hz(&mut bytes, entry + 24, v.rf[1]);
         }
     }
-    if let Some(first) = indexes.iter().find_map(|(_, slot, _, _, _)| *slot) {
-        put(&mut bytes, 12328, 1);
-        // Prepare the TX fastlock executor independently of RF emission.
-        put(&mut bytes, 12332, 0);
+    let first = visits.iter().find_map(|v| v.slot);
+    put(&mut bytes, 12328, first.is_some() as u32);
+    // The accepted guard can exercise fastlock without authorizing RF emission.
+    put(&mut bytes, 12332, 0);
+    if let Some(first) = first {
         put(&mut bytes, 12340, first as u32);
-    } else {
-        put(&mut bytes, 12328, 0);
     }
     Ok((
         bytes,
-        json!({"rf_ranges":rf_ranges,"positions":locations,"planned_ranges":planned_ranges}),
+        json!({"rf_ranges":intervals,"positions":locations,"planned_ranges":planned,
+        "overlap_profiles":overlaps}),
     ))
 }
-
 fn guard(fd: &File, cmd: libc::c_ulong, arg: *mut libc::c_void) -> Result<[u32; 128]> {
     let mut s = [0u32; 128];
     let arg = if arg.is_null() {
@@ -1009,6 +1139,15 @@ fn worker(
             };
             let route = RefCell::new(None);
             let route_fn = |id, epoch, version, position, antenna| {
+                let anchor = u64::from(regs.read(0x238)) | (u64::from(regs.read(0x23c)) << 32);
+                let count = actual.borrow()["spectrum"]["positions"]
+                    .as_array()
+                    .map_or(0, Vec::len);
+                let marker_position = if count > 0 && epoch >= anchor {
+                    ((epoch - anchor) % count as u64) as u32
+                } else {
+                    position
+                };
                 acknowledge(
                     &mut route.borrow_mut(),
                     &c,
@@ -1017,7 +1156,7 @@ fn worker(
                     id,
                     epoch,
                     version,
-                    position,
+                    marker_position,
                     antenna,
                     "PL",
                 )
@@ -1107,6 +1246,10 @@ fn worker(
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        (70_120_000..=plan_math::MAX_RF).contains(&c.rf_filter_max_hz),
+        "RF filter limit"
+    );
     for (&antenna, bands) in &mut c.antenna_bands {
         ensure!(
             antenna <= 7
@@ -1241,8 +1384,9 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         })
         .collect::<Vec<_>>();
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":false,
-        "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_max_rf_hz":plan_math::MAX_RF,
-        "antenna_bands":c.antenna_bands});
+        "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_max_rf_hz":scan_limit(&c),
+        "scan_min_rf_hz":c.antenna_bands.values().flatten().map(|b|b[0]).min().unwrap_or(70_000_000),
+        "rf_filter_max_hz":c.rf_filter_max_hz,"antenna_bands":c.antenna_bands});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(
@@ -1330,6 +1474,7 @@ mod tests {
             external_mixer: None,
             scan_tx: vec![p; 8],
             antenna_bands: BTreeMap::new(),
+            rf_filter_max_hz: filter_limit(),
         };
         let input = json!({"scan":{"ranges":[
             {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},
