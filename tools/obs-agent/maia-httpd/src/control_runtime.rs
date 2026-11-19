@@ -1,5 +1,6 @@
 //! Interactive owner for the row99 guarded RAM runtime.
 #![allow(missing_docs)]
+mod tx;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -43,6 +44,25 @@ struct Config {
     analysis: Value,
     #[serde(default)]
     external_mixer: Option<Mixer>,
+    #[serde(default)]
+    scan_tx: Vec<ScanTxProfile>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScanTxProfile {
+    pll_hz: u64,
+    multiplier: u64,
+    side: i64,
+    antenna: u64,
+}
+impl ScanTxProfile {
+    fn tone(&self) -> u64 {
+        self.pll_hz + FS / 64
+    }
+    fn rf(&self, intermediate: u64) -> i64 {
+        (self.multiplier * self.tone()) as i64 + self.side * intermediate as i64
+    }
 }
 
 #[derive(Deserialize)]
@@ -101,6 +121,10 @@ struct Inbox {
     failed_id: Value,
     error: Value,
     receipt_ns: u64,
+    queued_ns: u64,
+    received_ns: u64,
+    command_timing: Value,
+    capabilities: Value,
     route_pending: Value,
     metrics: Value,
 }
@@ -148,6 +172,9 @@ fn validate(v: &Value) -> Result<()> {
                 enabled |= r["enabled"]
                     .as_bool()
                     .ok_or_else(|| anyhow!("enabled must be boolean"))?;
+                if !r["tx_slot"].is_null() {
+                    int(r, "tx_slot", 0, 7)?;
+                }
             }
             ensure!(!run || enabled, "no enabled range");
         }
@@ -175,17 +202,19 @@ fn validate(v: &Value) -> Result<()> {
         Some("return") => {}
         Some("route") => {
             ensure!(
-                v["kind"] == "direct",
-                "mixer requires a verified calibrated TX/IF route in this RAM owner"
+                matches!(v["kind"].as_str(), Some("direct" | "mixer")),
+                "route kind"
             );
             int(v, "antenna", 0, 7)?;
+            if v["kind"] == "mixer" {
+                int(v, "multiplier", 1, 2)?;
+                ensure!(matches!(v["side"].as_i64(), Some(-1 | 1)), "route side");
+            }
         }
         Some("tx") => {
-            ensure!(
-                v["on"] == false,
-                "TX-on requires a calibrated carrier owner and expiring hardware lease"
-            );
             int(v, "frequency_hz", 70_000_000, 6_000_000_000)?;
+            int(v, "attenuation_mdb", 0, 89750)?;
+            ensure!(v["on"].is_boolean(), "TX on must be boolean");
         }
         _ => bail!("unknown command"),
     }
@@ -200,7 +229,7 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
         "pending_id":q.next.as_ref().or(q.pending.as_ref()).map(|v|&v["id"]),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
         "route_pending":q.route_pending,"arm_clock_ns":q.receipt_ns.to_string(),
-        "capabilities":{"tx_on":false,"mixer":false,"finite_field":false},"metrics":{"owner":q.metrics,"reader":reader}}),
+        "command_timing":q.command_timing,"capabilities":q.capabilities,"metrics":{"owner":q.metrics,"reader":reader}}),
     )
 }
 
@@ -233,6 +262,7 @@ async fn submit(
     }
     let id = id.clone();
     q.next = Some(cmd);
+    q.queued_ns = clock_ns();
     shared.switch.store(true, Ordering::Release);
     shared.wake.notify_one();
     (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})))
@@ -243,6 +273,10 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     q.pending = None;
     q.actual = state.clone();
     q.receipt_ns = clock_ns();
+    if !id.is_null() {
+        q.command_timing = json!({"id":id,"received_ns":q.received_ns.to_string(),
+            "completed_ns":q.receipt_ns.to_string()});
+    }
     if let Some(e) = error {
         q.failed_id = id.clone();
         q.error = json!(e);
@@ -258,6 +292,9 @@ fn word(b: &[u8], offset: usize) -> u32 {
 fn put(b: &mut [u8], offset: usize, n: u32) {
     b[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
 }
+fn put_hz(b: &mut [u8], offset: usize, n: u64) {
+    b[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
+}
 fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec<u8>, Value)> {
     let mut bytes = template.to_vec();
     let mut locations = Vec::new();
@@ -270,11 +307,45 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
         if range["enabled"] != true {
             continue;
         }
-        let lo = int(range, "lo_hz", 70_000_000, 6_000_000_000)?;
-        let hi = int(range, "hi_hz", lo + 120_000, 6_000_000_000)?;
+        let lo = int(range, "lo_hz", 70_000_000, 18_000_000_000)?;
+        let hi = int(range, "hi_hz", lo + 120_000, 18_000_000_000)?;
+        let slot = range["tx_slot"].as_u64().map(|s| s as usize);
+        let profile = slot
+            .map(|s| {
+                c.scan_tx
+                    .get(s)
+                    .ok_or_else(|| anyhow!("uncalibrated TX slot {s}"))
+            })
+            .transpose()?;
+        if let Some(p) = profile {
+            let offset = (p.tone() * p.multiplier) as i64;
+            let covered =
+                |rf| (70_000_000..=6_000_000_000).contains(&((rf as i64 - offset) * p.side));
+            ensure!(
+                covered(lo) && covered(hi),
+                "selected RF interval outside mixer IF coverage"
+            );
+        } else {
+            ensure!(
+                hi <= 6_000_000_000,
+                "selected RF interval outside direct RX coverage"
+            );
+        }
         rf_ranges.push([lo, hi]);
         let mut covered = lo;
-        for (idx, &f) in c.positions.iter().enumerate() {
+        let direction = profile.map_or(1, |p| p.side);
+        for ordinal in 0..c.positions.len() {
+            let idx = if direction == 1 {
+                ordinal
+            } else {
+                c.positions.len() - 1 - ordinal
+            };
+            let intermediate = c.positions[idx];
+            let rf = profile.map_or(intermediate as i64, |p| p.rf(intermediate));
+            if !(70_000_000..=18_000_000_000).contains(&rf) {
+                continue;
+            }
+            let f = rf as u64;
             let (a, b) = (f.saturating_sub(23_800_000), f + 23_800_000);
             if b <= lo || a >= hi {
                 continue;
@@ -284,35 +355,76 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
                 "range begins or crosses outside calibrated RX coverage"
             );
             covered = covered.max(b);
-            if !indexes.contains(&idx) {
-                indexes.push(idx);
+            if let Some((_, _, from, to)) = indexes
+                .iter_mut()
+                .find(|(i, s, _, _)| *i == idx && *s == slot)
+            {
+                *from = lo.min(*from);
+                *to = hi.max(*to);
+            } else {
+                indexes.push((idx, slot, lo, hi));
             }
         }
         ensure!(covered >= hi, "range ends outside calibrated RX coverage");
     }
-    ensure!(!indexes.is_empty(), "no calibrated scan position selected");
+    ensure!(
+        (1..=128).contains(&indexes.len()),
+        "calibrated scan map needs 1…128 positions"
+    );
     let v = int(state, "map_version", 1, 0x7fff_fffe)? as u32;
     put(&mut bytes, 8, indexes.len() as u32);
     put(&mut bytes, 12, indexes.len() as u32);
     put(&mut bytes, 16, v);
     put(&mut bytes, 20, v + 1);
     bytes[MAP..NEXT + 4096].fill(0);
-    for (i, &idx) in indexes.iter().enumerate() {
-        let f = c.positions[idx];
-        locations.push(json!({"rx_lo_hz":f,"rf_center_hz":f,"side_sign":1,"mixer":false}));
+    let direct_antenna = state["route"]["antenna"].as_u64().unwrap_or(0);
+    let route_at = |index: usize| {
+        indexes[index]
+            .1
+            .map_or(direct_antenna, |slot| c.scan_tx[slot].antenna)
+    };
+    for (i, &(idx, slot, lo, hi)) in indexes.iter().enumerate() {
+        let intermediate = c.positions[idx];
+        let profile = slot.map(|s| &c.scan_tx[s]);
+        let rf = profile.map_or(intermediate as i64, |p| p.rf(intermediate));
+        let antenna = route_at(i);
+        locations.push(json!({"rx_lo_hz":intermediate,"rf_center_hz":rf,
+            "side_sign":profile.map_or(1,|p|p.side),"mixer":slot.is_some(),"antenna":antenna,
+            "tx_slot":slot,"tx_pll_hz":profile.map(|p|p.pll_hz),"tx_tone_hz":profile.map(|p|p.tone()),
+            "rf_ranges":[[lo,hi]]}));
         for off in [MAP, NEXT] {
             let entry = off + 32 * i;
             bytes[entry..entry + 32]
                 .copy_from_slice(&template[MAP + 32 * idx..MAP + 32 * (idx + 1)]);
-            if marker && off == MAP && i == 0 {
-                put(
-                    &mut bytes,
-                    entry + 4,
-                    3 | ((state["route"]["antenna"].as_u64().unwrap() as u32) << 16),
-                );
-                put(&mut bytes, entry + 8, v);
-            }
+            let transition =
+                (marker && i == 0) || antenna != route_at((i + indexes.len() - 1) % indexes.len());
+            let flags = slot.map_or(0, |s| 4 | ((s as u32) << 8))
+                | if transition {
+                    3 | ((antenna as u32) << 16)
+                } else {
+                    0
+                };
+            put(&mut bytes, entry + 4, flags);
+            put(
+                &mut bytes,
+                entry + 8,
+                if transition {
+                    v.wrapping_add(i as u32)
+                } else {
+                    0
+                },
+            );
+            put_hz(&mut bytes, entry + 16, lo);
+            put_hz(&mut bytes, entry + 24, hi);
         }
+    }
+    if let Some(first) = indexes.iter().find_map(|(_, slot, _, _)| *slot) {
+        put(&mut bytes, 12328, 1);
+        // Prepare the TX fastlock executor independently of RF emission.
+        put(&mut bytes, 12332, 0);
+        put(&mut bytes, 12340, first as u32);
+    } else {
+        put(&mut bytes, 12328, 0);
     }
     Ok((bytes, json!({"rf_ranges":rf_ranges,"positions":locations})))
 }
@@ -357,6 +469,7 @@ fn acknowledge(
     version: u32,
     position: u32,
     antenna: u32,
+    source: &str,
 ) -> std::result::Result<Option<u32>, String> {
     let key = (id, epoch, version, position, antenna);
     if route.as_ref().is_none_or(|r| r.key != key) {
@@ -364,7 +477,7 @@ fn acknowledge(
         let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50))
             .map_err(|e| e.to_string())?;
         stream.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation});
+        let v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,"source":source});
         let mut out = serde_json::to_vec(&v).unwrap();
         out.push(b'\n');
         shared.inbox.lock().unwrap().route_pending = v;
@@ -513,6 +626,7 @@ fn continuous(
     state: &Value,
     id: &Value,
     regs: &Registers,
+    verify_tx: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     ensure!(
         regs.read(0x64) == 16 && regs.read(0x1e0) == 0 && regs.read(0x284) == 0,
@@ -561,9 +675,7 @@ fn continuous(
                 let mut lo_check = Instant::now();
                 while !shared.switch.load(Ordering::Acquire) {
                     if lo_check.elapsed() >= Duration::from_millis(200) {
-                        if let Some(mixer) = &c.external_mixer {
-                            mixer.confirm_tx()?;
-                        }
+                        verify_tx()?;
                         lo_check = Instant::now();
                     }
                     match stdout.read(&mut bytes[have..]) {
@@ -646,16 +758,34 @@ fn worker(
     regs: Registers,
 ) -> Result<()> {
     let mut state = shared.inbox.lock().unwrap().actual.clone();
+    let manual = state["manual_tx_available"] == true;
+    let mut carrier = tx::Carrier::default();
     while !shared.shutdown.load(Ordering::Acquire) {
         let cmd = {
             let mut q = shared.inbox.lock().unwrap();
-            while q.next.is_none() && !shared.shutdown.load(Ordering::Acquire) {
-                q = shared.wake.wait(q).unwrap();
+            if q.next.is_none() && !shared.shutdown.load(Ordering::Acquire) {
+                q = shared
+                    .wake
+                    .wait_timeout(q, Duration::from_millis(200))
+                    .unwrap()
+                    .0;
             }
-            let Some(cmd) = q.next.take() else { break };
-            q.pending = Some(cmd.clone());
-            shared.switch.store(false, Ordering::Release);
-            cmd
+            q.next.take().map(|cmd| {
+                q.received_ns = q.queued_ns;
+                q.pending = Some(cmd.clone());
+                shared.switch.store(false, Ordering::Release);
+                cmd
+            })
+        };
+        let Some(cmd) = cmd else {
+            if carrier.on() {
+                if let Err(e) = carrier.verify() {
+                    state["tx"] = carrier.off()?;
+                    state["waiting"] = json!(e.to_string());
+                    receipt(&shared, &state, &Value::Null, Some(e.to_string()));
+                }
+            }
+            continue;
         };
         let id = &cmd["id"];
         let before = state.clone();
@@ -673,6 +803,7 @@ fn worker(
         pending["ddc_hz"] = Value::Null;
         pending["ddc_fs_hz"] = Value::Null;
         pending["waiting"] = Value::Null;
+        pending["guard_tx"] = Value::Null;
         let config_result = (|| {
             ensure!(
                 previous_mode != "video" || op == "return" || op == "tx",
@@ -680,6 +811,17 @@ fn worker(
             );
             match op {
                 "scan" | "analysis" => {
+                    if op == "scan" && carrier.on() {
+                        pending["tx"] = carrier.off()?;
+                    }
+                    if previous_mode != op {
+                        if op == "scan" {
+                            pending["analysis_route"] = pending["route"].clone();
+                            pending["route"] = json!({"kind":"direct","antenna":pending["scan_antenna"],"multiplier":1,"side":1});
+                        } else {
+                            pending["route"] = pending["analysis_route"].clone();
+                        }
+                    }
                     pending["mode"] = json!(op);
                     pending[op] = request;
                 }
@@ -694,22 +836,58 @@ fn worker(
                     pending["video"] = Value::Null;
                 }
                 "route" => {
-                    pending["route"] = json!({"kind":"direct","antenna":request["antenna"],"multiplier":1,"side":1});
+                    ensure!(c.external_mixer.is_none(), "external fixture owns route");
+                    let scan = pending["mode"] == "scan";
+                    ensure!(
+                        !scan || request["kind"] == "direct",
+                        "select calibrated TX profiles in the scan map"
+                    );
+                    if !scan || pending["scan"]["run"] != true {
+                        let mut socket = None;
+                        let version = pending["map_version"].as_u64().unwrap() as u32;
+                        let marker = generation as u32;
+                        let antenna = request["antenna"].as_u64().unwrap() as u32;
+                        loop {
+                            if acknowledge(
+                                &mut socket,
+                                &c,
+                                &shared,
+                                generation,
+                                marker,
+                                0,
+                                version,
+                                0,
+                                antenna,
+                                "manual",
+                            )
+                            .map_err(|e| anyhow!(e))?
+                            .is_some()
+                            {
+                                break;
+                            }
+                            ensure!(!shared.shutdown.load(Ordering::Acquire), "route cancelled");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                    }
+                    pending["route"] = json!({"kind":request["kind"],"antenna":request["antenna"],
+                        "multiplier":if request["kind"]=="direct" {json!(1)} else {request["multiplier"].clone()},
+                        "side":if request["kind"]=="direct" {json!(1)} else {request["side"].clone()}});
+                    if scan {
+                        pending["scan_antenna"] = request["antenna"].clone();
+                    } else {
+                        pending["analysis_route"] = pending["route"].clone();
+                    }
                 }
                 "tx" => {
                     ensure!(
-                        set_attr("out_altvoltage1_TX_LO_powerdown", 1)? == "1",
-                        "TX LO powerdown readback"
+                        pending["mode"] != "scan",
+                        "manual TX locked while scanner owns profiles"
                     );
-                    let gain = set_attr("out_voltage0_hardwaregain", "-89.75")?;
                     ensure!(
-                        gain.split_whitespace()
-                            .next()
-                            .and_then(|v| v.parse::<f64>().ok())
-                            == Some(-89.75),
-                        "TX attenuation readback"
+                        manual && c.external_mixer.is_none(),
+                        "TX owned by external adapter or unavailable"
                     );
-                    pending["tx"] = json!({"on":false,"powerdown":1,"frequency_hz":attr("out_altvoltage1_TX_LO_frequency")?.parse::<u64>()?,"attenuation_mdb":89750});
+                    pending["tx"] = carrier.apply(&request)?;
                     if previous_mode == "video" {
                         pending["mode"] = pending["return_mode"].take();
                         pending["video"] = Value::Null;
@@ -723,12 +901,6 @@ fn worker(
             let mode = pending["mode"].as_str().unwrap().to_owned();
             pending["k"] = pending[&mode]["k"].clone();
             pending["running"] = json!(mode != "scan" || pending["scan"]["run"] == true);
-            if c.external_mixer.is_some() && op == "tx" {
-                pending["running"] = json!(false);
-                pending["spectrum"] = Value::Null;
-                pending["waiting"] = json!("mixer LO off");
-                return Ok(None);
-            }
             if let Some(mixer) = &c.external_mixer {
                 ensure!(
                     mode != "scan" && op != "route",
@@ -736,18 +908,24 @@ fn worker(
                 );
                 pending["tx"] = mixer.confirm_tx()?;
             }
+            if mode != "scan" && pending["route"]["kind"] == "mixer" && pending["tx"]["on"] != true
+            {
+                ensure!(mode != "video", "mixer LO off");
+                pending["running"] = json!(false);
+                pending["waiting"] = json!("mixer LO off");
+                return Ok(None);
+            }
             if mode == "video" {
                 pending["ddc_fs_hz"] = json!(FS / 4);
             }
             if mode == "scan" {
-                ensure!(
-                    !matches!(op, "route") || pending["running"] == true,
-                    "start scan before switching antenna"
-                );
                 let (bytes, spectrum) = plan(&c, &template, &pending, op == "route")?;
                 pending["rx_gain_db"] = json!(apply_gain(&pending["scan_rx"])?);
                 if pending["running"] == true {
                     pending["spectrum"] = spectrum;
+                }
+                if word(&bytes, 12328) == 1 {
+                    pending["waiting"] = json!("TX profiles loaded, mixer RF off");
                 }
                 Ok::<_, anyhow::Error>(Some(bytes))
             } else {
@@ -769,20 +947,35 @@ fn worker(
                 return Ok(());
             }
             if mode == "video" {
-                return continuous(&c, &shared, &actual.borrow(), id, &regs);
+                return continuous(&c, &shared, &actual.borrow(), id, &regs, &mut || {
+                    if carrier.on() {
+                        carrier.verify()?;
+                    }
+                    if let Some(mixer) = &c.external_mixer {
+                        mixer.confirm_tx()?;
+                    }
+                    Ok(())
+                });
             }
             if let Some(setup) = setup.as_mut() {
+                let expected_control = 3 | (word(setup, 12328) << 2);
                 guard(&guard_fd, 0x4601, setup.as_mut_ptr().cast())?;
                 guard_taken = true;
                 let s = guard_cmd(&guard_fd, 0x4602)?;
-                ensure!(s[1] == 2 && s[9] == 3 && s[112] == 1, "guard take readback");
+                ensure!(
+                    s[1] == 2 && s[9] == expected_control && s[112] == 1,
+                    "guard take readback"
+                );
+                actual.borrow_mut()["guard_tx"] =
+                    json!({"executor":s[9]&4!=0,"powerdown":s[112],"attenuation_mdb":s[113]});
             }
             let scan = mode == "scan";
+            let tx_active = actual.borrow()["tx"]["on"] == true;
             let work = c.output.join("reader");
             let k = actual.borrow()["k"].clone();
             let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":1,"previous_mode":1,
                 "seconds":1.0,"warmup":0.0,"shift544":true,"settling":0,"batch_limit":64,"direct":true,"batch_sync":true,
-                "neon":true,"hot":scan,"scan":scan,"tx_active":c.external_mixer.is_some(),
+                "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true});
             let started = |h: crate::system_reader::Header| {
                 let mut a = actual.borrow_mut();
@@ -802,7 +995,7 @@ fn worker(
                     ("scan", json!(scan)),
                     ("fs_hz", json!(FS)),
                     ("flags", json!(h.flags)),
-                    ("TX_OFF", json!(c.external_mixer.is_none())),
+                    ("TX_OFF", json!(!tx_active)),
                 ] {
                     s.insert(k.into(), v);
                 }
@@ -820,6 +1013,7 @@ fn worker(
                     version,
                     position,
                     antenna,
+                    "PL",
                 )
             };
             let q = crate::system_reader::RunControl {
@@ -828,6 +1022,13 @@ fn worker(
                 started: &started,
                 route: &route_fn,
                 check: &|| {
+                    if tx_active && c.external_mixer.is_none() {
+                        if !tx::lease_is_live()
+                            || tx::readback(FS / 64).map_err(|e| e.to_string())?["on"] != true
+                        {
+                            return Err("manual TX lease or carrier lost".into());
+                        }
+                    }
                     if let Some(mixer) = &c.external_mixer {
                         mixer.confirm_tx().map_err(|e| e.to_string())?;
                     }
@@ -877,6 +1078,12 @@ fn worker(
                 state["running"] = json!(false);
                 state["spectrum"] = Value::Null;
                 state["generation"] = json!(generation);
+                if carrier.on() {
+                    state["tx"] = carrier.off()?;
+                    if state["route"]["kind"] == "mixer" {
+                        state["waiting"] = json!("mixer LO off");
+                    }
+                }
                 if c.external_mixer.is_some()
                     && attr("out_altvoltage1_TX_LO_powerdown").as_deref().ok() == Some("1")
                 {
@@ -917,12 +1124,29 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     }
     let template = fs::read(&c.setup)?;
     ensure!(
-        template.len() == 12488
-            && word(&template, 0) == 0x3747534f
-            && word(&template, 12328) == 0
-            && word(&template, 12332) == 0,
-        "RX-only guard template required"
+        template.len() == 12488 && word(&template, 0) == 0x3747534f && word(&template, 12332) == 0,
+        "guard template must start RF off"
     );
+    if !c.scan_tx.is_empty() {
+        ensure!(
+            c.scan_tx.len() == 8
+                && c.scan_tx.iter().enumerate().all(|(slot, p)| {
+                    (70_000_000..=6_000_000_000 - FS / 64).contains(&p.pll_hz)
+                        && (1..=2).contains(&p.multiplier)
+                        && matches!(p.side, -1 | 1)
+                        && p.antenna <= 7
+                        && template[12352 + 16 * slot..12368 + 16 * slot]
+                            .iter()
+                            .any(|b| *b != 0)
+                }),
+            "eight calibrated TX fastlock slots and metadata required"
+        );
+    } else {
+        ensure!(
+            word(&template, 12328) == 0,
+            "TX calibration metadata missing"
+        );
+    }
     ensure!(
         c.positions.len() == word(&template, 8) as usize
             && (1..=128).contains(&c.positions.len())
@@ -965,7 +1189,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "control owner busy"
     );
     fs::create_dir_all(&c.output)?;
-    let tx = attr("out_altvoltage1_TX_LO_frequency")?.parse::<u64>()?;
+    let manual = c.external_mixer.is_none() && tx::available();
     let scan_agc = attr("in_voltage0_gain_control_mode")?;
     let scan_gain = attr("in_voltage0_hardwaregain")?
         .split_whitespace()
@@ -979,7 +1203,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     };
     let tx_readback = match &c.external_mixer {
         Some(mixer) => mixer.confirm_tx()?,
-        None => json!({"on":false,"powerdown":1,"frequency_hz":tx,"attenuation_mdb":89750}),
+        None => tx::readback(0)?,
     };
     let route = match &c.external_mixer {
         Some(mixer) => mixer.route(),
@@ -989,7 +1213,18 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
-        "route":route,"tx":tx_readback});
+        "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual});
+    let profiles = c
+        .scan_tx
+        .iter()
+        .enumerate()
+        .map(|(slot, p)| {
+            json!({"slot":slot,"pll_hz":p.pll_hz,"tone_hz":p.tone(),
+        "side":p.side,"multiplier":p.multiplier,"antenna":p.antenna})
+        })
+        .collect::<Vec<_>>();
+    let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":false,
+        "scan_tx_profiles":profiles,"scan_tx_rf":false});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(
@@ -1004,6 +1239,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let shared = Arc::new(Shared {
         inbox: Mutex::new(Inbox {
             actual: initial,
+            capabilities,
             ..Inbox::default()
         }),
         wake: Condvar::new(),
