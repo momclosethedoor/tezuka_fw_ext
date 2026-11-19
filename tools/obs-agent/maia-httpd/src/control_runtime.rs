@@ -1,5 +1,6 @@
 //! Interactive owner for the row99 guarded RAM runtime.
 #![allow(missing_docs)]
+mod field;
 mod plan_math;
 mod tx;
 
@@ -52,6 +53,8 @@ struct Config {
     antenna_bands: BTreeMap<u64, Vec<[u64; 2]>>,
     #[serde(default = "filter_limit")]
     rf_filter_max_hz: u64,
+    #[serde(default)]
+    field_preview: Option<field::Config>,
 }
 
 fn filter_limit() -> u64 {
@@ -935,6 +938,7 @@ fn worker(
         pending["ddc_fs_hz"] = Value::Null;
         pending["waiting"] = Value::Null;
         pending["guard_tx"] = Value::Null;
+        pending["field_watch"] = Value::Null;
         let config_result = (|| {
             ensure!(
                 previous_mode != "video" || op == "return" || op == "tx",
@@ -1070,6 +1074,7 @@ fn worker(
         })();
         let mut guard_taken = false;
         let actual = RefCell::new(pending);
+        let watch = RefCell::new(None);
         let result = (|| {
             let mut setup = config_result?;
             let mode = actual.borrow()["mode"].as_str().unwrap().to_owned();
@@ -1135,6 +1140,20 @@ fn worker(
                 ] {
                     s.insert(k.into(), v);
                 }
+                if scan && let Some(field) = &c.field_preview {
+                    match field::Watch::start(field, &c.output, &c.boot_id, c.video, &a["spectrum"])
+                    {
+                        Ok(Some((child, identity))) => {
+                            *watch.borrow_mut() = Some(child);
+                            a["field_watch"] = identity;
+                        }
+                        Ok(None) => {
+                            a["field_watch"] =
+                                json!({"waiting":"target outside usable direct capture coverage"})
+                        }
+                        Err(e) => a["field_watch"] = json!({"error":e.to_string()}),
+                    }
+                }
                 receipt(&shared, &a, id, None);
             };
             let route = RefCell::new(None);
@@ -1167,6 +1186,13 @@ fn worker(
                 started: &started,
                 route: &route_fn,
                 check: &|| {
+                    if let Some(note) = watch
+                        .borrow_mut()
+                        .as_mut()
+                        .and_then(field::Watch::exit_note)
+                    {
+                        shared.inbox.lock().unwrap().actual["field_watch"]["error"] = json!(note);
+                    }
                     if tx_active && c.external_mixer.is_none() {
                         if !tx::lease_is_live()
                             || tx::readback(FS / 64).map_err(|e| e.to_string())?["on"] != true
@@ -1183,6 +1209,10 @@ fn worker(
             crate::system_reader::run_controlled(&serde_json::to_vec(&cfg)?, &q)
                 .map_err(|e| anyhow!(e))
         })();
+        let field_stop = watch
+            .into_inner()
+            .map_or(Ok(()), |field| field.finish(&regs));
+        let result = result.and(field_stop);
         let result = if guard_taken {
             let handback = guard_cmd(&guard_fd, 0x4604).and_then(|s| {
                 ensure!(
@@ -1246,6 +1276,9 @@ fn worker(
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    if let Some(preview) = &c.field_preview {
+        preview.validate()?;
+    }
     ensure!(
         (70_120_000..=plan_math::MAX_RF).contains(&c.rf_filter_max_hz),
         "RF filter limit"
@@ -1383,7 +1416,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "multiplier":p.multiplier,"antenna":p.antenna})
         })
         .collect::<Vec<_>>();
-    let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":false,
+    let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_max_rf_hz":scan_limit(&c),
         "scan_min_rf_hz":c.antenna_bands.values().flatten().map(|b|b[0]).min().unwrap_or(70_000_000),
         "rf_filter_max_hz":c.rf_filter_max_hz,"antenna_bands":c.antenna_bands});
@@ -1475,6 +1508,7 @@ mod tests {
             scan_tx: vec![p; 8],
             antenna_bands: BTreeMap::new(),
             rf_filter_max_hz: filter_limit(),
+            field_preview: None,
         };
         let input = json!({"scan":{"ranges":[
             {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},

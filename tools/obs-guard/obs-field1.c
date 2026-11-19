@@ -39,6 +39,7 @@ static uint64_t wire_bytes=0,wire_chunks=0,wire_accepted=0;
 static double wire_send_s=0,wire_send_cpu_s=0;
 static int cpu_phases=0;
 static size_t tcp_pump_bytes=0;
+static const char *managed_boot=NULL;
 static double thread_cpu(void){struct timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static int sendall(int s,const void *p,size_t n){const uint8_t *b=p;while(n){ssize_t k=send(s,b,n,MSG_NOSIGNAL);if(k<0&&errno==EINTR)continue;if(k<=0)return -1;b+=k;n-=k;}return 0;}
 static int connect_video(void){
@@ -46,7 +47,11 @@ static int connect_video(void){
  int s=socket(AF_INET,SOCK_STREAM,0);if(s<0)return -1;
  struct timeval tv={1,0};int one=1;
  setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof(tv));setsockopt(s,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one));
- struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(18009)};inet_pton(AF_INET,"192.168.2.10",&a.sin_addr);
+ const char *host=managed_boot?getenv("OBS_FIELD1_HOST"):"192.168.2.10";
+ const char *port=managed_boot?getenv("OBS_FIELD1_PORT"):NULL;
+ unsigned long number=port?strtoul(port,NULL,10):18009;
+ struct sockaddr_in a={.sin_family=AF_INET,.sin_port=htons(number)};
+ if(!host||!number||number>65535||inet_pton(AF_INET,host,&a.sin_addr)!=1){close(s);return -1;}
  if(connect(s,(void*)&a,sizeof(a))){close(s);return -1;}if(fcntl(s,F_SETFL,fcntl(s,F_GETFL,0)|O_NONBLOCK)){close(s);return -1;}video_sock=s;return 0;
 }
 /* One active packet references either IIO (direct variant) or a protected
@@ -209,7 +214,7 @@ static int capture(int argc,char **argv){
     No previous generation can contribute bytes to this context. */
  uint64_t sent_before=wire_bytes,chunks_before=wire_chunks;double send_before=wire_send_s,send_cpu_before=wire_send_cpu_s;
  if(!no_delivery&&connect_video()){iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);close(fd);close(lock);return 9;}
- char path[512];snprintf(path,sizeof(path),"%s.trace.jsonl",argv[1]);FILE *trace=fopen(path,"wx");if(!trace)return 3;
+ char path[512];snprintf(path,sizeof(path),"%s.trace.jsonl",argv[1]);FILE *trace=managed_boot?fopen("/dev/null","w"):fopen(path,"wx");if(!trace)return 3;
  fprintf(trace,"{\"event\":\"iio_preparation\",\"time\":%.9f,\"context_s\":%.9f,\"buffer_s\":%.9f,\"ready_s\":%.9f,\"reuse_context\":%s}\n",now(),context_ready-prepare_start,buffer_ready-context_ready,now()-prepare_start,reuse_context?"true":"false");
  fprintf(trace,"{\"event\":\"iio_geometry\",\"time\":%.9f,\"kernel_buffers\":%u,\"block_bytes\":%zu}\n",now(),kernel_buffers,block_bytes);
  fprintf(trace,"{\"event\":\"raw_policy_latched\",\"time\":%.9f,\"unqualified_raw\":%s}\n",now(),unqualified_raw?"true":"false");
@@ -256,7 +261,8 @@ static int capture(int argc,char **argv){
  }
  if(!no_delivery){
   char watch_meta[320]="";
-  if(watch_active)snprintf(watch_meta,sizeof(watch_meta),"\"target_hz\":%llu,\"target_position\":%u,\"map_version\":%u,\"watch_revision\":%llu,\"watch_generation\":%llu,",(unsigned long long)target_hz,target_position,map_version,(unsigned long long)watch_revision,(unsigned long long)watch_selected.generation);
+  if(watch_active){int len=snprintf(watch_meta,sizeof(watch_meta),"\"target_hz\":%llu,\"target_position\":%u,\"map_version\":%u,\"watch_revision\":%llu,\"watch_generation\":%llu,",(unsigned long long)target_hz,target_position,map_version,(unsigned long long)watch_revision,(unsigned long long)watch_selected.generation);
+   if(managed_boot&&len>0&&(size_t)len<sizeof(watch_meta))snprintf(watch_meta+len,sizeof(watch_meta)-len,"\"system_boot\":\"%s\",",managed_boot);}
   char meta[1024];snprintf(meta,sizeof(meta),"{\"kind\":\"begin\",\"delivery_id\":\"field-%u-%llu\",\"stream_tag\":%u,\"epoch\":%llu,\"fs\":%u,\"code\":%u,\"g\":0,%s\"block_bytes\":%zu,\"capture_seconds\":%u,\"capture_limit_bytes\":%zu,\"unqualified_raw\":%s,\"replay\":false}",tag,(unsigned long long)target,tag,(unsigned long long)target,REAL8_FS,rd(0x40)&63,watch_meta,block_bytes,CAPTURE_SECONDS,capture_limit,unqualified_raw?"true":"false");
   if(packet(meta,NULL,0)){wr(0x284,0);iio_buffer_destroy(buf);context_done(iio_context_destroy,ctx);wr(0x38,old_mode);fclose(trace);close(fd);close(lock);return 9;}
  }
@@ -412,7 +418,7 @@ static int capture(int argc,char **argv){
  }
  fprintf(trace,"{\"event\":\"stream_delivery\",\"time\":%.9f,\"wire_bytes\":%llu,\"messages\":%llu,\"send_s\":%.9f,\"payload_bytes\":%zu,\"error\":%d}\n",now(),(unsigned long long)(wire_bytes-sent_before),(unsigned long long)(wire_chunks-chunks_before),wire_send_s-send_before,bytes,rc);
  FILE *f=NULL;
- snprintf(path,sizeof(path),"%s.json",argv[1]);f=fopen(path,"wx");if(f){fprintf(f,"{\"outcome\":%d,\"error\":%d,\"serial\":%u,\"target_epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u,\"blocks\":%u,\"owned_bytes\":%zu,\"arm_s\":%.9f,\"busy_observed_s\":%.9f,\"done_s\":%.9f,\"timeout_ms\":%u,\"epoch_after\":%llu}\n",outcome,rc,serial,(unsigned long long)target,tag,first,end,blocks,bytes,armed,busy,done,ms,(unsigned long long)epoch());fclose(f);}
+ snprintf(path,sizeof(path),"%s.json",argv[1]);f=managed_boot?NULL:fopen(path,"wx");if(f){fprintf(f,"{\"outcome\":%d,\"error\":%d,\"serial\":%u,\"target_epoch\":%llu,\"tag\":%u,\"first\":%u,\"end\":%u,\"blocks\":%u,\"owned_bytes\":%zu,\"arm_s\":%.9f,\"busy_observed_s\":%.9f,\"done_s\":%.9f,\"timeout_ms\":%u,\"epoch_after\":%llu}\n",outcome,rc,serial,(unsigned long long)target,tag,first,end,blocks,bytes,armed,busy,done,ms,(unsigned long long)epoch());fclose(f);}
  struct rusage usage;if(!getrusage(RUSAGE_SELF,&usage))fprintf(trace,"{\"event\":\"collector_resources\",\"time\":%.9f,\"user_cpu_s\":%.6f,\"system_cpu_s\":%.6f,\"max_rss_kib\":%ld}\n",now(),usage.ru_utime.tv_sec+usage.ru_utime.tv_usec/1e6,usage.ru_stime.tv_sec+usage.ru_stime.tv_usec/1e6,usage.ru_maxrss);
  fclose(trace);library_done(lib);munmap((void*)r,4096);close(fd);close(lock);return rc?rc:(!outcome?7:0);
 }
@@ -420,7 +426,7 @@ static int capture(int argc,char **argv){
 static int watch_session(int argc,char **argv){
  if(argc!=7){fprintf(stderr,"usage: obs-field1 --watch prefix map.bin seconds timeout-ms first-tag\n");return 2;}
  if(strspn(argv[2],"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")!=strlen(argv[2])||strlen(argv[2])>400)return 2;
- char *endptr;unsigned seconds=strtoul(argv[4],&endptr,10);if(*endptr||!seconds||seconds>120)return 2;
+ char *endptr;unsigned seconds=strtoul(argv[4],&endptr,10);if(*endptr||(!seconds&&!managed_boot)||seconds>120)return 2;
  unsigned ms=strtoul(argv[5],&endptr,10);if(*endptr||!ms||ms>1000)return 2;
  unsigned long long tag0=strtoull(argv[6],&endptr,10);if(*endptr||!tag0||tag0>UINT32_MAX-65536)return 2;
  /* All watch attempts use bounded copied transport, so cancel returns IIO
@@ -431,10 +437,11 @@ static int watch_session(int argc,char **argv){
  if(watch_open(&watching,argv[3])){fprintf(stderr,"invalid watch map\n");return 13;}
  watch_owner=open("/run/obs-field1.lock",O_RDWR|O_CREAT,0600);
  if(watch_owner<0||flock(watch_owner,LOCK_EX|LOCK_NB))return 2;
- reuse_context=1;watch_active=1;watch_until=now()+seconds;int rc=0;unsigned attempts=0;
+ reuse_context=1;watch_active=1;watch_until=seconds?now()+seconds:1e30;int rc=0;unsigned attempts=0;
  while(now()<watch_until){
   if(watch_refresh(&watching)){rc=13;break;}
   if(!watching.map.enabled){
+   if(managed_boot)break;
    struct pollfd f={watching.fd,POLLIN,0};double remaining=watch_until-now();if(remaining<=0)break;
    if(poll(&f,1,(int)(remaining*1000)+1)<0&&errno!=EINTR){rc=13;break;}
    continue;
@@ -475,6 +482,8 @@ static int watch_session(int argc,char **argv){
 
 int main(int argc,char **argv){
  signal(SIGPIPE,SIG_IGN);
+ managed_boot=getenv("OBS_FIELD1_BOOT");
+ if(managed_boot&&(strlen(managed_boot)!=36||strspn(managed_boot,"abcdef0123456789-")!=36))return 2;
  cpu_phases=getenv("OBS_FIELD1_CPU_PHASES")&&!strcmp(getenv("OBS_FIELD1_CPU_PHASES"),"1");
  const char *pump=getenv("OBS_TCP_PUMP_BYTES");tcp_pump_bytes=pump?strtoul(pump,NULL,10):0;
  if(tcp_pump_bytes!=0&&tcp_pump_bytes!=16384&&tcp_pump_bytes!=32768&&tcp_pump_bytes!=65536&&tcp_pump_bytes!=131072)return 2;
