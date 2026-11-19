@@ -13,6 +13,8 @@
 #include <linux/uaccess.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/mutex.h>
+#include "obs_cap2.h"
 
 static bool cached = true;
 module_param(cached, bool, 0444);
@@ -71,6 +73,7 @@ static int map_region(struct file *f, struct vm_area_struct *vma)
 }
 static const struct file_operations fops={.owner=THIS_MODULE,.open=open_owner,.release=close_owner,.unlocked_ioctl=control,.mmap=map_region};
 static struct miscdevice misc={.minor=MISC_DYNAMIC_MINOR,.name="obs_dma",.fops=&fops,.mode=0600};
+#include "obs_cap2_impl.h"
 static void free_regions(void)
 {
  int i; for(i=0;i<2;i++) {
@@ -97,6 +100,10 @@ static int __init begin(void)
   pr_info("obs_dma: region%d DMA=%pad len=%zu cached=%d\n",i,&r->dma,r->len,cached);
  }
  err=misc_register(&misc); if(err) goto fail;
+ if (readl(csr + OBS_CAP2_ID_REG) == OBS_CAP2_ID) {
+  err = cap_register();
+  if (err) { misc_deregister(&misc); goto fail; }
+ }
  __module_get(THIS_MODULE); /* intentional: only reboot relinquishes memory */
  pr_info("obs_dma: ownership PINNED until reboot; close only stops writer\n");
  return 0;

@@ -1,0 +1,42 @@
+name: OBS007F1 CAP2 RAM modules
+on:
+  push:
+    branches: [build/obs007f1-cap2-a9]
+    paths: ['tools/obs-dma/**', 'tools/obs-guard/**', '.github/workflows/obs007f1-cap2.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  modules:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-kernel-kit
+          path: kit
+          run-id: 43645241286
+          github-token: ${{ github.token }}
+      - name: Build and verify against stock 6.12.77
+        run: |
+          set -euo pipefail
+          echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
+          tar --zstd -xf kit/kernel-kit.tar.zst
+          kernel="$PWD/output/nano/build/linux-custom"
+          cross="$PWD/output/nano/host/bin/arm-linux-"
+          mkdir artifact
+          python3 tools/obs-dma/check_kernel.py "$kernel" | tee artifact/kernel-check.txt
+          make -C "$kernel" M="$PWD/tools/obs-dma" ARCH=arm CROSS_COMPILE="$cross" modules
+          make -C "$kernel" M="$PWD/tools/obs-guard" ARCH=arm CROSS_COMPILE="$cross" modules
+          "${cross}gcc" -O2 -Wall -Wextra tools/obs-guard/obs-fl-ctl.c -o artifact/obs-fl-ctl
+          cp tools/obs-dma/obs_dma.ko tools/obs-guard/obs_ad9361.ko artifact/
+          git rev-parse HEAD > artifact/commit.txt
+          cd artifact
+          sha256sum obs_dma.ko obs_ad9361.ko obs-fl-ctl commit.txt kernel-check.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs007f1-cap2-modules
+          path: artifact/
+          if-no-files-found: error

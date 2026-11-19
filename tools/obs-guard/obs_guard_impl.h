@@ -11,6 +11,7 @@
 #include <linux/gpio/machine.h>
 #include <linux/iopoll.h>
 #include <linux/fs.h>
+#include "../obs-dma/obs_cap2.h"
 static DECLARE_RWSEM(obs_gate);
 static struct task_struct *obs_worker;
 static atomic_t obs_denied=ATOMIC_INIT(0);
@@ -144,13 +145,17 @@ static int obs_thread(void *arg){int cmd,r;
  }return 0;
 }
 static int obs_validate(struct obs_setup *c){u32 i,j;
+ bool cap2 = obs_r(OBS_CAP2_ID_REG) == OBS_CAP2_ID;
  if(c->magic!=0x3747534f||c->catalog_count<8||c->catalog_count>128||!c->map_count||c->map_count>128||!c->next_count||c->next_count>128||!c->version||c->next_version==c->version||!c->next_version||c->reserved||c->restore_lo<70000000ULL||c->restore_lo>6000000000ULL)return -EINVAL;
  if(c->tx_enable>1||c->tx_rf_on>1||c->tx_rf_on>c->tx_enable||c->tx_start_slot>7||c->tx_atten_mdb>89750||c->extra_reserved)return -EINVAL;
  if(c->tx_enable&&(c->restore_tx_lo<70000000ULL||c->restore_tx_lo>6000000000ULL))return -EINVAL;
  for(i=0;i<c->catalog_count;i++)for(j=24;j<32;j++)if(c->catalog[i*32+j])return -EINVAL;
  for(j=0;j<2;j++){u8 *p=j?c->next:c->map;u32 n=j?c->next_count:c->map_count;
   for(i=0;i<n;i++){u32 idx=get_unaligned_le32(p+i*32),flags=get_unaligned_le32(p+i*32+4);
-   if(idx>=c->catalog_count||(flags&~0x00ff0707)||get_unaligned_le32(p+i*32+12))return -EINVAL;
+   u32 job = get_unaligned_le32(p+i*32+12);
+   bool assigned = flags & BIT(3);
+   if(idx>=c->catalog_count||(flags&~0x00ff070f)||assigned!=!!job)return -EINVAL;
+   if(assigned&&!cap2)return -EOPNOTSUPP;
    /* Segment slots require a prepared TX bank; RF may still be off. */
    if((flags&0x704)&&!c->tx_enable)return -EINVAL;
   }
@@ -175,6 +180,10 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
   if(r){for(i=0;i<3;i++)if(obs_mem[i]){dma_free_coherent(obs_dma_dev,4096,obs_mem[i],obs_dma[i]);obs_mem[i]=NULL;obs_dma[i]=0;}kfree(cfg);goto out;}
   memcpy(obs_mem[0],cfg->catalog,4096);memcpy(obs_mem[1],cfg->map,4096);memcpy(obs_mem[2],cfg->next,4096);dma_wmb();kfree(obs_cfg);obs_cfg=cfg;obs_state=0;obs_error=0;
  }else if(cmd>=0x4602&&cmd<=0x4604){
+  if(cmd==0x4604 && obs_r(OBS_CAP2_ID_REG)==OBS_CAP2_ID){
+   u32 state=obs_r(OBS_CAP2_STATUS_REG)&15;
+   if(state && state!=5 && state!=6){r=-EBUSY;goto out;}
+  }
   reinit_completion(&obs_done);WRITE_ONCE(obs_command,cmd-0x4600);wake_up(&obs_wait);
   if(!wait_for_completion_timeout(&obs_done,msecs_to_jiffies(10000)))r=-ETIMEDOUT;else r=obs_error;
  }else r=-ENOTTY;
