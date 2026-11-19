@@ -72,7 +72,7 @@ fn parse_antenna_bands(source: &Value) -> Result<AntennaBands> {
                 && intervals.len() <= 16
                 && intervals
                     .iter()
-                    .all(|[lo, hi]| *lo >= 70_000_000 && lo < hi && *hi <= plan_math::MAX_RF),
+                    .all(|[lo, hi]| *lo > 0 && lo < hi && *hi <= plan_math::MAX_RF),
             "invalid RF bands for antenna {antenna}"
         );
         intervals.sort_unstable();
