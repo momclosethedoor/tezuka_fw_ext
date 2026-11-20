@@ -1125,7 +1125,7 @@ fn worker(
                 "cancel_alternative" | "return"
                     if resume_scan.is_some() && previous_mode == "scan" =>
                 {
-                    pending["scan"] = resume_scan.take().unwrap();
+                    pending["scan"] = resume_scan.as_ref().unwrap().clone();
                     pending["alternative"] = Value::Null;
                 }
                 "scan" | "analysis" => {
@@ -1308,7 +1308,7 @@ fn worker(
                     let pll = actual.borrow()["spectrum"]["first_tx_pll_hz"]
                         .as_u64()
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
-                    carrier.prepare_guarded(pll)?;
+                    carrier.prepare_guarded(pll, &shared.switch)?;
                 }
                 shared.inbox.lock().unwrap().phase = "loading";
                 let load_start = Instant::now();
@@ -1321,6 +1321,10 @@ fn worker(
                 let load_us = load_start.elapsed().as_micros() as u64;
                 shared.inbox.lock().unwrap().phase = "applying";
                 let take_start = Instant::now();
+                if guard_rf {
+                    ensure!(carrier.guarded_lease_live() && !shared.switch.load(Ordering::Acquire),
+                        "lease expired or preparation cancelled before guard take");
+                }
                 guard_taken = true;
                 let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })?;
                 ensure!(
@@ -1438,7 +1442,7 @@ fn worker(
                         shared.inbox.lock().unwrap().actual["field_watch"]["error"] = json!(note);
                     }
                     if guard_rf && last_renew.get().elapsed() >= Duration::from_millis(80) {
-                        if !tx::lease_is_live() || !carrier.buffer_live() {
+                        if !carrier.guarded_lease_live() || !carrier.buffer_live() {
                             return Err("guarded TX lease or buffer lost".into());
                         }
                         guard_cmd(&guard_fd, 0x4606).map_err(|e| e.to_string())?;
@@ -1498,6 +1502,9 @@ fn worker(
         match result {
             Ok(()) => {
                 state = actual.into_inner();
+                if matches!(op, "return" | "cancel_alternative") && state["alternative"].is_null() {
+                    resume_scan = None;
+                }
                 if shared.inbox.lock().unwrap().pending.is_some() {
                     receipt(
                         &shared,
@@ -1510,8 +1517,7 @@ fn worker(
             Err(e) => {
                 state = before;
                 if op == "scan" || op == "alternative" {
-                    state["failed_plan"] =
-                        json!({"command":cmd,"applied_rf_ranges":[],"reason":e.to_string()});
+                    state["failed_plan"] = generated::failure(&actual.borrow()["scan"], &cmd, e.to_string());
                 }
                 state["running"] = json!(false);
                 state["spectrum"] = Value::Null;

@@ -29,7 +29,7 @@ def record_laps(receiver,data,status,folder,index):
     return laps.result()
 
 
-def lease_loop(stop, ready,log):
+def lease_loop(stop, ready,log, silence):
     from sdr.source.maia.lease import Lease
     from sdr.source.maia.mqtt import MqttLink
     lease=Lease.create("192.168.2.1")
@@ -40,7 +40,8 @@ def lease_loop(stop, ready,log):
         next_log=0
         while not stop.is_set():
             now=time.perf_counter()
-            lease.service(now)
+            if not silence.is_set():
+                lease.service(now)
             if now>=will.next_due:
                 will.service(now)
             if lease.lease is True and will.armed:
@@ -141,12 +142,12 @@ def control(log, profiles, boot):
     a.upload(log/"cli-config.json", remote, "cli-config.json")
     a.ssh(f"cd {remote} && (timeout 135 ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
     calls = []
-    stop,ready=threading.Event(),threading.Event()
+    stop,ready,silence=threading.Event(),threading.Event(),threading.Event()
     thread=None
     sinks=Sinks(ip,log)
     try:
         if mixer:
-            thread=threading.Thread(target=lease_loop,args=(stop,ready,log),daemon=True)
+            thread=threading.Thread(target=lease_loop,args=(stop,ready,log,silence),daemon=True)
             thread.start()
             assert ready.wait(8),"no live TX lease"
         for i in range(50):
@@ -218,6 +219,23 @@ def control(log, profiles, boot):
                     if status["actual"]["mode"]=="scan" and not os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
                         calls[-1]["laps"]=record_laps(receiver,data,status,log,len(calls))
                     a.write_json(log/"commands.json",calls)
+                    if os.environ.get("PLANNER_BENCH_LEASE_LOSS") and len(calls)==1:
+                        time.sleep(6)
+                        healthy=a.request(url,"GET",path,timeout=1)
+                        assert healthy["actual"]["running"] and healthy["phase"]=="running", healthy["error"]
+                        silence.set()
+                        start_loss=time.monotonic_ns()
+                        while time.monotonic_ns()-start_loss < 8_000_000_000:
+                            expired=a.request(url,"GET",path,timeout=1)
+                            if expired["failed_id"]==ident:break
+                            time.sleep(.05)
+                        assert expired["failed_id"]==ident and not expired["actual"]["running"]
+                        gate=a.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain")
+                        api_elapsed=time.monotonic_ns()-start_loss
+                        a.write_json(log/"host-lease-loss.json",dict(status=expired,physical=gate,
+                            host_upper_bound_ns=api_elapsed))
+                        assert gate.splitlines()[0]=="1" and float(gate.splitlines()[1].split()[0])==-89.75
+                        break
                     if os.environ.get("PLANNER_BENCH_FIELD") and len(calls)==1:
                         actual = status["actual"]
                         watch = actual["field_watch"]

@@ -4,10 +4,11 @@ use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{ErrorKind, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -78,8 +79,56 @@ fn buffer_enabled(device: &Path) -> bool {
     })
 }
 
+// The stock lease daemon timestamps its decisions with /proc/uptime. A
+// present lease_ok can outlive a stalled telemetry read. Expire its last
+// positive decision using that same board clock before renewing physical RF.
+struct LeaseDecisions {
+    child: Child,
+    expiry_ms: Arc<AtomicU64>,
+}
+
+impl LeaseDecisions {
+    fn start() -> Result<Self> {
+        let mut child = Command::new("mosquitto_sub")
+            .args(["-h", "127.0.0.1", "-R", "-t", "state/goofy/lease"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        let pipe = child.stdout.take().unwrap();
+        let expiry_ms = Arc::new(AtomicU64::new(0));
+        let published = expiry_ms.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(std::result::Result::ok) {
+                let expiry = serde_json::from_str::<Value>(&line).ok().and_then(|v| {
+                    if v["alive"] != true || v["enforce"] != 1 || v["lease"] != 1
+                        || v["released"] != 0 || v["lease_ms"] != 5000 { return None; }
+                    let up = v["up_ms"].as_u64()?;
+                    up.checked_sub(v["age_ms"].as_u64()?)?.checked_add(5000)
+                }).unwrap_or(0);
+                published.store(expiry, Ordering::Release);
+            }
+            published.store(0, Ordering::Release);
+        });
+        Ok(Self { child, expiry_ms })
+    }
+
+    fn live(&self) -> bool {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut t) } != 0 { return false; }
+        let now = t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000;
+        let until = self.expiry_ms.load(Ordering::Acquire);
+        until > now && until - now <= 5000 && lease_is_live()
+    }
+}
+
+impl Drop for LeaseDecisions {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[derive(Default)]
 pub struct Carrier {
+    lease: Option<LeaseDecisions>,
     child: Option<Child>,
     device: Option<PathBuf>,
     frequency_hz: u64,
@@ -155,9 +204,21 @@ impl Carrier {
         result
     }
 
-    pub fn prepare_guarded(&mut self, pll: u64) -> Result<()> {
-        ensure!(lease_is_live(), "TX lease required before guarded scan");
+    pub fn guarded_lease_live(&self) -> bool {
+        self.lease.as_ref().is_some_and(LeaseDecisions::live)
+    }
+
+    pub fn prepare_guarded(&mut self, pll: u64, cancel: &AtomicBool) -> Result<()> {
         self.off()?;
+        if self.lease.is_none() {
+            self.lease = Some(LeaseDecisions::start()?);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !self.guarded_lease_live() {
+            ensure!(!cancel.load(Ordering::Acquire), "preparation cancelled");
+            ensure!(Instant::now() < deadline, "fresh TX lease required before guarded scan");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         self.frequency_hz = pll + OFFSET;
         if let Err(e) = self.start(pll + OFFSET, 89750, true) {
             self.off()?;

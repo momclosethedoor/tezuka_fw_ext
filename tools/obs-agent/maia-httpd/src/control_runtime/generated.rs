@@ -27,6 +27,32 @@ pub(super) struct Tile {
     handover: &'static str,
 }
 
+pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
+    let ranges = scan["ranges"].as_array().into_iter().flatten()
+        .filter(|r| r["enabled"] == true)
+        .filter_map(|r| Some([r["lo_hz"].as_u64()?, r["hi_hz"].as_u64()?]))
+        .collect::<Vec<_>>();
+    let mut gaps = Vec::new();
+    if let Ok(antennas) = parse_antenna_bands(&scan["antenna_bands"]) {
+        let mut bands = antennas.into_values().flatten().collect::<Vec<_>>();
+        bands.sort_unstable();
+        if !bands.is_empty() {
+            for &[start,end] in &ranges {
+                let mut cursor = start;
+                for &[a,b] in &bands {
+                    if a >= end || cursor >= end { break; }
+                    if b <= cursor { continue; }
+                    if cursor < a { gaps.push([cursor,a]); }
+                    cursor = cursor.max(b);
+                }
+                if cursor < end { gaps.push([cursor,end]); }
+            }
+        }
+    }
+    json!({"command":command,"applied_rf_ranges":[],"unapplied_rf_ranges":ranges,
+        "antenna_gaps_hz":gaps,"reason":reason})
+}
+
 pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
     let (threshold, mult) = environment()?;
     let scan = &state["scan"];
