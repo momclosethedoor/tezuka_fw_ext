@@ -14,6 +14,8 @@ class Sinks:
         self.video={}
         self.fields={}
         self.missing=False
+        self.retry_first = {}
+        self.retry_done = set()
         self.threads=[]
         self.sockets=[]
         for port, handler in [(18008,self.route),(18009,self.real8)]:
@@ -44,6 +46,20 @@ class Sinks:
     def route(self,conn):
         with conn.makefile("rb") as stream:
             event=json.loads(stream.readline(1024))
+        kind=event["ack_version"]
+        if os.environ.get("PLANNER_BENCH_RETRY")=="1" and kind not in self.retry_done:
+            tick=time.perf_counter_ns()
+            if kind not in self.retry_first:
+                self.retry_first[kind]=(event,tick)
+                # Hold the first stream without sending an ACK. The next
+                # connection is already queued when accept resumes.
+                self.stop.wait(.92)
+                return
+            first,initial=self.retry_first[kind]
+            assert event==first, (event,first)
+            with (self.folder/"retry.ndjson").open("a") as out:
+                print(json.dumps(dict(event=event,interval_ms=(tick-initial)/1e6)),file=out)
+            self.retry_done.add(kind)
         if event.get("event") == "prepare_path":
             from planner_row99 import bench
             assert event["ack_version"] == 3 and event["source"] == "ARM"
@@ -61,7 +77,7 @@ class Sinks:
                     phase=status["phase"],prior_running=status["actual"]["running"],gate=int(gate),
                     correct_ack=not withheld,physical_switch=False)),file=out)
             if withheld:
-                self.stop.wait(11)
+                self.stop.wait(.1)
             else:
                 conn.sendall(f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode())
             return
@@ -89,7 +105,7 @@ class Sinks:
             print(json.dumps(dict(event=event,host_ns=received,correct_ack=not self.missing,
                                   physical_switch=False)),file=out)
         if self.missing:
-            self.stop.wait(2.3)
+            self.stop.wait(.1)
 
     def real8(self,conn):
         from sdr.source.field1_stream import Field1Stream

@@ -54,6 +54,10 @@ pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
 }
 
 pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
+    transitions(state, &core_tiles(state)?)
+}
+
+pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
     let (threshold, mult) = environment()?;
     let scan = &state["scan"];
     let bands = parse_antenna_bands(&scan["antenna_bands"])?;
@@ -96,7 +100,11 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
                     .flat_map(|(&id, rs)| rs.iter().map(move |r| (id, r)))
                     .filter(|(_, r)| r[0] <= lo && lo < r[1])
                     .map(|(id, r)| (id, r[1].min(end)))
-                    .max_by_key(|(id, edge)| (*edge, std::cmp::Reverse(*id)))
+                    .max_by_key(|(id, edge)| {
+                        let keep_direct = state["catalog_policy"] == true && *id == 0
+                            && path != "mixer" && lo < threshold && *edge >= threshold.min(end);
+                        (keep_direct, *edge, std::cmp::Reverse(*id))
+                    })
                     .ok_or_else(|| {
                         anyhow!(
                             "missing antenna coverage [{lo},{}) Hz",
@@ -151,6 +159,12 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
             lo = hi;
         }
     }
+    Ok(tiles)
+}
+
+pub(super) fn transitions(state: &Value, tiles: &[Tile]) -> Result<Vec<Tile>> {
+    let (threshold, mult) = environment()?;
+    let bands = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
     let mut result = Vec::new();
     for (i, current) in tiles.iter().enumerate() {
         let old = &tiles[(i + tiles.len() - 1) % tiles.len()];
@@ -161,17 +175,23 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
             for l in &bands[&old.antenna] {
                 for r in &bands[&current.antenna] {
                     let a = l[0].max(r[0]);
-                    let b = l[1].min(r[1]);
+                    let mut b = l[1].min(r[1]);
+                    if state["catalog_policy"] == true && old.tx.is_some() != current.tx.is_some() {
+                        b = b.min(threshold);
+                    }
                     if a < b {
                         common.push([a, b]);
                     }
                 }
             }
+            let target = if state["catalog_policy"] == true && old.tx.is_some() != current.tx.is_some() {
+                threshold
+            } else { current.rf[0] };
             let overlap = common
                 .iter()
                 .filter(|r| r[1] - r[0] >= width)
-                .map(|r| current.rf[0].clamp(r[0] + width / 2, r[1] - width / 2))
-                .min_by_key(|f| f.abs_diff(current.rf[0]));
+                .map(|r| target.clamp(r[0] + width / 2, r[1] - width / 2))
+                .min_by_key(|f| f.abs_diff(target));
             if let Some(center) = overlap {
                 let window = [center - width / 2, center + width / 2];
                 let mut pair = Vec::new();
@@ -230,6 +250,10 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
             main.hold = true;
         }
         result.push(main);
+    }
+    if state["catalog_policy"] == true {
+        let prefix = result.iter().take_while(|v| v.transition_only).count();
+        result.rotate_left(prefix);
     }
     Ok(result)
 }

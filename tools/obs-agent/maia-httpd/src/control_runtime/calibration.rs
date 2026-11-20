@@ -8,6 +8,11 @@ pub(super) struct Cache {
     snapshot: Vec<String>,
     rx: Bank,
     tx: Bank,
+    core: Vec<generated::Tile>,
+    bands: Value,
+    mixer: Value,
+    keep_rx: BTreeSet<u64>,
+    keep_tx: BTreeSet<u64>,
 }
 
 fn calibrate(
@@ -67,11 +72,71 @@ fn calibrate(
 }
 
 impl Cache {
+    pub fn catalog(state: &Value, shared: &Shared) -> Result<(Self, Value)> {
+        let bands = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
+        let mut intervals: Vec<_> = bands.values().flatten()
+            .map(|r| [r[0].max(70_000_000), r[1]]).filter(|r| r[0]<r[1]).collect();
+        intervals.sort_unstable();
+        let mut union: Vec<[u64; 2]> = Vec::new();
+        for r in intervals {
+            if let Some(last) = union.last_mut() && last[1] >= r[0] {
+                last[1] = last[1].max(r[1]);
+            } else { union.push(r); }
+        }
+        ensure!(!union.is_empty(), "antenna catalog outside receiver limits");
+        let mut full = state.clone();
+        full["pl_timing_only"] = json!(true); // Only encode locally. No guard load or take.
+        full["alternative"] = Value::Null;
+        full["scan"]["ranges"] = json!(union.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
+        let core = generated::core_tiles(&full)?;
+        let tiles = generated::transitions(&full,&core)?;
+        let mut cache = Self::default();
+        let (_, desc) = cache.prepare_tiles(&full,shared,tiles,Instant::now(),cpu_ns()?)?;
+        cache.core = core;
+        cache.bands = full["scan"]["antenna_bands"].clone();
+        cache.mixer = full["scan"]["mixer"].clone();
+        cache.keep_rx = cache.rx.keys().copied().collect();
+        cache.keep_tx = cache.tx.keys().copied().collect();
+        let info = json!({"rf_intervals_hz":union,"primary_tiles":cache.core.len(),
+            "preparation":desc["preparation"],"rx_bandwidth_hz":attr("in_voltage_rf_bandwidth")?.parse::<u64>()?,
+            "tx_powerdown":attr("out_altvoltage1_TX_LO_powerdown")?.parse::<u32>()?});
+        Ok((cache,info))
+    }
+
     pub fn prepare(&mut self, pending: &Value, shared: &Shared) -> Result<(Vec<u8>, Value)> {
-        let stop = &shared.switch;
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
-        let tiles = generated::tiles(pending)?;
+        let scan = &pending["scan"];
+        let ranges = scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?;
+        let select = !self.core.is_empty() && pending["alternative"].is_null()
+            && self.bands == scan["antenna_bands"] && self.mixer == scan["mixer"]
+            && ranges.iter().all(|r| r["path"].is_null() || r["path"]=="auto");
+        let tiles = if select {
+            let mut subset = Vec::new();
+            for r in ranges.iter().filter(|r|r["enabled"]==true) {
+                let lo = r["lo_hz"].as_u64().ok_or_else(||anyhow!("range start"))?;
+                let hi = r["hi_hz"].as_u64().ok_or_else(||anyhow!("range end"))?;
+                let mut cursor = lo;
+                for t in &self.core {
+                    let a = lo.max(t.rf[0]);
+                    let b = hi.min(t.rf[1]);
+                    if a >= b {continue}
+                    ensure!(a == cursor,"uncovered RF [{cursor},{a})");
+                    let mut clipped = t.clone();
+                    clipped.rf = [a,b];
+                    subset.push(clipped);
+                    cursor = b;
+                }
+                ensure!(cursor == hi,"uncovered RF [{cursor},{hi})");
+            }
+            generated::transitions(pending,&subset)?
+        } else { generated::tiles(pending)? };
+        self.prepare_tiles(pending,shared,tiles,start,cpu_start)
+    }
+
+    fn prepare_tiles(&mut self, pending: &Value, shared: &Shared, tiles: Vec<generated::Tile>,
+                     start: Instant, cpu_start: u64) -> Result<(Vec<u8>, Value)> {
+        let stop = &shared.switch;
         if pending["pl_timing_only"] != true && tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
             let requested = pending["scan"]["ranges"]
                 .as_array()
@@ -140,8 +205,10 @@ impl Cache {
         let prepare_us = now.elapsed().as_micros() as u64;
         let compile = Instant::now();
         let (bytes, mut desc) = generated::encode(&tiles, &rx, &tx, restore, pending)?;
-        self.rx = rx;
-        self.tx = tx;
+        self.rx.retain(|key,_|self.keep_rx.contains(key));
+        self.tx.retain(|key,_|self.keep_tx.contains(key));
+        self.rx.extend(rx);
+        self.tx.extend(tx);
         desc["preparation"] = json!({"planner_version":2,"math_us":math_us+compile.elapsed().as_micros() as u64,
             "prepare_us":prepare_us,"worker_cpu_ns":cpu_ns()?.saturating_sub(cpu_start),
             "rss_kib":fs::read_to_string("/proc/self/status")?.lines().find_map(|l|

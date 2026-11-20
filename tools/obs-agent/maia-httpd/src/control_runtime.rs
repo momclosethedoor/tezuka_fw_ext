@@ -275,6 +275,9 @@ fn validate(v: &Value) -> Result<()> {
             }
         }
         Some("return") => {}
+        Some("antennas") => {
+            ensure!(!parse_antenna_bands(&v["antenna_bands"])?.is_empty(), "antenna table required");
+        }
         Some("alternative") => {
             int(v, "source_generation", 1, u64::MAX)?;
             int(v, "source_position", 0, 65534)?;
@@ -730,12 +733,13 @@ fn guard_cmd(fd: &File, cmd: libc::c_ulong) -> Result<[u32; 128]> {
 }
 
 struct Route {
-    stream: TcpStream,
+    stream: Option<TcpStream>,
     key: (u32, u64, u32, u32, u32),
     out: Vec<u8>,
     written: usize,
     input: Vec<u8>,
     since: Instant,
+    attempt: u8,
 }
 fn acknowledge(
     route: &mut Option<Route>,
@@ -752,10 +756,6 @@ fn acknowledge(
     let key = (id, epoch, version, position, antenna);
     let initial_path = source.strip_prefix("startup_");
     if route.as_ref().is_none_or(|r| r.key != key) {
-        let addr = c.route;
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50))
-            .map_err(|e| e.to_string())?;
-        stream.set_nonblocking(true).map_err(|e| e.to_string())?;
         let mut v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
             "source":if source=="PLv2" {"PL"} else {source},"ack_version":if source=="PLv2" {2}else{1}});
         if let Some(path) = initial_path {
@@ -769,32 +769,45 @@ fn acknowledge(
         out.push(b'\n');
         shared.inbox.lock().unwrap().route_pending = v;
         *route = Some(Route {
-            stream,
+            stream: None,
             key,
             out,
             written: 0,
             input: Vec::new(),
             since: Instant::now(),
+            attempt: 0,
         });
     }
     let r = route.as_mut().unwrap();
-    if r.since.elapsed() > Duration::from_secs(if initial_path.is_some() {10} else {2}) {
-        return Err("route ACK timeout".into());
+    if r.attempt == 0 || r.since.elapsed() >= Duration::from_secs(1) {
+        if r.attempt == 2 {
+            return Err("route ACK timeout after retry".into());
+        }
+        r.attempt += 1;
+        r.since = Instant::now();
+        r.written = 0;
+        r.input.clear();
+        r.stream = TcpStream::connect_timeout(&c.route, Duration::from_millis(50)).ok();
+        if let Some(stream) = &r.stream {
+            stream.set_nonblocking(true).map_err(|e| e.to_string())?;
+        }
+        shared.inbox.lock().unwrap().route_pending["attempt"] = json!(r.attempt);
     }
+    let Some(stream) = &mut r.stream else { return Ok(None) };
     if r.written < r.out.len() {
-        match r.stream.write(&r.out[r.written..]) {
-            Ok(0) => return Err("route socket closed".into()),
+        match stream.write(&r.out[r.written..]) {
+            Ok(0) => { r.stream = None; return Ok(None); }
             Ok(n) => r.written += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-            Err(e) => return Err(e.to_string()),
+            Err(_) => { r.stream = None; return Ok(None); }
         }
     }
     let mut data = [0; 128];
-    match r.stream.read(&mut data) {
-        Ok(0) => return Err("route stream closed before current ACK".into()),
+    match stream.read(&mut data) {
+        Ok(0) => { r.stream = None; return Ok(None); }
         Ok(n) => r.input.extend_from_slice(&data[..n]),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+        Err(_) => { r.stream = None; return Ok(None); }
     }
     if r.input.len() > 512 {
         return Err("route ACK length".into());
@@ -1110,7 +1123,7 @@ fn worker(
         pending["field_watch"] = Value::Null;
         let config_result = (|| {
             if pending["pl_timing_only"] == true {
-                ensure!(op == "scan" && cmd["planner_version"] == 2,
+                ensure!(op == "antennas" || op == "scan" && cmd["planner_version"] == 2,
                         "PL timing fixture accepts v2 scan commands only");
             }
             ensure!(
@@ -1118,6 +1131,24 @@ fn worker(
                 "close video before changing mode"
             );
             match op {
+                "antennas" => {
+                    ensure!(pending["catalog_policy"] == true, "antenna catalog disabled");
+                    if carrier.on() { pending["tx"] = carrier.off()?; }
+                    pending["mode"] = json!("scan");
+                    pending["scan"]["run"] = json!(false);
+                    pending["scan"]["antenna_bands"] = request["antenna_bands"].clone();
+                    pending["scan"]["mixer"] = pending["catalog_mixer"].clone();
+                    pending["scan_bounds"] = json!(scan_bounds(&c,&parse_antenna_bands(&request["antenna_bands"])?));
+                    let (next, info) = calibration::Cache::catalog(&pending,&shared)?;
+                    let tmp = c.output.join("antennas.json.tmp");
+                    fs::write(&tmp, serde_json::to_vec(&request["antenna_bands"])?)?;
+                    fs::rename(tmp,c.output.join("antennas.json"))?;
+                    calibration = next;
+                    pending["catalog_antennas"] = request["antenna_bands"].clone();
+                    pending["catalog"] = info;
+                    pending["running"] = json!(false);
+                    return Ok(None);
+                }
                 "alternative" => {
                     ensure!(
                         before["generation"] == cmd["source_generation"],
@@ -1160,6 +1191,16 @@ fn worker(
                         }
                     }
                     if op == "scan" {
+                        if pending["catalog_policy"] == true {
+                            ensure!(request["run"] != true || !pending["catalog"].is_null(),
+                                    "antenna catalog not ready");
+                            if request.get("antenna_bands").is_none() {
+                                request["antenna_bands"] = pending["catalog_antennas"].clone();
+                            }
+                            if request.get("mixer").is_none() {
+                                request["mixer"] = pending["catalog_mixer"].clone();
+                            }
+                        }
                         if request.get("antenna_bands").is_none()
                             && pending["scan"].get("antenna_bands").is_some()
                         {
@@ -1586,11 +1627,24 @@ fn worker(
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    let catalog_policy = c.scan["planner_version"] == 2 && c.scan["catalog_on_boot"] != false
+        && c.external_mixer.is_none();
     if let Some(preview) = &c.field_preview {
         preview.validate()?;
     }
     if c.scan.get("antenna_bands").is_none() && !c.antenna_bands.is_empty() {
         c.scan["antenna_bands"] = json!(c.antenna_bands);
+    }
+    if catalog_policy {
+        let saved = c.output.join("antennas.json");
+        if saved.exists() { c.scan["antenna_bands"] = serde_json::from_slice(&fs::read(saved)?)?; }
+        if c.scan["antenna_bands"].is_null() {
+            c.scan["antenna_bands"] = json!({"0":[[50_000_000u64,7_000_000_000u64]],
+                                             "1":[[4_000_000_000u64,13_000_000_000u64]]});
+        }
+        if c.scan["mixer"].is_null() {
+            c.scan["mixer"] = json!({"pll_range_hz":[2_250_000_000u64,4_500_000_000u64]});
+        }
     }
     validate(&c.scan)?;
     let initial_antenna_bands = parse_antenna_bands(&c.scan["antenna_bands"])?;
@@ -1717,6 +1771,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
             && c.scan["planner_version"] == 2), "PL timing fixture requires a v2 scan-only configuration");
     let initial = json!({"mode":initial_mode,"generation":clock_ns()/1000,"map_version":1,"epoch":0,"boot":c.boot_id,
         "pl_timing_only":pl_timing_only,
+        "catalog_policy":catalog_policy,"catalog_antennas":c.scan["antenna_bands"],"catalog_mixer":c.scan["mixer"],
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
@@ -1750,7 +1805,9 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     }
     let shared = Arc::new(Shared {
         inbox: Mutex::new(Inbox {
-            phase: "stopped",
+            phase: if catalog_policy {"accepted"} else {"stopped"},
+            next: catalog_policy.then(||json!({"op":"antennas","id":format!("{:032x}",clock_ns()),
+                                                "antenna_bands":c.scan["antenna_bands"]})),
             actual: initial,
             capabilities,
             ..Inbox::default()

@@ -161,6 +161,7 @@ def control(log, profiles, boot):
         cfg["field_preview"] = dict(collector=remote+"/obs-field1", target_hz=2425000000, timeout_ms=90)
     if v2:
         scan["planner_version"] = 2
+        scan["catalog_on_boot"] = os.environ.get("PLANNER_BENCH_CATALOG") == "1"
         if os.environ.get("PLANNER_BENCH_TIMING_ONLY") == "1":
             scan["bench_timing_only"] = True
         if os.environ.get("PLANNER_BENCH_PATH_ACK") == "1":
@@ -169,7 +170,8 @@ def control(log, profiles, boot):
         cfg.update(setup=remote+"/control-map.bin", positions=bench.FREQUENCIES)
     a.write_json(log/"cli-config.json", cfg)
     a.upload(log/"cli-config.json", remote, "cli-config.json")
-    a.ssh(f"cd {remote} && (timeout 135 ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
+    owner_seconds = 215 if scan.get("catalog_on_boot") else 135
+    a.ssh(f"cd {remote} && (timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
     calls = []
     stop,ready,silence=threading.Event(),threading.Event(),threading.Event()
     thread=None
@@ -185,6 +187,17 @@ def control(log, profiles, boot):
                 break
             except OSError:
                 time.sleep(.1)
+        if scan.get("catalog_on_boot"):
+            deadline = time.monotonic()+90
+            while time.monotonic()<deadline:
+                startup = a.request(url,"GET",path,timeout=2)
+                if startup["phase"] in ("failed","stopped"):
+                    a.write_json(log/"startup-catalog.json", startup)
+                    assert startup["actual"].get("catalog"), startup.get("error")
+                    break
+                time.sleep(.15)
+            else:
+                raise RuntimeError("boot catalog did not finish")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
             receiver.bind((ip,18010))
             receiver.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4<<20)
@@ -214,7 +227,7 @@ def control(log, profiles, boot):
             sweep = os.environ.get("PLANNER_BENCH_SWEEP")
             if sweep:
                 cases = json.loads(Path(sweep).read_text(encoding="utf-8-sig"))
-                cmds = [dict(scan, **case) for case in cases] + [dict(scan,run=False)]
+                cmds = [case if case.get("op")=="antennas" else dict(scan, **case) for case in cases] + [dict(scan,run=False)]
             for cmd in cmds:
                 if cmd["op"]=="alternative":
                     prev=calls[-1]["status"]["actual"]
