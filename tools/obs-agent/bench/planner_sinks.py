@@ -1,5 +1,6 @@
 """Read real8 and emulate only the host side of the antenna switch contract."""
 import json
+import os
 import socket
 import struct
 import threading
@@ -43,6 +44,27 @@ class Sinks:
     def route(self,conn):
         with conn.makefile("rb") as stream:
             event=json.loads(stream.readline(1024))
+        if event.get("event") == "prepare_path":
+            from planner_row99 import bench
+            assert event["ack_version"] == 3 and event["source"] == "ARM"
+            start=time.monotonic_ns()
+            boot,gen,version,antenna,path=(event[k] for k in ("boot_id","generation","version","route","required_path"))
+            conn.sendall(f"ACK3 {boot} {gen-1} {version} {antenna} {path}\n".encode())
+            time.sleep(.08)
+            api=bench.accepted
+            status=api.request("http://192.168.2.1:18080","GET","/api/system/control",timeout=2)
+            gate=api.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")
+            assert status["phase"]=="waiting_path_ack" and not status["actual"]["running"] and gate.strip()=="1"
+            withheld=os.environ.get("PLANNER_BENCH_PATH_TIMEOUT")=="1"
+            with (self.folder/"path-events.ndjson").open("a") as out:
+                print(json.dumps(dict(event=event,host_received_ns=start,host_before_ack_ns=time.monotonic_ns(),
+                    phase=status["phase"],prior_running=status["actual"]["running"],gate=int(gate),
+                    correct_ack=not withheld,physical_switch=False)),file=out)
+            if withheld:
+                self.stop.wait(11)
+            else:
+                conn.sendall(f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode())
+            return
         assert event["ack_version"]==2
         fields=[event[k] for k in ("generation","version","epoch","position","marker_id","route")]
         def ack(f):

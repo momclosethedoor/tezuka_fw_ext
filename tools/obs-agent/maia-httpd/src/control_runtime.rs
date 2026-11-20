@@ -210,6 +210,9 @@ fn clock_ns() -> u64 {
 fn validate(v: &Value) -> Result<()> {
     match v["op"].as_str() {
         Some("scan") => {
+            if let Some(rev) = v.get("path_ack_version") {
+                ensure!(rev == 1 && v["planner_version"] == 2, "unsupported path_ack_version");
+            }
             if let Some(v) = v.get("planner_version") {
                 ensure!(
                     matches!(v.as_u64(), Some(1 | 2)),
@@ -747,13 +750,21 @@ fn acknowledge(
     source: &str,
 ) -> std::result::Result<Option<u32>, String> {
     let key = (id, epoch, version, position, antenna);
+    let initial_path = source.strip_prefix("startup_");
     if route.as_ref().is_none_or(|r| r.key != key) {
         let addr = c.route;
         let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50))
             .map_err(|e| e.to_string())?;
         stream.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
+        let mut v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
             "source":if source=="PLv2" {"PL"} else {source},"ack_version":if source=="PLv2" {2}else{1}});
+        if let Some(path) = initial_path {
+            v["event"] = json!("prepare_path");
+            v["source"] = json!("ARM");
+            v["required_path"] = json!(path);
+            v["boot_id"] = json!(c.boot_id);
+            v["ack_version"] = json!(3);
+        }
         let mut out = serde_json::to_vec(&v).unwrap();
         out.push(b'\n');
         shared.inbox.lock().unwrap().route_pending = v;
@@ -767,7 +778,7 @@ fn acknowledge(
         });
     }
     let r = route.as_mut().unwrap();
-    if r.since.elapsed() > Duration::from_secs(2) {
+    if r.since.elapsed() > Duration::from_secs(if initial_path.is_some() {10} else {2}) {
         return Err("route ACK timeout".into());
     }
     if r.written < r.out.len() {
@@ -788,7 +799,9 @@ fn acknowledge(
     if r.input.len() > 512 {
         return Err("route ACK length".into());
     }
-    let expected = if source == "PLv2" {
+    let expected = if let Some(path) = initial_path {
+        format!("ACK3 {} {generation} {version} {antenna} {path}", c.boot_id)
+    } else if source == "PLv2" {
         format!("ACK2 {generation} {version} {epoch} {position} {id} {antenna}")
     } else {
         format!("ACK {id}")
@@ -1300,6 +1313,30 @@ fn worker(
             if let Some(setup) = setup.as_mut() {
                 let expected_control = 3 | (word(setup, setup.len() - 160) << 2);
                 guard_rf = word(setup, setup.len() - 156) != 0;
+                if actual.borrow()["scan"]["planner_version"] == 2 {
+                    let required = c.scan["path_ack_version"] == 1 || actual.borrow()["scan"]["path_ack_version"] == 1;
+                    let path = if guard_rf {"mixer"} else {"direct"};
+                    let mut confirmation = json!({"required_path":path,"confirmed_by_client":false});
+                    if required {
+                        shared.inbox.lock().unwrap().phase = "waiting_path_ack";
+                        let antenna = actual.borrow()["spectrum"]["positions"][0]["antenna"]
+                            .as_u64().ok_or_else(||anyhow!("first antenna missing"))? as u32;
+                        let version = word(setup, 16);
+                        let mut socket = None;
+                        loop {
+                            ensure!(!shared.switch.load(Ordering::Acquire) && !shared.shutdown.load(Ordering::Acquire),
+                                "initial path confirmation cancelled");
+                            let ack = acknowledge(&mut socket, &c, &shared, generation, 0, 0, version, 0, antenna,
+                                if guard_rf {"startup_mixer"} else {"startup_direct"}).map_err(|e|anyhow!(e))?;
+                            if ack.is_some() { break; }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        confirmation = json!({"required_path":path,"confirmed_by_client":true,
+                            "boot_id":c.boot_id,"generation":generation,"version":version,"antenna":antenna,
+                            "ack_arm_ns":clock_ns().to_string()});
+                    }
+                    actual.borrow_mut()["spectrum"]["path_confirmation"] = confirmation;
+                }
                 if guard_rf {
                     ensure!(
                         guard_cmd(&guard_fd, 0x4605)?[114] == 1,
@@ -1689,7 +1726,9 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let (threshold, mult) = generated::environment()?;
     let rf_guard = guard_cmd(&guard_fd, 0x4605)?[114] == 1;
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
-        "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"tx_model_pll_hz":[2250000000u64,2490000000u64]}});
+        "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
+        "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1,
+        "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"tx_model_pll_hz":[2250000000u64,2490000000u64]}}); 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(

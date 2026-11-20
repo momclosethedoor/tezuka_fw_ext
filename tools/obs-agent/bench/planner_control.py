@@ -154,6 +154,8 @@ def control(log, profiles, boot):
         cfg["field_preview"] = dict(collector=remote+"/obs-field1", target_hz=2425000000, timeout_ms=90)
     if v2:
         scan["planner_version"] = 2
+        if os.environ.get("PLANNER_BENCH_PATH_ACK") == "1":
+            scan["path_ack_version"] = 1
     else:
         cfg.update(setup=remote+"/control-map.bin", positions=bench.FREQUENCIES)
     a.write_json(log/"cli-config.json", cfg)
@@ -213,6 +215,15 @@ def control(log, profiles, boot):
                     time.sleep(.02)
                 calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.monotonic_ns()-start))
                 a.write_json(log/"commands.json",calls)
+                if os.environ.get("PLANNER_BENCH_PATH_TIMEOUT"):
+                    assert status["failed_id"]==ident and not status["actual"]["running"]
+                    assert "ACK timeout" in status["error"]
+                    receiver.settimeout(.2)
+                    try:
+                        receiver.recvfrom(65535)
+                    except socket.timeout:
+                        break
+                    raise AssertionError("VIEW arrived without initial path ACK")
                 assert status["applied_id"] == ident, status.get("error")
                 if os.environ.get("PLANNER_BENCH_LOWER") and cmd["op"] == "scan" and cmd["run"]:
                     for position in status["actual"]["spectrum"]["positions"]:
@@ -246,6 +257,9 @@ def control(log, profiles, boot):
                             mixer_lo_hz=pos["mixer_lo_hz"], rx_lo_hz=pos["rx_lo_hz"], marker_route=pos["marker_route"],
                             route_events=events.read_text().splitlines() if events.exists() else [],
                             physical_switch_verified=False)
+                        readback["path_confirmation"] = actual["spectrum"].get("path_confirmation")
+                        path_events=log/"path-events.ndjson"
+                        readback["path_events"] = [json.loads(s) for s in path_events.read_text().splitlines()] if path_events.exists() else []
                         a.write_json(log/"edge-start.json",readback)
                         assert pos["mixer"] and readback["guard"]["powerdown"]==0
                         assert readback["generation"]==readback["fresh_generation"]
