@@ -92,12 +92,13 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
             }
             let tx = if path == "mixer" || path == "auto" && lo >= threshold {
                 Some(
-                    choose(
+                    mixer_math::choose_on_antenna(
                         [lo as i64, hi as i64],
                         mult,
                         pll_bounds,
                         previous,
                         state["alternative"]["excluded_tx_pll_hz"].as_i64(),
+                        bands.get(&antenna).map_or(&[], Vec::as_slice),
                     )
                     .ok_or_else(|| anyhow!("no measured mixer setting covers [{lo},{hi}) Hz"))?,
                 )
@@ -264,6 +265,7 @@ pub(super) fn encode(
     }
     let (threshold, mult) = environment()?;
     let mut positions = Vec::new();
+    let antennas = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
     let mut ranges = Vec::new();
     let first = tiles
         .iter()
@@ -290,9 +292,14 @@ pub(super) fn encode(
             "readback leaves uncovered RF edge [{a},{b})"
         );
         if let Some(p) = pll {
+            let x = side * (a as i64 - offset);
+            let y = side * (b as i64 - offset);
+            let low = x.min(y);
+            let high = x.max(y);
             ensure!(
-                choose([a as i64, b as i64], mult, [p, p], Some(p), None)
-                    .is_some_and(|t| t.side == side),
+                low >= 70_000_000
+                    && high <= 6_000_000_000
+                    && (high < p + OFFSET - 35_520_000 || low > p + OFFSET + 35_520_000),
                 "PLL readback puts measured interference in [{a},{b})"
             );
         }
@@ -316,6 +323,8 @@ pub(super) fn encode(
             "side_sign":side,"mixer":slot.is_some(),"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
             "mixer_lo_hz":tone.map(|_|offset),"if_edges_hz":if side==1 {[a as i64-offset,b as i64-offset]}else{[offset-b as i64,offset-a as i64]},
             "ddc_hz":0,"dc_clearance_hz":mixer_math::DC_CLEARANCE,"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
+            "image_in_antenna":tone.and_then(|_|antennas.get(&v.antenna).map(|bands|bands.iter().any(|r|
+                (r[0] as i64)<2*offset-a as i64 && (r[1] as i64)>2*offset-b as i64))),
             "tx_if_veto_hz":tone.map(|f|[f-35_520_000,f+35_520_000]),"tx_model_extrapolated":pll.is_some_and(|p|!(2_250_000_000..=2_490_000_000).contains(&p)),
             "rx_available":!v.transition_only,"transition_only":v.transition_only,"marker_route":v.notify,
             "hold_boundary":v.hold,"transition":v.handover}));

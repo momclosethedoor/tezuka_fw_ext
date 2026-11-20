@@ -88,6 +88,9 @@ fn scan_bounds(c: &Config, bands: &AntennaBands) -> [u64; 2] {
     let entries = bands.values().flatten();
     let lower = entries.clone().map(|b| b[0]).min().unwrap_or(70_000_000);
     let upper = entries.map(|b| b[1]).max().unwrap_or_else(|| {
+        if c.scan["planner_version"] == 2 {
+            return plan_math::MAX_RF;
+        }
         c.scan_tx
             .iter()
             .map(|p| p.offset() as u64 + plan_math::DIRECT_LIMIT)
@@ -207,6 +210,12 @@ fn clock_ns() -> u64 {
 fn validate(v: &Value) -> Result<()> {
     match v["op"].as_str() {
         Some("scan") => {
+            if let Some(v) = v.get("planner_version") {
+                ensure!(
+                    matches!(v.as_u64(), Some(1 | 2)),
+                    "unsupported planner_version"
+                );
+            }
             int(v, "k", 1, 1023)?;
             let run = v["run"]
                 .as_bool()
@@ -326,6 +335,20 @@ async fn submit(
         );
     }
     let mut q = shared.inbox.lock().unwrap();
+    if q.applied_id == *id
+        || q.failed_id == *id
+        || q.pending.as_ref().is_some_and(|p| p["id"] == *id)
+        || q.next.as_ref().is_some_and(|p| p["id"] == *id)
+    {
+        return (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})));
+    }
+    if cmd["op"] == "scan" && cmd["run"] == false && q.pending.is_some() && q.next.is_none() {
+        q.next = Some(cmd.clone());
+        q.queued_ns = clock_ns();
+        shared.switch.store(true, Ordering::Release);
+        shared.wake.notify_one();
+        return (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})));
+    }
     if cmd["op"] == "alternative" {
         let source = &q.actual;
         let p = &source["spectrum"]["positions"][cmd["source_position"].as_u64().unwrap() as usize];
@@ -372,9 +395,6 @@ async fn submit(
             StatusCode::CONFLICT,
             Json(json!({"error":"another hardware command is pending"})),
         );
-    }
-    if q.applied_id == *id || q.failed_id == *id {
-        return (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})));
     }
     let id = id.clone();
     q.next = Some(cmd);
@@ -1072,6 +1092,8 @@ fn worker(
         pending["ddc_fs_hz"] = Value::Null;
         pending["waiting"] = Value::Null;
         pending["guard_tx"] = Value::Null;
+        pending["bank_apply"] = Value::Null;
+        pending["failed_plan"] = Value::Null;
         pending["field_watch"] = Value::Null;
         let config_result = (|| {
             ensure!(
@@ -1487,6 +1509,10 @@ fn worker(
             }
             Err(e) => {
                 state = before;
+                if op == "scan" || op == "alternative" {
+                    state["failed_plan"] =
+                        json!({"command":cmd,"applied_rf_ranges":[],"reason":e.to_string()});
+                }
                 state["running"] = json!(false);
                 state["spectrum"] = Value::Null;
                 state["generation"] = json!(generation);

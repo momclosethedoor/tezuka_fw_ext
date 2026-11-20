@@ -72,6 +72,18 @@ impl Cache {
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
         let tiles = generated::tiles(pending)?;
+        if tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
+            let requested = pending["scan"]["ranges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|r| r["enabled"] == true)
+                .map(|r| [r["lo_hz"].clone(), r["hi_hz"].clone()])
+                .collect::<Vec<_>>();
+            bail!(
+                "row99 cannot gate TX per visit within one active map; unapplied RF intervals {requested:?}"
+            );
+        }
         let rx_keys = tiles.iter().map(|v| v.rx).collect::<BTreeSet<_>>();
         let tx_keys = tiles
             .iter()
@@ -98,7 +110,7 @@ impl Cache {
         .iter()
         .map(|s| attr(s))
         .collect::<Result<Vec<_>>>()?;
-        if snapshot != self.snapshot {
+        if snapshot != self.snapshot || pending["scan"]["recalibrate"] == true {
             self.snapshot = snapshot;
             self.rx.clear();
             self.tx.clear();

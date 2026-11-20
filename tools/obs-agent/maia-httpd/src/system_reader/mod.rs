@@ -97,11 +97,27 @@ impl Hardware{
   if self.r(0x1bc)!=1||self.r(0x1a8)!=self.info.full as u32||self.r(0x1ac)!=self.info.view as u32{return Err("staged memory validation".into())}Ok(())
  }
  fn start(&mut self)->R<()>{let before=self.snapshot()?.cookie;self.valid=1;self.active=true;self.w(0x54,3);let s=self.snapshot()?;if !s.running||s.cookie!=before+1{return Err("START rejected".into())}self.last_release=Instant::now();Ok(())}
- fn cold_split(&mut self)->R<Value>{
+ fn service_route(&mut self,q:&RunControl)->R<()>{
+  if self.r(0x228)&8==0{return Ok(())}
+  let id=self.r(0x240);
+  let epoch=self.live64(0x24c);
+  let version=self.r(0x22c);
+  if (q.route)(id,epoch,version,self.r(0x234),self.r(0x244))?==Some(id)
+     && self.r(0x240)==id && self.r(0x228)&8!=0 && self.r(0x22c)==version && self.live64(0x24c)==epoch{
+   self.w(0x218,id);self.w(0x220,2);
+  }
+  Ok(())
+ }
+ fn cold_split(&mut self,control:Option<&RunControl>)->R<Value>{
   let initial=self.snapshot()?;
   if !self.shift||initial.cookie!=1||initial.released!=0{return Ok(Value::Null)}
-  let deadline=Instant::now()+Duration::from_secs(1);
+  let deadline=Instant::now()+Duration::from_secs(if control.is_some(){3}else{1});
   loop{
+   if let Some(q)=control{
+    if q.stop.load(Ordering::Acquire){return Err("scan cancelled during first visit".into())}
+    self.service_route(q)?;
+    (q.check)()?;
+   }
    let s=self.snapshot()?;
    if !s.running||s.fault||s.cookie!=1||s.released!=0||s.reserved>=view::SLOTS as u64{
     return Err("cold split lost initial ownership".into())
@@ -247,7 +263,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  if c.command!="rate"&&c.command!="drain"{return Err("command must be capture, drain, rate".into())}
  if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
- let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split()?}else{Value::Null};
+ let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split(control.filter(|_|c.scan))?}else{Value::Null};
  save(c,"cold-start.json",&cold)?;
  let mut reader=view::PairReader::attach(io.snapshot()?)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
@@ -263,14 +279,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  loop{
   if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin_link=interface_counters();begin_network=network.borrow().counts();begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
   if c.command=="rate"&&(control.map_or(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed),|q|q.stop.load(Ordering::Acquire))){end_link=interface_counters();end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break}
-  if let Some(q)=control{if c.scan&&io.r(0x228)&8!=0{
-    let id=io.r(0x240);let epoch=io.live64(0x24c);let version=io.r(0x22c);
-    match (q.route)(id,epoch,version,io.r(0x234),io.r(0x244)){
-      Ok(Some(ack)) if ack==id&&io.r(0x240)==id&&io.r(0x228)&8!=0&&io.r(0x22c)==version=>{io.w(0x218,ack);io.w(0x220,2);},
-      Ok(_)=>{},
-      Err(e)=>{route_failure=Some(e);break;}
-    }
-  }}
+  if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=Duration::from_millis(100){
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
    if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();

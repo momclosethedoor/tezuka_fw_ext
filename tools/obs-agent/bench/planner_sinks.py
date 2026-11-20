@@ -48,7 +48,9 @@ class Sinks:
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
         old=fields.copy()
         old[0]-=1
-        conn.sendall(ack(old))
+        wrong=fields.copy()
+        wrong[4]+=1
+        conn.sendall(ack(old)+ack(wrong))
         received=time.monotonic_ns()
         time.sleep(.025)
         if not self.missing:
