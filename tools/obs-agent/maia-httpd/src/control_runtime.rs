@@ -2,6 +2,8 @@
 #![allow(missing_docs)]
 mod calibration;
 mod field;
+mod generated;
+mod mixer_math;
 mod plan_math;
 mod tx;
 
@@ -1127,7 +1129,7 @@ fn worker(
                     return Ok(None);
                 }
                 let (bytes, spectrum) = if pending["scan"]["planner_version"] == 2 {
-                    calibration.direct(&c, &pending, op == "route", &shared.switch)?
+                    calibration.prepare(&pending, &shared.switch)?
                 } else {
                     plan(&c, &template, &pending, op == "route")?
                 };
@@ -1135,7 +1137,7 @@ fn worker(
                 if pending["running"] == true {
                     pending["spectrum"] = spectrum;
                 }
-                if word(&bytes, 12328) == 1 {
+                if word(&bytes, 12328) == 1 && word(&bytes, 12332) == 0 {
                     pending["waiting"] = json!("TX profiles loaded, mixer RF off");
                 }
                 Ok::<_, anyhow::Error>(Some(bytes))
@@ -1149,6 +1151,7 @@ fn worker(
             }
         })();
         let mut guard_taken = false;
+        let mut guard_rf = false;
         let actual = RefCell::new(pending);
         let watch = RefCell::new(None);
         let result = (|| {
@@ -1171,13 +1174,31 @@ fn worker(
             }
             if let Some(setup) = setup.as_mut() {
                 let expected_control = 3 | (word(setup, 12328) << 2);
+                guard_rf = word(setup, 12332) != 0;
+                if guard_rf {
+                    ensure!(
+                        guard_cmd(&guard_fd, 0x4605)?[114] == 1,
+                        "guard with RF lease required"
+                    );
+                    let pll = actual.borrow()["spectrum"]["first_tx_pll_hz"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("first TX PLL"))?;
+                    carrier.prepare_guarded(pll)?;
+                }
                 guard(&guard_fd, 0x4601, setup.as_mut_ptr().cast())?;
                 guard_taken = true;
-                let s = guard_cmd(&guard_fd, 0x4602)?;
+                let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })?;
                 ensure!(
-                    s[1] == 2 && s[9] == expected_control && s[112] == 1,
+                    s[1] == 2
+                        && s[9] == expected_control
+                        && s[112] == (!guard_rf) as u32
+                        && (!guard_rf || s[113] == word(setup, 12336)),
                     "guard take readback"
                 );
+                if guard_rf {
+                    actual.borrow_mut()["tx"] = json!({"on":true,"powerdown":s[112],"attenuation_mdb":s[113],
+                        "owner":"obs_fl_guard","carrier_source":"cyclic_fs_div_64"});
+                }
                 actual.borrow_mut()["guard_tx"] =
                     json!({"executor":s[9]&4!=0,"powerdown":s[112],"attenuation_mdb":s[113]});
             }
@@ -1256,6 +1277,7 @@ fn worker(
                     "PL",
                 )
             };
+            let last_renew = std::cell::Cell::new(Instant::now());
             let q = crate::system_reader::RunControl {
                 generation,
                 stop: &shared.switch,
@@ -1269,7 +1291,13 @@ fn worker(
                     {
                         shared.inbox.lock().unwrap().actual["field_watch"]["error"] = json!(note);
                     }
-                    if tx_active && c.external_mixer.is_none() {
+                    if guard_rf && last_renew.get().elapsed() >= Duration::from_millis(80) {
+                        if !tx::lease_is_live() || !carrier.buffer_live() {
+                            return Err("guarded TX lease or buffer lost".into());
+                        }
+                        guard_cmd(&guard_fd, 0x4606).map_err(|e| e.to_string())?;
+                        last_renew.set(Instant::now());
+                    } else if !guard_rf && tx_active && c.external_mixer.is_none() {
                         if !tx::lease_is_live()
                             || tx::readback(FS / 64).map_err(|e| e.to_string())?["on"] != true
                         {
@@ -1290,13 +1318,22 @@ fn worker(
             .map_or(Ok(()), |field| field.finish(&regs));
         let result = result.and(field_stop);
         let result = if guard_taken {
-            let handback = guard_cmd(&guard_fd, 0x4604).and_then(|s| {
+            let handback = (|| {
+                let s = guard_cmd(&guard_fd, 0x4605)?;
+                let s = if guard_rf && s[1] == 3 {
+                    s
+                } else {
+                    guard_cmd(&guard_fd, 0x4604)?
+                };
                 ensure!(
                     s[1] == 3 && s[9] == 0 && s[112] == 1,
                     "guard return credential"
                 );
-                Ok(())
-            });
+                if guard_rf {
+                    actual.borrow_mut()["tx"] = carrier.off()?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })();
             match handback {
                 Ok(()) => result,
                 Err(e) => {
@@ -1493,8 +1530,10 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "multiplier":p.multiplier,"antenna":p.antenna})
         })
         .collect::<Vec<_>>();
+    let (threshold, mult) = generated::environment()?;
+    let rf_guard = guard_cmd(&guard_fd, 0x4605)?[114] == 1;
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
-        "scan_tx_profiles":profiles,"scan_tx_rf":false});
+        "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"tx_model_pll_hz":[2250000000u64,2490000000u64]}});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(

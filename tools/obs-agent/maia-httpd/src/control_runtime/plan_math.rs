@@ -129,7 +129,7 @@ fn prefix(positions: &[u64], candidate: &Candidate<'_>, lo: u64, hi: u64) -> Opt
             intervals.push((a, b, ordinal, idx));
         } else {
             // Match the conservative exclusion at DC for the active VIEW512.
-            intervals.push((a, f - 360_000, ordinal, idx));
+            intervals.push((a, f.saturating_sub(360_000), ordinal, idx));
             intervals.push((f + 360_000, b, ordinal, idx));
         }
     }

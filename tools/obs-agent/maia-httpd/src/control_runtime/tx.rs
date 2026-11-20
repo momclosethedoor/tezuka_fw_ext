@@ -120,14 +120,32 @@ impl Carrier {
         ensure!(lease_is_live(), "TX lease not confirmed");
         self.off()?;
         self.frequency_hz = requested;
-        let result = self.start(requested, attenuation);
+        let result = self.start(requested, attenuation, false);
         if result.is_err() {
             self.off()?;
         }
         result
     }
 
-    fn start(&mut self, requested: u64, attenuation: u64) -> Result<Value> {
+    pub fn prepare_guarded(&mut self, pll: u64) -> Result<()> {
+        ensure!(lease_is_live(), "TX lease required before guarded scan");
+        self.off()?;
+        self.frequency_hz = pll + OFFSET;
+        if let Err(e) = self.start(pll + OFFSET, 89750, true) {
+            self.off()?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    pub fn buffer_live(&self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|c| unsafe { libc::kill(c.id() as i32, 0) } == 0)
+            && self.device.as_ref().is_some_and(|d| buffer_enabled(d))
+    }
+
+    fn start(&mut self, requested: u64, attenuation: u64, guarded: bool) -> Result<Value> {
         ensure!(
             attr("out_voltage_sampling_frequency")? == FS.to_string(),
             "TX sample rate differs"
@@ -207,6 +225,14 @@ impl Carrier {
             lease_is_live() && child.try_wait()?.is_none(),
             "TX lease lost before activation"
         );
+        if guarded {
+            let rb = readback(OFFSET)?;
+            ensure!(
+                rb["powerdown"] == 1 && rb["attenuation_mdb"] == 89750,
+                "TX must be muted during handoff"
+            );
+            return Ok(rb);
+        }
         set_attr(
             "out_voltage0_hardwaregain",
             format!("{:.3}", -(attenuation as f64) / 1000.0),
