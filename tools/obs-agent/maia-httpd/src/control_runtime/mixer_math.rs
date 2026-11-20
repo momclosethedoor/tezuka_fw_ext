@@ -4,8 +4,10 @@ pub const OFFSET: i64 = 960_000;
 const IF_MIN: i64 = 70_000_000;
 const IF_MAX: i64 = 6_000_000_000;
 const PILOT_HALF_SPAN: i64 = 61_440_000 / 2 + 4_800_000;
-// The largest first bin below one VIEW code above the local floor was
-// 10 native bins from DC. Include a full 8-bin VIEW512 cell on each edge.
+// At the tested gain the central DC feature crossed one VIEW code within
+// 10 bins on 39/40 sides. On the remaining side a broader TX-off feature
+// had unknown origin. This bound models the central feature only. Include
+// a full 8-bin VIEW512 cell on each edge.
 pub const DC_CLEARANCE: i64 = (10 + 8) * 15_000;
 pub const HALF_PASS: i64 = 23_800_000;
 // RX readback <=10 Hz plus multiplier * TX readback <=20 Hz.
