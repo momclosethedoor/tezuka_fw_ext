@@ -19,6 +19,9 @@ impl UdpBatch {
  pub fn due(&self,now:Instant)->bool {
   self.pending>0&&(self.coalesce_us==0||self.pending>=self.max_records as u64||self.first.is_some_and(|t|now.saturating_duration_since(t)>=Duration::from_micros(self.coalesce_us)))
  }
+ pub fn timer_due(&self,now:Instant)->bool {
+  self.first.is_some_and(|t|now.saturating_duration_since(t)>=Duration::from_micros(self.coalesce_us))
+ }
  pub fn flush_due(&mut self,s:&UdpSocket){if self.due(Instant::now()){self.flush(s);}}
  pub fn flush(&mut self,s:&UdpSocket){
   if self.pending==0{return}

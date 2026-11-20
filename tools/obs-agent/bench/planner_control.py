@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 from planner_row99 import bench, stage_executables
 from planner_sinks import Sinks
 from planner_laps import Laps
+from planner_sweeps import Sweeps
 
 
 def record_laps(receiver,data,status,folder,index):
@@ -24,16 +25,21 @@ def record_laps(receiver,data,status,folder,index):
         timing_position = next((i for i,p in enumerate(positions)
                                 if not p["transition_only"] and p["marker_route"] is None), 0)
     laps = Laps(status["actual"], timing_position)
+    sweep = None
+    if status["actual"]["spectrum"].get("sweep_wire_version") == 1:
+        sweep = Sweeps(status["actual"],folder/f"sweeps-{index}.json")
     deadline=time.monotonic()+(15 if wide else 8 if load_test else 3.5)
     with (folder/f"lap-{index}.dat").open("wb") as f:
         while time.monotonic()<deadline:
+            if sweep:
+                sweep.accept(data)
             if data[:8]==b"GVIEW4\0\0":
                 f.write(struct.pack("<I",len(data))+data)
                 laps.accept(data)
                 if wide and len(laps.ticks)>=13:break
                 if not wide and not load_test and len(laps.ticks)>=5 and len(laps.seen)==laps.n:break
             data,_=receiver.recvfrom(65535)
-    return laps.result()
+    return dict(laps.result(),**(sweep.result() if sweep else {}))
 
 
 def lease_loop(stop, ready,log, silence):

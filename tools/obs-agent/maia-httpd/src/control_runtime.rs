@@ -210,6 +210,10 @@ fn clock_ns() -> u64 {
 fn validate(v: &Value) -> Result<()> {
     match v["op"].as_str() {
         Some("scan") => {
+            if let Some(delivery) = v.get("view_delivery") {
+                ensure!(matches!(delivery.as_str(),Some("stream" | "5ms" | "10ms" | "20ms" | "pass")),
+                    "unsupported view_delivery");
+            }
             if let Some(rev) = v.get("path_ack_version") {
                 ensure!(rev == 1 && v["planner_version"] == 2, "unsupported path_ack_version");
             }
@@ -1387,7 +1391,18 @@ fn worker(
                     Ok(())
                 });
             }
+            let mut sweep = None;
             if let Some(setup) = setup.as_mut() {
+                let mut a = actual.borrow_mut();
+                if a["spectrum"]["sweep_wire_version"] == 1 {
+                    let delivery = a["scan"]["view_delivery"].as_str()
+                        .or_else(||c.scan["view_delivery"].as_str()).unwrap_or("stream").to_owned();
+                    a["spectrum"]["version"] = json!(word(setup,16));
+                    sweep = crate::system_reader::SweepSpec::from_descriptor(&a["spectrum"],&delivery)
+                        .map_err(|e|anyhow!(e))?;
+                    a["spectrum"]["view_delivery"] = json!(delivery);
+                }
+                drop(a);
                 managed_tx = word(setup, setup.len() - 4) & 1 != 0;
                 let expected_control = if managed_tx {31} else {3 | (word(setup, setup.len() - 160) << 2)};
                 guard_rf = word(setup, setup.len() - 156) != 0;
@@ -1564,6 +1579,7 @@ fn worker(
                 stop: &shared.switch,
                 started: &started,
                 route: &route_fn,
+                sweep: sweep.as_ref(),
                 check: &|| {
                     if let Some(note) = watch
                         .borrow_mut()

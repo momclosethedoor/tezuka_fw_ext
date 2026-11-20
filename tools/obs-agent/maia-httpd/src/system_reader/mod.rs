@@ -3,6 +3,8 @@ mod continuous;
 mod view;
 mod discard;
 mod view_batch;
+mod sweep_delivery;
+pub(crate) use sweep_delivery::SweepSpec;
 use view_batch::UdpBatch;
 pub(crate) use continuous::Header;
 use continuous::Snapshot;
@@ -244,6 +246,7 @@ pub(crate) struct RunControl<'a>{
  pub started:&'a dyn Fn(Header),
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
  pub check:&'a dyn Fn()->R<()>,
+ pub sweep:Option<&'a SweepSpec>,
 }
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
@@ -271,10 +274,19 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let record_bytes=(if control.is_some(){64}else{56})+[0,512,1024,2048][c.mode as usize];
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
+ let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
+   sweep_delivery::Delivery::new(spec,io.live64(0x238),q.generation,&mut network.borrow_mut()))));
  let announced=std::cell::Cell::new(false);let draining=std::cell::Cell::new(false);
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(q)=control{if draining.get(){return Ok(())}if !announced.replace(true){(q.started)(h);}}
-  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}let mut net=network.borrow_mut();net.start_record();net.bytes.extend_from_slice(if control.is_some(){b"GVIEW4\0\0"}else{b"GVIEW3\0\0"});for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}if let Some(q)=control{net.bytes.extend_from_slice(&q.generation.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}}}
+  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
+   let mut net=network.borrow_mut();
+   if let Some(sweep)=sweeps.borrow_mut().as_mut() {
+    if overview.len()!=512{return Err("sweep delivery requires VIEW512".into())}
+    sweep.accept(h,overview,&mut net,sock);
+   } else {
+    net.start_record();net.bytes.extend_from_slice(if control.is_some(){b"GVIEW4\0\0"}else{b"GVIEW3\0\0"});for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}if let Some(q)=control{net.bytes.extend_from_slice(&q.generation.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}
+   }}}
   if c.trace_limit!=0{if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}}Ok(())
  };
  loop{
@@ -286,12 +298,22 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();
   }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
-  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush_due(sock);}max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
+  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+  if let Some(sock)=&socket {
+   let mut net=network.borrow_mut();
+   if let Some(sweep)=sweeps.borrow().as_ref(){sweep.poll(&mut net,sock);}else{net.flush_due(sock);}
+  }
+  max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released{std::hint::spin_loop();} // CSR has no completion fd/IRQ; no timer delay.
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
- draining.set(control.is_some());io.stop();let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;if let Some(sock)=&socket{network.borrow_mut().flush(sock);}if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
+ draining.set(control.is_some());io.stop();let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+  if let Some(sock)=&socket {
+   let mut net=network.borrow_mut();
+   if let Some(sweep)=sweeps.borrow_mut().as_mut(){sweep.finish(&mut net,sock,false);}else{net.flush(sock);}
+  }
+  if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
  if let Some(err)=route_failure{return Err(err);}
  drop(sink);
@@ -305,7 +327,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
  }
  if io.pressure_on{save(c,"pressure.json",&json!({"columns":["board_monotonic_ns","reserved","committed","physical_released"],"period_min_ms":2,"omitted":io.pressure_omitted,"samples":io.pressure}))?;}
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum","network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let sweep_network=sweeps.borrow().as_ref().map(|s|json!({"completion_datagrams":s.notes_sent,"completion_send_drop":s.notes_lost,"peak_payload_bytes":s.peak_bytes}));
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum","network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
