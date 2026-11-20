@@ -16,7 +16,11 @@ def main():
     p.add_argument("--rf-hz",type=int,default=6750000000)
     p.add_argument("--pll-hz",type=int,nargs="+",default=[2250000000,2370000000,2490000000])
     p.add_argument("--source-58",action="store_true",help="locate the enabled 5.8 GHz reference with TX muted")
+    p.add_argument("--direct-tx-on",action="store_true",
+                   help="measure a physically confirmed direct RX with the mixer LO driven")
     args = p.parse_args()
+    if args.direct_tx_on and (args.route != "direct" or args.source_58):
+        p.error("--direct-tx-on requires direct RX and the carrier-comparison series")
     host = args.workspace.parent / "goofy_scan"
     sys.path[:0] = [str(args.workspace / "obs-007a-hw-system/scripts"), str(host),
                     str(host / "local-only/HOST-SCAN-CONTROL-001")]
@@ -69,7 +73,7 @@ def main():
         tags = [float(np.frombuffer(f, "<f4")[0]) for f in frames]
         lock_after = int(ssh(rx_lock).strip(), 0)
         records.append(dict(file=name, host_ns=times, profile_tags=tags, route=args.route,
-                            rx_fastlock_setup=[lock_before, lock_after],
+                            rx_fastlock_setup=[lock_before, lock_after],direct_tx_on_comparison=args.direct_tx_on,
                             nominal_pll_hz=pll, tx=tx, arm=state, discard_prefix_frames=2))
         save("series.json", records)
         assert lock_after & 3 == 0, "RX fastlock changed during static observation"
@@ -86,10 +90,11 @@ def main():
             return
         for pll in args.pll_hz:
             tone = pll + 960000
-            points = (tone - 4800000, tone + 4800000, abs(args.rf_hz - 2*tone))
+            target_if = args.rf_hz if args.direct_tx_on else abs(args.rf_hz - 2*tone)
+            points = (tone - 4800000, tone + 4800000, target_if)
             for rx in points:
                 capture(pll, rx, None, {"powerdown": 1})
-            if args.route == "mixer":
+            if args.route == "mixer" or args.direct_tx_on:
                 fixture = ToneFixture(board)
                 try:
                     fixture.enter()

@@ -136,6 +136,8 @@ def control(log, profiles, boot):
     if mixer:
         assert v2
         scan["ranges"]=[dict(lo_hz=6748000000,hi_hz=6752000000,enabled=True)]
+        if os.environ.get("PLANNER_BENCH_EDGE") == "1":
+            scan["ranges"] = [dict(lo_hz=6000000001, hi_hz=6002000001, enabled=True)]
         if os.environ.get("PLANNER_BENCH_LOWER"):
             scan["mixer"] = {"pll_range_hz": [4750000000, 4760000000]}
         if os.environ.get("PLANNER_BENCH_SOURCE58"):
@@ -235,6 +237,18 @@ def control(log, profiles, boot):
                     if status["actual"]["mode"]=="scan" and not os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
                         calls[-1]["laps"]=record_laps(receiver,data,status,log,len(calls))
                     a.write_json(log/"commands.json",calls)
+                    if os.environ.get("PLANNER_BENCH_EDGE") == "1" and len(calls)==1:
+                        actual = status["actual"]
+                        pos = actual["spectrum"]["positions"][0]
+                        events = log/"antenna.ndjson"
+                        readback = dict(request=cmd, rf_ranges=pos["rf_ranges"], generation=actual["generation"],
+                            fresh_generation=struct.unpack_from("<Q", data, 56)[0], guard=actual["guard_tx"],
+                            mixer_lo_hz=pos["mixer_lo_hz"], rx_lo_hz=pos["rx_lo_hz"], marker_route=pos["marker_route"],
+                            route_events=events.read_text().splitlines() if events.exists() else [],
+                            physical_switch_verified=False)
+                        a.write_json(log/"edge-start.json",readback)
+                        assert pos["mixer"] and readback["guard"]["powerdown"]==0
+                        assert readback["generation"]==readback["fresh_generation"]
                     if os.environ.get("PLANNER_BENCH_LEASE_LOSS") and len(calls)==1:
                         time.sleep(6)
                         healthy=a.request(url,"GET",path,timeout=1)
