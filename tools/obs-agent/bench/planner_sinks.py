@@ -81,9 +81,11 @@ class Sinks:
             else:
                 conn.sendall(f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode())
             return
-        assert event["ack_version"]==2
+        assert kind in (2,4)
         fields=[event[k] for k in ("generation","version","epoch","position","marker_id","route")]
         def ack(f):
+            if kind == 4:
+                return ("ACK4 "+" ".join(map(str,[event["boot_id"],*f,event["required_path"]]))+"\n").encode()
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
         if os.environ.get("PLANNER_BENCH_SWEEP"):
             received=time.monotonic_ns()

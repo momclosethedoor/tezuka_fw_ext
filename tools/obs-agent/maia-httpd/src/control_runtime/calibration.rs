@@ -116,7 +116,7 @@ impl Cache {
             && ranges.iter().all(|r| r["path"].is_null() || r["path"]=="auto");
         let tiles = if select {
             let mut subset = Vec::new();
-            for r in ranges.iter().filter(|r|r["enabled"]==true) {
+            for (row,r) in ranges.iter().enumerate().filter(|(_,r)|r["enabled"]==true) {
                 let lo = r["lo_hz"].as_u64().ok_or_else(||anyhow!("range start"))?;
                 let hi = r["hi_hz"].as_u64().ok_or_else(||anyhow!("range end"))?;
                 let mut cursor = lo;
@@ -127,6 +127,7 @@ impl Cache {
                     ensure!(a == cursor,"uncovered RF [{cursor},{a})");
                     let mut clipped = t.clone();
                     clipped.rf = [a,b];
+                    clipped.rf_row = row;
                     subset.push(clipped);
                     cursor = b;
                 }

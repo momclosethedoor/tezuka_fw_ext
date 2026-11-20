@@ -161,6 +161,10 @@ def control(log, profiles, boot):
         cfg["field_preview"] = dict(collector=remote+"/obs-field1", target_hz=2425000000, timeout_ms=90)
     if v2:
         scan["planner_version"] = 2
+        if "PLANNER_BENCH_GATE_TICKS" in os.environ:
+            scan["xtg1_wait_ticks"] = int(os.environ["PLANNER_BENCH_GATE_TICKS"])
+        if geometry := os.environ.get("PLANNER_BENCH_GEOMETRY"):
+            scan["sweep_geometry"] = geometry
         scan["catalog_on_boot"] = os.environ.get("PLANNER_BENCH_CATALOG") == "1"
         if os.environ.get("PLANNER_BENCH_TIMING_ONLY") == "1":
             scan["bench_timing_only"] = True

@@ -1840,6 +1840,14 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual,
         "scan_bounds":bounds});
     initial["xtg1_wait_ticks"] = json!(xtg1);
+    let grid_27 = match c.scan["sweep_geometry"].as_str() {
+        Some("27/9") => true,
+        Some("legacy") => false,
+        None if c.scan["sweep_geometry"].is_null() => xtg1.is_some(),
+        _ => bail!("sweep_geometry must be 27/9 or legacy"),
+    };
+    ensure!(!grid_27 || c.scan["planner_version"] == 2,"27/9 requires planner v2");
+    initial["grid_27"] = json!(grid_27);
     let profiles = c
         .scan_tx
         .iter()

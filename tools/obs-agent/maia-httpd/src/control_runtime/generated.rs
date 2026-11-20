@@ -28,6 +28,7 @@ pub(super) struct Tile {
     handover: &'static str,
     grid: Option<(&'static str, [u64; 2])>,
     marker_path: Option<&'static str>,
+    pub rf_row: usize,
 }
 
 pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
@@ -70,6 +71,9 @@ pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>
         let schedule = grid_bench::schedule(core, overlap, half)?;
         return transitions(state, &schedule);
     }
+    if state["grid_27"] == true && state["alternative"].is_null() {
+        return transitions(state, &grid_bench::schedule(core, 9_000_000, 27_000_000)?);
+    }
     transitions(state, core)
 }
 
@@ -91,7 +95,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
     };
     let mut tiles = Vec::new();
     let mut previous = None;
-    for range in scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))? {
+    for (rf_row, range) in scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?.iter().enumerate() {
         if range["enabled"] != true {
             continue;
         }
@@ -173,6 +177,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 handover: "none",
                 grid: None,
                 marker_path: None,
+                rf_row,
             });
             lo = hi;
         }
@@ -332,6 +337,8 @@ pub(super) fn encode(
     let timing_only = state["pl_timing_only"] == true;
     let tx_rf_on = !tx.is_empty() && !timing_only;
     let managed = tx_rf_on && state["xtg1_wait_ticks"].is_number();
+    let working_grid = state["grid_27"] == true && state["alternative"].is_null()
+        && state["scan"]["bench_overlap_hz"].is_null();
     let tail = 40 + 3 * stride;
     let mut bytes = vec![0; tail + 160];
     for (p, v) in [
@@ -426,8 +433,15 @@ pub(super) fn encode(
             put_hz(&mut bytes, at + 16, a);
             put_hz(&mut bytes, at + 24, b);
         }
-        if !v.transition_only && !timing_only {
-            ranges.push(v.rf);
+        let useful = if let Some((_,bounds)) = v.grid.filter(|_| working_grid && !v.transition_only) {
+            grid_bench::lobes(bounds, center, offset, side, tone)?
+        } else if !v.transition_only {
+            vec![v.rf]
+        } else {
+            Vec::new()
+        };
+        if !timing_only {
+            ranges.extend(useful.iter().copied());
         }
         positions.push(json!({"rf_ranges":[v.rf],"rx_lo_hz":rx_hz,"rf_center_hz":center,"antenna":v.antenna,
             "side_sign":side,"mixer":slot.is_some(),"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
@@ -446,6 +460,11 @@ pub(super) fn encode(
         let row = positions.last_mut().unwrap();
         row["marker_path"] = json!(v.marker_path);
         row["tx_gate_requested"] = if managed {json!(slot.is_some())} else {Value::Null};
+        if working_grid {
+            row["rf_ranges"] = json!(useful);
+            row["rf_row"] = json!(v.rf_row);
+            row["sweep_phase"] = json!(v.grid.map(|(p,_)| if p == "main" {"A"} else {"B"}));
+        }
     }
     // The guard drives TX for the full map. A mixed direct/mixer map requires
     // validated per-route gating or a measured direct model with the TX still on.
@@ -453,9 +472,14 @@ pub(super) fn encode(
         !tx_rf_on || managed || tiles.iter().all(|t| t.tx.is_some()),
         "direct/mixer map needs TX gating at route boundary"
     );
-    Ok((
-        bytes,
-        json!({"rf_ranges":ranges,"requested_ranges":state["scan"]["ranges"],"positions":positions,"planner_version":2,
-        "pl_timing_only":timing_only,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"first_tx_pll_hz":first.map(|s|tx[&txkeys[s]].0)}),
-    ))
+    let mut desc = json!({"rf_ranges":ranges,"requested_ranges":state["scan"]["ranges"],"positions":positions,"planner_version":2,
+        "pl_timing_only":timing_only,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,
+        "first_tx_pll_hz":first.map(|s|tx[&txkeys[s]].0)});
+    if working_grid {
+        grid_bench::validate_cover(&desc)?;
+        desc["sweep_geometry"] = json!({"half_pass_hz":27_000_000,"overlap_hz":9_000_000,
+            "max_step_hz":45_000_000,"phase_order":["A","B"]});
+        desc["sweep_wire_version"] = json!(1);
+    }
+    Ok((bytes, desc))
 }

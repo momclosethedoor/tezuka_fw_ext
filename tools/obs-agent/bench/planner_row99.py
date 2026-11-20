@@ -28,7 +28,7 @@ def stage_executables(*args, **kwargs):
         script = loader.read_bytes()
         assert script.count(original.encode()) == 1
         loader.write_bytes(script.replace(original.encode(), expected.encode()) +
-                           b'\ntest "$(devmem 0x7c460328)" = 0x31475458\n./obs-fl-ctl gate-status\n')
+                           b'\ntest "$(devmem 0x7c460328)" = 0x31475458\necho XTG1_ID=0x31475458\n')
         api.upload(image, api.REMOTE, "row99.bit.bin")
         api.upload(loader, api.REMOTE, loader.name)
         board = log / "staged.json"
@@ -42,6 +42,11 @@ if __name__ == "__main__":
     bench.accepted.stage = stage_executables
     if os.environ.get("PLANNER_BENCH_CAP2"):
         def capture_and_hold(log, profiles, boot):
+            if os.environ.get("PLANNER_BENCH_XTG1"):
+                api = bench.accepted
+                gate = json.loads(api.ssh(f"cd {api.REMOTE} && ./obs-fl-ctl gate-status"))
+                assert gate["supported"] and gate["capability"] == 0x31475458 and gate["visit"] is None
+                api.write_json(log / "xtg1-idle.json", gate)
             bench.accepted.run_case(log, profiles, boot, "window-18432", "reuse", 18432, 102, save=True)
             bench.accepted.mode_smoke(log, profiles, boot)
         bench.accepted.video_smoke = capture_and_hold
