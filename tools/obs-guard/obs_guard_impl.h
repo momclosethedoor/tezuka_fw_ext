@@ -20,6 +20,7 @@ static struct ad9361_rf_phy *obs_phy;
 static void __iomem *obs_csr;
 static struct device *obs_dma_dev;
 static void *obs_mem[3];
+static size_t obs_alloc_bytes;
 static dma_addr_t obs_dma[3];
 static struct gpio_desc *obs_gpio[3];
 static DECLARE_WAIT_QUEUE_HEAD(obs_wait);
@@ -168,13 +169,13 @@ static int obs_thread(void *arg){int cmd,r;
   obs_error=r;if(r)obs_state=4;WRITE_ONCE(obs_command,0);complete(&obs_done);
  }return 0;
 }
-static int obs_validate(struct obs_setup *c){u32 i,j;
+static int obs_validate(struct obs_setup *c,u8 *tables,size_t stride){u32 i,j;
  bool cap2 = obs_r(OBS_CAP2_ID_REG) == OBS_CAP2_ID;
- if(c->magic!=0x3747534f||c->catalog_count<8||c->catalog_count>128||!c->map_count||c->map_count>128||!c->next_count||c->next_count>128||!c->version||c->next_version==c->version||!c->next_version||c->reserved||c->restore_lo<70000000ULL||c->restore_lo>6000000000ULL)return -EINVAL;
+ if(c->catalog_count<8||c->catalog_count>stride/32||!c->map_count||c->map_count>stride/32||!c->next_count||c->next_count>stride/32||!c->version||c->next_version==c->version||!c->next_version||c->reserved||c->restore_lo<70000000ULL||c->restore_lo>6000000000ULL||c->gpio_base!=512)return -EINVAL;
  if(c->tx_enable>1||c->tx_rf_on>1||c->tx_rf_on>c->tx_enable||c->tx_start_slot>7||c->tx_atten_mdb>89750||c->extra_reserved)return -EINVAL;
  if(c->tx_enable&&(c->restore_tx_lo<70000000ULL||c->restore_tx_lo>6000000000ULL))return -EINVAL;
- for(i=0;i<c->catalog_count;i++)for(j=24;j<32;j++)if(c->catalog[i*32+j])return -EINVAL;
- for(j=0;j<2;j++){u8 *p=j?c->next:c->map;u32 n=j?c->next_count:c->map_count;
+ for(i=0;i<c->catalog_count;i++)for(j=24;j<32;j++)if(tables[i*32+j])return -EINVAL;
+ for(j=0;j<2;j++){u8 *p=tables+(1+j)*stride;u32 n=j?c->next_count:c->map_count;
   for(i=0;i<n;i++){u32 idx=get_unaligned_le32(p+i*32),flags=get_unaligned_le32(p+i*32+4);
    u32 job = get_unaligned_le32(p+i*32+12);
    bool assigned = flags & BIT(3);
@@ -185,11 +186,54 @@ static int obs_validate(struct obs_setup *c){u32 i,j;
   }
  }return 0;
 }
-static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u32 words[128]={};struct obs_setup *cfg;
+static int obs_install(void __user *arg,bool extended){
+ struct obs_setup *cfg;
+ void *fresh[3]={};
+ dma_addr_t addr[3];
+ u8 *tables;
+ size_t stride=4096;
+ u32 entries;
+ int i,r;
+ cfg=kzalloc(sizeof(*cfg),GFP_KERNEL);
+ if(!cfg)return -ENOMEM;
+ if(copy_from_user(cfg,arg,offsetof(struct obs_setup,catalog))){r=-EFAULT;goto free_cfg;}
+ if(cfg->magic!=(extended?0x3847534f:0x3747534f)){r=-EINVAL;goto free_cfg;}
+ if(extended){
+  entries=max(cfg->catalog_count,max(cfg->map_count,cfg->next_count));
+  if(entries<8||entries>65535){r=-EINVAL;goto free_cfg;}
+  stride=32*max(entries,128U);
+ }
+ tables=vmemdup_user((u8 __user *)arg+40,stride*3);
+ if(IS_ERR(tables)){r=PTR_ERR(tables);goto free_cfg;}
+ if(copy_from_user((u8 *)cfg+offsetof(struct obs_setup,tx_enable),(u8 __user *)arg+40+3*stride,
+     sizeof(*cfg)-offsetof(struct obs_setup,tx_enable))){r=-EFAULT;goto free_tables;}
+ r=obs_validate(cfg,tables,stride);if(r)goto free_tables;
+ memcpy(cfg->catalog,tables,8*32);
+ if(stride>obs_alloc_bytes){
+  for(i=0;i<3;i++){
+   fresh[i]=dma_alloc_coherent(obs_dma_dev,stride,&addr[i],GFP_KERNEL);
+   if(!fresh[i] || addr[i]%32 || (u64)addr[i]+stride>0x20000000ULL){r=-ENOMEM;goto free_fresh;}
+  }
+  for(i=0;i<3;i++){
+   if(obs_mem[i])dma_free_coherent(obs_dma_dev,obs_alloc_bytes,obs_mem[i],obs_dma[i]);
+   obs_mem[i]=fresh[i];obs_dma[i]=addr[i];
+  }
+  obs_alloc_bytes=stride;
+ }
+ for(i=0;i<3;i++)memcpy(obs_mem[i],tables+i*stride,stride);
+ dma_wmb();kfree(obs_cfg);obs_cfg=cfg;obs_state=0;obs_error=0;kvfree(tables);return 0;
+free_fresh:
+ for(i=0;i<3;i++)if(fresh[i])dma_free_coherent(obs_dma_dev,stride,fresh[i],addr[i]);
+free_tables:
+ kvfree(tables);
+free_cfg:
+ kfree(cfg);return r;
+}
+static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u32 words[128]={};
  if(!capable(CAP_SYS_RAWIO))return -EPERM;
  if(cmd==0x4605){
   words[0]=2;words[1]=READ_ONCE(obs_state);words[2]=READ_ONCE(obs_error);words[3]=atomic_read(&obs_denied);
-  for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=4096;
+  for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=obs_alloc_bytes?:4096;words[115]=65535;
   words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);words[114]=1;
   for(i=0;i<18;i++)words[16+i]=obs_r(0x224+4*i);
   words[40]=obs_readback_status;words[41]=obs_readback_pos;words[42]=obs_readback_version;memcpy(words+48,obs_readback,128);memcpy(words+80,obs_tx_readback,128);words[112]=obs_tx_pd;words[113]=obs_tx_atten;
@@ -206,13 +250,9 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
   obs_rf_closed=false;WRITE_ONCE(obs_rf_owner,f);
   WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));cmd=0x4602;
  }else if(obs_rf_owner && obs_rf_owner!=f){r=-EBUSY;goto out;}
- if(cmd==0x4601){
+ if(cmd==0x4601||cmd==0x4608){
   if(obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16){r=-EBUSY;goto out;}
-  cfg=memdup_user((void __user *)arg,sizeof(*cfg));if(IS_ERR(cfg)){r=PTR_ERR(cfg);goto out;}
-  r=obs_validate(cfg);if(r){kfree(cfg);goto out;}
-  for(i=0;i<3;i++){if(obs_mem[i])continue;obs_mem[i]=dma_alloc_coherent(obs_dma_dev,4096,&obs_dma[i],GFP_KERNEL);if(!obs_mem[i]||obs_dma[i]%32||obs_dma[i]+4096>0x20000000ULL){r=-ENOMEM;break;}}
-  if(r){for(i=0;i<3;i++)if(obs_mem[i]){dma_free_coherent(obs_dma_dev,4096,obs_mem[i],obs_dma[i]);obs_mem[i]=NULL;obs_dma[i]=0;}kfree(cfg);goto out;}
-  memcpy(obs_mem[0],cfg->catalog,4096);memcpy(obs_mem[1],cfg->map,4096);memcpy(obs_mem[2],cfg->next,4096);dma_wmb();kfree(obs_cfg);obs_cfg=cfg;obs_state=0;obs_error=0;
+  r=obs_install((void __user *)arg,cmd==0x4608);
  }else if(cmd>=0x4602&&cmd<=0x4604){
   if(cmd==0x4604 && obs_r(OBS_CAP2_ID_REG)==OBS_CAP2_ID){
    u32 state=obs_r(OBS_CAP2_STATUS_REG)&15;
