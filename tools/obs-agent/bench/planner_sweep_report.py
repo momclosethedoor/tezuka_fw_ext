@@ -67,12 +67,26 @@ def analyze(folder, index, call):
                                 next_antenna=p["marker_route"], hold=p["hold_boundary"],
                                 from_start_ms_median=statistics.median(times) if times else None))
     result.update(map_version=actual["map_version"],generation=actual["generation"], positions=n,timing_origin=origin,
+                  pl_timing_only=spectrum.get("pl_timing_only",False),guard_tx=actual.get("guard_tx"),
+                  rf_available_positions=sum(p["rx_available"] for p in positions),
                   useful=len(goal), rx=len({p["rx_lo_hz"] for p in positions}),
                   tx_plls_hz=sorted({p["tx_pll_hz"] for p in positions if p["mixer"]}),
                   overlap=overlap, apertures_hz=[goal[0][0],goal[-1][1]],
                   last_width_hz=goal[-1][1]-goal[-1][0], fresh_ms=call["fresh_host_ns"]/1e6,
                   preparation=spectrum["preparation"],apply=actual["bank_apply"],
                   missing_ordinals=missing, circuits=runs, complete_count=len(complete), ten_circuits_ms=ten)
+    events = folder/"antenna.ndjson"
+    pairs = {}
+    if events.exists():
+        rows=[json.loads(s) for s in events.read_text().splitlines()]
+        rows=[r for r in rows if r["event"]["generation"]==actual["generation"]]
+        for old,new in zip(rows,rows[1:]):
+            a,b=old["event"],new["event"]
+            key=(a["position"],b["position"],a["route"],b["route"],b["epoch"]-a["epoch"])
+            pairs.setdefault(key,[]).append((new["host_ns"]-old["host_ns"])/1e6)
+    result["event_intervals"]=[dict(from_pos=a,to_pos=b,from_target=m,to_target=nxt,visits=count,
+                                    samples=len(times),host_ms_min_med_max=[min(times),statistics.median(times),max(times)])
+                               for (a,b,m,nxt,count),times in pairs.items()]
     geometry = folder/f"applied-map-{index}.json"
     geometry.write_text(json.dumps(positions,indent=2),encoding="utf-8")
     result["applied_map"] = geometry.name
