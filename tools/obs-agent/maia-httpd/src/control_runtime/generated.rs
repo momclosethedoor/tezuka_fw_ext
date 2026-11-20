@@ -64,7 +64,9 @@ pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>
         ensure!(state["pl_timing_only"] == true, "grid experiment requires muted timing fixture");
         let overlap = overlap.as_u64().ok_or_else(|| anyhow!("invalid overlap"))?;
         ensure!(matches!(overlap, 8_000_000 | 9_000_000), "unsupported bench overlap");
-        let schedule = grid_bench::schedule(core, overlap)?;
+        let half = state["scan"]["bench_half_pass_hz"].as_u64().unwrap_or(mixer_math::HALF_PASS as u64);
+        ensure!(matches!(half,23_800_000 | 27_700_000), "unsupported bench aperture");
+        let schedule = grid_bench::schedule(core, overlap, half)?;
         return transitions(state, &schedule);
     }
     transitions(state, core)

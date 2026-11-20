@@ -2,8 +2,8 @@
 //! route, mixing side and calibrated TX for every contiguous compatible span.
 use super::*;
 
-pub(super) fn schedule(core: &[Tile], overlap: u64) -> Result<Vec<Tile>> {
-    let step = 2 * mixer_math::HALF_PASS as u64 - overlap;
+pub(super) fn schedule(core: &[Tile], overlap: u64, half_pass: u64) -> Result<Vec<Tile>> {
+    let step = 2 * half_pass - overlap;
     let mut first = Vec::new();
     let mut second = Vec::new();
     let mut remaining = core;
