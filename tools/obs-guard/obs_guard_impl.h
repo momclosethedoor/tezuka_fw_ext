@@ -36,6 +36,16 @@ static u32 obs_readback_status,obs_readback_pos,obs_readback_version;
 static u8 obs_readback[128],obs_tx_readback[128];
 static u32 obs_tx_pd,obs_tx_atten;
 struct obs_setup {u32 magic,catalog_count,map_count,next_count,version,next_version,gpio_base,reserved;u64 restore_lo;u8 catalog[4096],map[4096],next[4096];u32 tx_enable,tx_rf_on,tx_atten_mdb,tx_start_slot;u64 restore_tx_lo;u8 tx_profiles[128];u32 dwell,extra_reserved;};
+/* setup.extra_reserved: bit0 requests per-visit gate, bits31:16 are the
+ * post-transition settling interval in 62.5 MHz clocks. Old drivers reject
+ * this field, including maps where every visit requests TX off. */
+#define OBS_GATE_ID_REG 0x328
+#define OBS_GATE_ID 0x31475458
+#define OBS_GATE_SEEDS 0x32c
+#define OBS_GATE_WAIT 0x330
+#define OBS_GATE_STATUS 0x334
+#define OBS_GATE_DURATION 0x338
+#define OBS_GATE_OPT BIT(0)
 static struct obs_setup *obs_cfg;
 bool obs_gate_enter(void){
  if(current==READ_ONCE(obs_worker))return true;
@@ -56,9 +66,11 @@ static u32 obs_r(unsigned o){return readl(obs_csr+o);}
 static void obs_w(unsigned o,u32 v){writel(v,obs_csr+o);}
 static void obs_pins(unsigned slot){int i;for(i=0;i<3;i++)gpiod_set_value_cansleep(obs_gpio[i],(slot>>i)&1);}
 static int obs_tx_off(void){
+ int pd;
  int r=ad9361_synth_lo_powerdown(obs_phy,LO_DONTCARE,LO_OFF);
  r|=ad9361_set_tx_atten(obs_phy,89750,true,true,true);
- if(r||!(ad9361_spi_read(obs_phy->spi,REG_TX_SYNTH_POWER_DOWN_OVERRIDE)&TX_LO_POWER_DOWN)||ad9361_get_tx_atten(obs_phy,1)!=89750)return -EIO;
+ pd=ad9361_spi_read(obs_phy->spi,REG_TX_SYNTH_POWER_DOWN_OVERRIDE);
+ if(r||pd<0||!(pd&TX_LO_POWER_DOWN)||ad9361_get_tx_atten(obs_phy,1)!=89750)return -EIO;
  return 0;
 }
 static int obs_canonical(void){int i,r;u8 check[16];
@@ -101,12 +113,18 @@ static int obs_take(void){int i,r;u32 v;struct gpio_chip *chip;
   obs_w(0x208,get_unaligned_le32(orig));obs_w(0x20c,get_unaligned_le32(orig+4));
   obs_w(0x210,get_unaligned_le32(written));obs_w(0x214,get_unaligned_le32(written+4));
   /* RF power and digital executor are deliberately independent. */
-  if(obs_cfg->tx_rf_on){r=ad9361_set_tx_atten(obs_phy,obs_cfg->tx_atten_mdb,true,true,true);if(r)return r;
+  if(obs_cfg->tx_rf_on && !(obs_cfg->extra_reserved & OBS_GATE_OPT)){r=ad9361_set_tx_atten(obs_phy,obs_cfg->tx_atten_mdb,true,true,true);if(r)return r;
    r=ad9361_synth_lo_powerdown(obs_phy,LO_DONTCARE,LO_ON);if(r)return r;}
  }
  obs_tx_pd=!!(ad9361_spi_read(obs_phy->spi,REG_TX_SYNTH_POWER_DOWN_OVERRIDE)&TX_LO_POWER_DOWN);
  obs_tx_atten=ad9361_get_tx_atten(obs_phy,1);
- if(obs_tx_pd!=!obs_cfg->tx_rf_on||obs_tx_atten!=(obs_cfg->tx_rf_on?obs_cfg->tx_atten_mdb:89750))return -EIO;
+ if(obs_cfg->extra_reserved & OBS_GATE_OPT){
+  int pd=ad9361_spi_read(obs_phy->spi,REG_TX_SYNTH_POWER_DOWN_OVERRIDE);
+  int tpc=ad9361_spi_read(obs_phy->spi,REG_TX2_DIG_ATTEN);
+  if(pd<0 || tpc<0 || !(pd&TX_LO_POWER_DOWN) || obs_tx_atten!=89750)return -EIO;
+  obs_w(OBS_GATE_SEEDS,pd|(tpc<<8)|((obs_cfg->tx_atten_mdb/250)<<16));
+  obs_w(OBS_GATE_WAIT,obs_cfg->extra_reserved>>16);
+ }else if(obs_tx_pd!=!obs_cfg->tx_rf_on||obs_tx_atten!=(obs_cfg->tx_rf_on?obs_cfg->tx_atten_mdb:89750))return -EIO;
  r=spi_bus_lock(obs_phy->spi->controller);if(r)return r;WRITE_ONCE(obs_bus_locked,true);
  /* This synchronous locked transaction is behind any already-queued PS work. */
  if(ad9361_spi_read(obs_phy->spi,REG_PRODUCT_ID)<0)return -EIO;
@@ -114,10 +132,16 @@ static int obs_take(void){int i,r;u32 v;struct gpio_chip *chip;
  obs_w(0x1f0,obs_dma[0]);obs_w(0x1f4,obs_cfg->catalog_count);obs_w(0x204,obs_phy->state->fastlock.entry[0][0].alc_written|(obs_cfg->tx_start_slot<<8));
  obs_w(0x21c,obs_cfg->dwell);obs_w(0x1e0,2);
  r=readl_poll_timeout(obs_csr+0x228,v,v&2,10,1000000);if(r)return r;
- obs_w(0x1e0,3|(obs_cfg->tx_enable?4:0));obs_state=2;return 0;
+ if(obs_cfg->extra_reserved & OBS_GATE_OPT){
+  obs_w(0x1e0,31);
+  obs_w(0x220,4);
+ }else obs_w(0x1e0,3|(obs_cfg->tx_enable?4:0));
+ obs_state=2;return 0;
 }
 static int obs_return(void){int i,r;u32 v;unsigned long hz;
  if(!obs_held||!obs_bus_locked)return -EINVAL;
+ if(obs_cfg->extra_reserved & OBS_GATE_OPT)
+  obs_w(0x1e0,15); /* Revoke before attempting STOP/drain or taking PS SPI. */
  obs_w(0x54,4);r=readl_poll_timeout(obs_csr+0x64,v,(v&19)==16,10,2000000);if(r)return r;
  v=obs_r(0x228);obs_readback_status=v;obs_readback_pos=obs_r(0x234);obs_readback_version=obs_r(0x22c);
  obs_pins((v>>16)&7);obs_w(0x1e0,0);
@@ -173,14 +197,18 @@ static int obs_thread(void *arg){int cmd,r;
 static int obs_validate(struct obs_setup *c,u8 *tables,size_t stride){u32 i,j;
  bool cap2 = obs_r(OBS_CAP2_ID_REG) == OBS_CAP2_ID;
  if(c->catalog_count<8||c->catalog_count>stride/32||!c->map_count||c->map_count>stride/32||!c->next_count||c->next_count>stride/32||!c->version||c->next_version==c->version||!c->next_version||c->reserved||c->restore_lo<70000000ULL||c->restore_lo>6000000000ULL||c->gpio_base!=512)return -EINVAL;
- if(c->tx_enable>1||c->tx_rf_on>1||c->tx_rf_on>c->tx_enable||c->tx_start_slot>7||c->tx_atten_mdb>89750||c->extra_reserved)return -EINVAL;
+ if(c->tx_enable>1||c->tx_rf_on>1||c->tx_rf_on>c->tx_enable||c->tx_start_slot>7||c->tx_atten_mdb>89750||(c->extra_reserved && !(c->extra_reserved & OBS_GATE_OPT)))return -EINVAL;
+ if(c->extra_reserved & OBS_GATE_OPT){
+  if(obs_r(OBS_GATE_ID_REG)!=OBS_GATE_ID)return -EOPNOTSUPP;
+  if((c->extra_reserved & 0xfffe) || !c->tx_rf_on || c->tx_atten_mdb%250)return -EINVAL;
+ }
  if(c->tx_enable&&(c->restore_tx_lo<70000000ULL||c->restore_tx_lo>6000000000ULL))return -EINVAL;
  for(i=0;i<c->catalog_count;i++)for(j=24;j<32;j++)if(tables[i*32+j])return -EINVAL;
  for(j=0;j<2;j++){u8 *p=tables+(1+j)*stride;u32 n=j?c->next_count:c->map_count;
   for(i=0;i<n;i++){u32 idx=get_unaligned_le32(p+i*32),flags=get_unaligned_le32(p+i*32+4);
    u32 job = get_unaligned_le32(p+i*32+12);
    bool assigned = flags & BIT(3);
-   if(idx>=c->catalog_count||(flags&~0x00ff070f)||assigned!=!!job)return -EINVAL;
+   if(idx>=c->catalog_count||(flags & ~(0x00ff070fU | ((c->extra_reserved & OBS_GATE_OPT)?BIT(4):0)))||assigned!=!!job)return -EINVAL;
    if(assigned&&!cap2)return -EOPNOTSUPP;
    /* Segment slots require a prepared TX bank; RF may still be off. */
    if((flags&0x704)&&!c->tx_enable)return -EINVAL;
@@ -230,11 +258,29 @@ free_tables:
 free_cfg:
  kfree(cfg);return r;
 }
+/* A bound tuple belongs to one physical RX entry. A transition can start
+ * between MMIO reads; drop the binding on either edge of that interval. */
+static void obs_gate_snapshot(u32 *words)
+{
+ u32 before = obs_r(OBS_GATE_STATUS);
+ u32 epoch = obs_r(0x180);
+ words[119]=obs_r(OBS_GATE_DURATION);
+ words[120]=obs_r(0x22c); /* map version */
+ words[121]=obs_r(0x234); /* visit position */
+ words[122]=obs_r(0x230); /* pass */
+ words[123]=epoch;
+ words[124]=obs_r(0x184);
+ words[118]=obs_r(OBS_GATE_STATUS);
+ if(before!=words[118] || epoch!=obs_r(0x180) || (before & BIT(7)))
+  words[118]&=~BIT(6);
+}
 static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u32 words[128]={};
  if(!capable(CAP_SYS_RAWIO))return -EPERM;
  if(cmd==0x4605){
   words[0]=2;words[1]=READ_ONCE(obs_state);words[2]=READ_ONCE(obs_error);words[3]=atomic_read(&obs_denied);
   for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=obs_alloc_bytes?:4096;words[115]=65535;words[116]=1;
+  words[117]=obs_r(OBS_GATE_ID_REG);
+  if(words[117]==OBS_GATE_ID)obs_gate_snapshot(words);
   words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);words[114]=1;
   for(i=0;i<18;i++)words[16+i]=obs_r(0x224+4*i);
   words[40]=obs_readback_status;words[41]=obs_readback_pos;words[42]=obs_readback_version;memcpy(words+48,obs_readback,128);memcpy(words+80,obs_tx_readback,128);words[112]=obs_tx_pd;words[113]=obs_tx_atten;
@@ -244,6 +290,10 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
  if(cmd==0x4606){
   if(obs_rf_closed || obs_rf_owner!=f || obs_state!=2){r=-ESTALE;goto out;}
   if(time_after_eq(jiffies,obs_rf_deadline)){r=-ETIMEDOUT;goto out;}
+  if(obs_cfg->extra_reserved & OBS_GATE_OPT){
+   if(obs_r(OBS_GATE_STATUS)&BIT(8)){r=-ESTALE;goto out;}
+   obs_w(0x220,4);
+  }
   WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));goto out;
  }
  if(cmd==0x4607){
@@ -258,7 +308,13 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
  }else if(cmd>=0x4602&&cmd<=0x4604){
   if(cmd==0x4604 && obs_r(OBS_CAP2_ID_REG)==OBS_CAP2_ID){
    u32 state=obs_r(OBS_CAP2_STATUS_REG)&15;
-   if(state && state!=5 && state!=6){r=-EBUSY;goto out;}
+   if(state && state!=5 && state!=6){
+    if(obs_held && obs_cfg && (obs_cfg->extra_reserved & OBS_GATE_OPT)){
+     obs_w(0x1e0,15);
+     obs_w(0x54,4);
+    }
+    r=-EBUSY;goto out;
+   }
   }
   reinit_completion(&obs_done);WRITE_ONCE(obs_command,cmd-0x4600);wake_up(&obs_wait);
   if(!wait_for_completion_timeout(&obs_done,msecs_to_jiffies(10000)))r=-ETIMEDOUT;else r=obs_error;
@@ -270,6 +326,7 @@ out:mutex_unlock(&obs_command_lock);return r;
 static int obs_file_release(struct inode *inode,struct file *f){
  mutex_lock(&obs_command_lock);
  if(obs_rf_owner==f){
+  if(obs_held && obs_cfg && (obs_cfg->extra_reserved & OBS_GATE_OPT))obs_w(0x1e0,15);
   obs_rf_closed=true;WRITE_ONCE(obs_rf_deadline,jiffies);
   if(!obs_held)WRITE_ONCE(obs_rf_owner,NULL);
  }
