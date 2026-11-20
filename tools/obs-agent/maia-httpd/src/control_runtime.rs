@@ -736,6 +736,11 @@ fn guard_cmd(fd: &File, cmd: libc::c_ulong) -> Result<[u32; 128]> {
     guard(fd, cmd, std::ptr::null_mut())
 }
 
+fn guard_raw(fd: &File) -> Option<[u32;128]> {
+    let mut status = [0u32;128];
+    (unsafe {libc::ioctl(fd.as_raw_fd(),0x4605,status.as_mut_ptr())}==0).then_some(status)
+}
+
 const XTG1: u32 = 0x31475458;
 
 fn gate_receipt(words: &[u32; 128], spectrum: &Value) -> Value {
@@ -1592,7 +1597,17 @@ fn worker(
                         if !carrier.guarded_lease_live() || !carrier.buffer_live() {
                             return Err("guarded TX lease or buffer lost".into());
                         }
-                        let s = guard_cmd(&guard_fd, 0x4606).map_err(|e| e.to_string())?;
+                        let s = guard_cmd(&guard_fd, 0x4606).map_err(|e| {
+                            if managed_tx && let Some(raw) = guard_raw(&guard_fd) {
+                                let mut a = actual.borrow_mut();
+                                a["guard_tx"]["failure"] = gate_receipt(&raw,&a["spectrum"]);
+                                a["guard_tx"]["failure"]["driver_state"] = json!(raw[1]);
+                                a["guard_tx"]["failure"]["fld_error"] = json!(raw[25]);
+                                a["tx"]["on"] = Value::Null;
+                                a["tx"]["visit"] = Value::Null;
+                            }
+                            e.to_string()
+                        })?;
                         if managed_tx && applied.get() {
                             let mut a = actual.borrow_mut();
                             let gate = gate_receipt(&s, &a["spectrum"]);

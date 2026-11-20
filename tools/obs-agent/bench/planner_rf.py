@@ -16,6 +16,7 @@ def main():
     p.add_argument("--rf-hz",type=int,default=6750000000)
     p.add_argument("--pll-hz",type=int,nargs="+",default=[2250000000,2370000000,2490000000])
     p.add_argument("--source-58",action="store_true",help="locate the enabled 5.8 GHz reference with TX muted")
+    p.add_argument("--edge-27",action="store_true",help="compare offsets around the nominal 27 MHz edge at 56 MHz bandwidth")
     p.add_argument("--direct-tx-on",action="store_true",
                    help="measure a physically confirmed direct RX with the mixer LO driven")
     args = p.parse_args()
@@ -80,9 +81,37 @@ def main():
 
     save("before.json", start)
     try:
-        patch("ad9361", {"sampling_frequency": 61440000, "rx_rf_bandwidth": 48000000,
+        patch("ad9361", {"sampling_frequency": 61440000, "rx_rf_bandwidth": 56000000 if args.edge_27 else 48000000,
                          "rx_gain_mode": "Manual", "rx_gain": 35})
         patch("spectrometer", {"input": "AD9361", "mode": "Average", "number_integrations": 128})
+        if args.edge_27:
+            pll, = args.pll_hz
+            tone = pll + 960000
+            target = args.rf_hz if args.route == "direct" else abs(args.rf_hz - 2*tone)
+            offsets = (1_000_000,-26_500_000,-27_000_000,-27_500_000,
+                       26_500_000,27_000_000,27_500_000,1_000_000)
+            fixture = ToneFixture(board) if args.route=="mixer" else None
+            try:
+                tx = {"powerdown":1}
+                if fixture:
+                    fixture.enter()
+                    tx = fixture.transmit(tone,3)
+                for offset in offsets:
+                    capture(pll,target-offset,fixture,tx)
+                result=[]
+                for offset,row in zip(offsets,records,strict=True):
+                    mean=np.median(np.fromfile(args.output/row["file"],"<f4").reshape(-1,4096)[2:],axis=0)
+                    nominal=2048+round(offset/15000)
+                    window=range(nominal-8,nominal+9)
+                    peak=max(window,key=lambda i:mean[i])
+                    background=np.median(np.r_[mean[nominal-28:nominal-13],mean[nominal+13:nominal+28]])
+                    result.append(dict(offset_hz=offset,bin=peak,power_db=float(10*np.log10(mean[peak])),
+                        background_db=float(10*np.log10(background)),file=row["file"]))
+                save("edges.json",result)
+            finally:
+                if fixture:
+                    save("tx-off.json",fixture.close())
+            return
         if args.source_58:
             assert args.route=="direct"
             for rx in range(5640000000,5980000001,20000000):

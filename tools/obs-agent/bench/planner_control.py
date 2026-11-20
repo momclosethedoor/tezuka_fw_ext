@@ -181,7 +181,17 @@ def control(log, profiles, boot):
     a.write_json(log/"cli-config.json", cfg)
     a.upload(log/"cli-config.json", remote, "cli-config.json")
     owner_seconds = 215 if scan.get("catalog_on_boot") else 135
-    a.ssh(f"cd {remote} && (timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
+    phase_timing = int(os.environ.get("PLANNER_BENCH_PHASE_TIMING") == "1")
+    if os.environ.get("PLANNER_BENCH_RECORD_GATE"):
+        a.ssh(f"""cd {remote}
+(timeout 25 sh -c 'last=
+while :; do
+  v=$(./obs-fl-ctl gate-status) || break
+  if [ "$v" != "$last" ]; then printf "%s %s\\n" "$(cut -d" " -f1 /proc/uptime)" "$v"; last=$v; fi
+  usleep 2500
+done' </dev/null >gate-probe.ndjson 2>&1 &)
+""")
+    a.ssh(f"cd {remote} && (OBS_PHASE_TIMING={phase_timing} timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
     calls = []
     stop,ready,silence=threading.Event(),threading.Event(),threading.Event()
     thread=None
@@ -301,6 +311,16 @@ def control(log, profiles, boot):
                     calls[-1].update(stale_datagrams_discarded=discarded,fresh_host_ns=time.monotonic_ns()-start)
                     if status["actual"]["mode"]=="scan" and not os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
                         calls[-1]["laps"]=record_laps(receiver,data,status,log,len(calls))
+                    if os.environ.get("PLANNER_BENCH_RECORD_GATE") and status["actual"]["guard_tx"].get("per_visit"):
+                        receipts = []
+                        for _ in range(36):
+                            t0=time.monotonic_ns()
+                            readback=a.request(url,"GET",path,timeout=1)
+                            tx=readback["actual"]["tx"]
+                            receipts.append(dict(tx=tx,rtt_ns=time.monotonic_ns()-t0,
+                                generation=readback["actual"]["generation"],error=readback["error"]))
+                            time.sleep(.021)
+                        a.write_json(log/f"gate-{len(calls)}.json",receipts)
                     a.write_json(log/"commands.json",calls)
                     if os.environ.get("PLANNER_BENCH_EDGE") == "1" and len(calls)==1:
                         actual = status["actual"]
@@ -374,6 +394,8 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                 verify_recovery(a, url, path, scan, log)
     finally:
         try:
+            if os.environ.get("PLANNER_BENCH_RECORD_GATE"):
+                (log/"gate-probe.ndjson").write_text(a.ssh(f"cd {remote} && cat gate-probe.ndjson"))
             if mixer:
                 (log/"lease-board.txt").write_text(a.ssh("ls -l /run/goofy; cat /run/goofy/goofy_lease.pid; pidof goofy_lease.sh; logread | tail -60"))
             (log/"owner.log").write_text(a.ssh(f"cd {remote}; kill -TERM $(cat owner.pid) 2>/dev/null || :; sleep 1; cat owner.log"))

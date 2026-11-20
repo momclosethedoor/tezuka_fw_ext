@@ -462,6 +462,13 @@ pub(super) fn encode(
         row["tx_gate_requested"] = if managed {json!(slot.is_some())} else {Value::Null};
         if working_grid {
             row["rf_ranges"] = json!(useful);
+            row["useful_if_ranges_hz"] = json!(useful.iter().map(|&[l,h]| {
+                let mut edges = [side*(l as i64-offset),side*(h as i64-offset)];
+                edges.sort_unstable();
+                edges
+            }).collect::<Vec<_>>());
+            row["image_rf_ranges_hz"] = json!(tone.map(|_| useful.iter()
+                .map(|&[l,h]| [2*offset-h as i64,2*offset-l as i64]).collect::<Vec<_>>()));
             row["rf_row"] = json!(v.rf_row);
             row["sweep_phase"] = json!(v.grid.map(|(p,_)| if p == "main" {"A"} else {"B"}));
         }
