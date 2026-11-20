@@ -73,6 +73,8 @@ fn calibrate(
 
 impl Cache {
     pub fn catalog(state: &Value, shared: &Shared) -> Result<(Self, Value)> {
+        let start = Instant::now();
+        let cpu_start = cpu_ns()?;
         let bands = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
         let mut intervals: Vec<_> = bands.values().flatten()
             .map(|r| [r[0].max(70_000_000), r[1]]).filter(|r| r[0]<r[1]).collect();
@@ -85,13 +87,12 @@ impl Cache {
         }
         ensure!(!union.is_empty(), "antenna catalog outside receiver limits");
         let mut full = state.clone();
-        full["pl_timing_only"] = json!(true); // Only encode locally. No guard load or take.
         full["alternative"] = Value::Null;
         full["scan"]["ranges"] = json!(union.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
         let core = generated::core_tiles(&full)?;
         let tiles = generated::transitions(&full,&core)?;
         let mut cache = Self::default();
-        let (_, desc) = cache.prepare_tiles(&full,shared,tiles,Instant::now(),cpu_ns()?)?;
+        let (_, desc) = cache.prepare_tiles(&full,shared,tiles,start,cpu_start,true)?;
         cache.core = core;
         cache.bands = full["scan"]["antenna_bands"].clone();
         cache.mixer = full["scan"]["mixer"].clone();
@@ -108,6 +109,8 @@ impl Cache {
         let cpu_start = cpu_ns()?;
         let scan = &pending["scan"];
         let ranges = scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?;
+        ensure!(ranges.iter().filter(|r| r["enabled"]==true).all(|r| r["tx_slot"].is_null()),
+                "v2 selects TX from RF");
         let select = !self.core.is_empty() && pending["alternative"].is_null()
             && self.bands == scan["antenna_bands"] && self.mixer == scan["mixer"]
             && ranges.iter().all(|r| r["path"].is_null() || r["path"]=="auto");
@@ -131,13 +134,13 @@ impl Cache {
             }
             generated::transitions(pending,&subset)?
         } else { generated::tiles(pending)? };
-        self.prepare_tiles(pending,shared,tiles,start,cpu_start)
+        self.prepare_tiles(pending,shared,tiles,start,cpu_start,false)
     }
 
     fn prepare_tiles(&mut self, pending: &Value, shared: &Shared, tiles: Vec<generated::Tile>,
-                     start: Instant, cpu_start: u64) -> Result<(Vec<u8>, Value)> {
+                     start: Instant, cpu_start: u64, catalog_only: bool) -> Result<(Vec<u8>, Value)> {
         let stop = &shared.switch;
-        if pending["pl_timing_only"] != true && tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
+        if !catalog_only && pending["pl_timing_only"] != true && tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
             let requested = pending["scan"]["ranges"]
                 .as_array()
                 .into_iter()
@@ -155,7 +158,7 @@ impl Cache {
             .filter_map(|v| v.tx.map(|t| t.pll as u64))
             .collect::<BTreeSet<_>>();
         ensure!(
-            tiles.len() <= 65535 && rx_keys.len() <= 65535 && tx_keys.len() <= 8,
+            tiles.len() <= 65535 && rx_keys.len() <= 65535 && (catalog_only || tx_keys.len() <= 8),
             "row99 needs {} visits, {} RX and {} TX; capacities 65535/65535/8",
             tiles.len(),
             rx_keys.len(),
@@ -204,7 +207,12 @@ impl Cache {
         )?;
         let prepare_us = now.elapsed().as_micros() as u64;
         let compile = Instant::now();
-        let (bytes, mut desc) = generated::encode(&tiles, &rx, &tx, restore, pending)?;
+        let (bytes, mut desc) = if catalog_only {
+            (Vec::new(),json!({}))
+        } else {
+            generated::encode(&tiles, &rx, &tx, restore, pending)?
+        };
+        let rx_count = if catalog_only {rx.len() as u32} else {word(&bytes,4)};
         self.rx.retain(|key,_|self.keep_rx.contains(key));
         self.tx.retain(|key,_|self.keep_tx.contains(key));
         self.rx.extend(rx);
@@ -213,7 +221,7 @@ impl Cache {
             "prepare_us":prepare_us,"worker_cpu_ns":cpu_ns()?.saturating_sub(cpu_start),
             "rss_kib":fs::read_to_string("/proc/self/status")?.lines().find_map(|l|
                 l.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse::<u64>().ok()),
-            "rx_calibrated":rx_cold,"tx_calibrated":tx_cold,"rx_catalog_count":word(&bytes,4)});
+            "rx_calibrated":rx_cold,"tx_calibrated":tx_cold,"rx_catalog_count":rx_count});
         Ok((bytes, desc))
     }
 }
