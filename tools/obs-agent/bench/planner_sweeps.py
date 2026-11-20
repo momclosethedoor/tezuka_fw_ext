@@ -2,7 +2,7 @@
 from collections import defaultdict
 import json
 import struct
-from time import monotonic_ns
+from time import perf_counter_ns
 
 
 class Sweeps:
@@ -17,7 +17,7 @@ class Sweeps:
         self.notes_out_of_order = 0
 
     def accept(self, data):
-        host = monotonic_ns()
+        host = perf_counter_ns()
         if data[:8] == b"GSWEEP1\0":
             assert len(data) == 112
             generation, version, anchor, sweep, phase, lo, hi, first, last, tick, expected, observed, flags = (

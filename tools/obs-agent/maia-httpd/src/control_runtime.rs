@@ -1414,7 +1414,7 @@ fn worker(
                 if actual.borrow()["scan"]["planner_version"] == 2 {
                     let required = c.scan["xtg1_wait_ticks"].is_number()
                         || c.scan["path_ack_version"] == 1 || actual.borrow()["scan"]["path_ack_version"] == 1;
-                    let first_mixer = if managed_tx {
+                    let first_mixer = if c.scan["xtg1_wait_ticks"].is_number() {
                         actual.borrow()["spectrum"]["positions"][0]["mixer"] == true
                     } else { guard_rf };
                     let path = if first_mixer {"mixer"} else {"direct"};
@@ -1560,8 +1560,8 @@ fn worker(
                 let a = actual.borrow();
                 let marker = &a["spectrum"]["positions"][marker_position as usize];
                 let source = match marker["marker_path"].as_str() {
-                    Some("mixer") if managed_tx => "visit_mixer",
-                    Some("direct") if managed_tx => "visit_direct",
+                    Some("mixer") => "visit_mixer",
+                    Some("direct") => "visit_direct",
                     _ if a["scan"]["planner_version"] == 2 => "PLv2",
                     _ => "PL",
                 };
@@ -1602,7 +1602,7 @@ fn worker(
                                 let mut a = actual.borrow_mut();
                                 a["guard_tx"]["failure"] = gate_receipt(&raw,&a["spectrum"]);
                                 a["guard_tx"]["failure"]["driver_state"] = json!(raw[1]);
-                                a["guard_tx"]["failure"]["fld_error"] = json!(raw[25]);
+                                a["guard_tx"]["failure"]["fld_errors"] = json!(raw[30]);
                                 a["tx"]["on"] = Value::Null;
                                 a["tx"]["visit"] = Value::Null;
                             }

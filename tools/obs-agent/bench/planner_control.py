@@ -28,7 +28,12 @@ def record_laps(receiver,data,status,folder,index):
     sweep = None
     if status["actual"]["spectrum"].get("sweep_wire_version") == 1:
         sweep = Sweeps(status["actual"],folder/f"sweeps-{index}.json")
-    deadline=time.monotonic()+(15 if wide else 8 if load_test else 3.5)
+    began=time.monotonic()
+    deadline=began+(15 if wide else 8 if load_test else 3.5)
+    minimum=float(os.environ.get("PLANNER_BENCH_MIN_SECONDS","0"))
+    assert 0 <= minimum <= 10
+    limit = int(os.environ.get("PLANNER_BENCH_LAPS", "12"))
+    assert 12 <= limit <= 64
     with (folder/f"lap-{index}.dat").open("wb") as f:
         while time.monotonic()<deadline:
             if sweep:
@@ -36,10 +41,51 @@ def record_laps(receiver,data,status,folder,index):
             if data[:8]==b"GVIEW4\0\0":
                 f.write(struct.pack("<I",len(data))+data)
                 laps.accept(data)
-                if wide and len(laps.ticks)>=13:break
+                if wide and len(laps.ticks)>=limit+1 and time.monotonic()-began>=minimum:break
                 if not wide and not load_test and len(laps.ticks)>=5 and len(laps.seen)==laps.n:break
             data,_=receiver.recvfrom(65535)
-    return dict(laps.result(),**(sweep.result() if sweep else {}))
+    return dict(laps.result(),last_ordinal=laps.last,**(sweep.result() if sweep else {}))
+
+
+def receive_after_pause(receiver,status,folder,last):
+    receiver.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,32<<10)
+    pause_ns=int(os.environ["PLANNER_BENCH_RX_PAUSE_MS"])*1_000_000
+    start=time.perf_counter_ns()
+    time.sleep(pause_ns/1e9)
+    resume=time.perf_counter_ns()
+    laps=Laps(status["actual"])
+    laps.last=last
+    sweep=Sweeps(status["actual"],folder/"pause-passes.json")
+    until=time.perf_counter_ns()+1_200_000_000
+    while time.perf_counter_ns()<until:
+        data,_=receiver.recvfrom(65535)
+        sweep.accept(data)
+        if data[:8]==b"GVIEW4\0\0":
+            laps.accept(data)
+    receiver.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4<<20)
+    return dict(laps.result(),**sweep.result(),paused_ms=(resume-start)/1e6)
+
+
+def start_sig0_replay(api, remote, index):
+    # Fixed cadence in the device's own monotonic clock. If a job overruns,
+    # skip deadlines so the load never becomes a catch-up burst.
+    api.ssh(f"""cd {remote}
+(timeout 9 sh -c '
+ms() {{ awk "{{print int(\$1*1000)}}" /proc/uptime; }}
+next=$(ms)
+for i in 0 1 2 3 4 5 6 7
+do
+  start=$(ms)
+  if [ "$start" -lt "$next" ]; then usleep $(((next-start)*1000)); fi
+  start=$(ms)
+  ./sig0-arm replay-window.bin replay-result-{index} replay-stages-{index} >/dev/null 2>&1
+  rc=$?
+  end=$(ms)
+  echo "$i $start $end $rc"
+  next=$((next+250))
+  while [ "$next" -lt "$end" ]; do next=$((next+250)); done
+done' </dev/null >sig0-replay-{index}.txt 2>&1 &)
+""")
 
 
 def lease_loop(stop, ready,log, silence):
@@ -180,6 +226,8 @@ def control(log, profiles, boot):
         cfg.update(setup=remote+"/control-map.bin", positions=bench.FREQUENCIES)
     a.write_json(log/"cli-config.json", cfg)
     a.upload(log/"cli-config.json", remote, "cli-config.json")
+    if replay_window := os.environ.get("PLANNER_BENCH_SIG0_REPLAY"):
+        a.upload(Path(replay_window),remote,"replay-window.bin")
     owner_seconds = 215 if scan.get("catalog_on_boot") else 135
     phase_timing = int(os.environ.get("PLANNER_BENCH_PHASE_TIMING") == "1")
     if os.environ.get("PLANNER_BENCH_RECORD_GATE"):
@@ -309,8 +357,12 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                         raise RuntimeError("no UDP observation of applied generation")
                     (log/f"view-{len(calls)}.bin").write_bytes(data)
                     calls[-1].update(stale_datagrams_discarded=discarded,fresh_host_ns=time.monotonic_ns()-start)
+                    if replay_window and cmd.get("test_sig0_replay"):
+                        start_sig0_replay(a,remote,len(calls))
                     if status["actual"]["mode"]=="scan" and not os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
                         calls[-1]["laps"]=record_laps(receiver,data,status,log,len(calls))
+                    if len(calls)==1 and os.environ.get("PLANNER_BENCH_RX_PAUSE_MS"):
+                        calls[-1]["pause"]=receive_after_pause(receiver,status,log,calls[-1]["laps"]["last_ordinal"])
                     if os.environ.get("PLANNER_BENCH_RECORD_GATE") and status["actual"]["guard_tx"].get("per_visit"):
                         receipts = []
                         for _ in range(36):
@@ -361,8 +413,11 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                         deadline = time.monotonic() + 8
                         while actual["generation"] not in sinks.fields and time.monotonic()<deadline:
                             time.sleep(.02)
-                        meta = sinks.fields[actual["generation"]]
-                        assert meta["map_version"] == watch["version"]
+                        meta = sinks.fields.get(actual["generation"])
+                        if meta is None and os.environ.get("PLANNER_BENCH_FIELD_OPTIONAL"):
+                            a.write_json(log/"field-observation.json",dict(watch=watch,end_received=False))
+                        else:
+                            assert meta and meta["map_version"] == watch["version"], (watch,meta)
                     if os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
                         time.sleep(.3)
                         if len(calls)==2:
@@ -394,6 +449,10 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                 verify_recovery(a, url, path, scan, log)
     finally:
         try:
+            if replay_window:
+                for i,c in enumerate(calls,1):
+                    if c["command"].get("test_sig0_replay"):
+                        (log/f"sig0-replay-{i}.txt").write_text(a.ssh(f"cd {remote} && cat sig0-replay-{i}.txt"))
             if os.environ.get("PLANNER_BENCH_RECORD_GATE"):
                 (log/"gate-probe.ndjson").write_text(a.ssh(f"cd {remote} && cat gate-probe.ndjson"))
             if mixer:

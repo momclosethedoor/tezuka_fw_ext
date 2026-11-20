@@ -89,6 +89,15 @@ class Sinks:
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
         if os.environ.get("PLANNER_BENCH_SWEEP"):
             received=time.monotonic_ns()
+            if kind == 4 and os.environ.get("PLANNER_BENCH_WRONG_PATH_ACK"):
+                wrong=fields.copy()
+                wrong[0]-=1
+                conn.sendall(ack(wrong))
+                expected=event["required_path"]
+                event["required_path"]="direct" if expected=="mixer" else "mixer"
+                conn.sendall(ack(fields))
+                event["required_path"]=expected
+                self.stop.wait(.025)
             conn.sendall(ack(fields))
             with (self.folder/"antenna.ndjson").open("a") as out:
                 print(json.dumps(dict(event=event,host_ns=received,host_ack_ns=time.monotonic_ns(),
