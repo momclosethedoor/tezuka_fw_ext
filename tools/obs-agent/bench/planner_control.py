@@ -374,6 +374,17 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                             time.sleep(.021)
                         a.write_json(log/f"gate-{len(calls)}.json",receipts)
                     a.write_json(log/"commands.json",calls)
+                    if os.environ.get("PLANNER_BENCH_STOP_WHILE_ROUTE") and len(calls)==1:
+                        sinks.missing=True
+                        end=time.monotonic()+1.5
+                        while time.monotonic()<end:
+                            pending=a.request(url,"GET",path,timeout=1)
+                            if (pending.get("route_pending") or {}).get("ack_version")==4:
+                                a.write_json(log/"stop-during-route.json",pending)
+                                break
+                            time.sleep(.01)
+                        else:
+                            raise AssertionError("no active ACK4 boundary before STOP")
                     if os.environ.get("PLANNER_BENCH_EDGE") == "1" and len(calls)==1:
                         actual = status["actual"]
                         pos = actual["spectrum"]["positions"][0]

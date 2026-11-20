@@ -89,6 +89,11 @@ class Sinks:
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
         if os.environ.get("PLANNER_BENCH_SWEEP"):
             received=time.monotonic_ns()
+            if self.missing:
+                with (self.folder/"antenna.ndjson").open("a") as out:
+                    print(json.dumps(dict(event=event,host_ns=received,correct_ack=False,
+                                          physical_switch=False)),file=out)
+                return
             if kind == 4 and os.environ.get("PLANNER_BENCH_WRONG_PATH_ACK"):
                 wrong=fields.copy()
                 wrong[0]-=1
