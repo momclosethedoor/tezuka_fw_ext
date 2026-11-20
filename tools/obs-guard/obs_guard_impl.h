@@ -76,6 +76,7 @@ static int obs_tx_canonical(void){int i,r;u8 b[16];
 }
 static int obs_take(void){int i,r;u32 v;struct gpio_chip *chip;
  if(!obs_cfg||obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16)return -EINVAL;
+ if(obs_cfg->tx_rf_on && !READ_ONCE(obs_rf_owner))return -EPERM;
  WRITE_ONCE(obs_block,true);down_write(&obs_gate);obs_held=true;obs_state=1;
  /* All callback families are quiesced. A callback that queued calibration has
   * returned before down_write; flush drains its physical SPI before bus lock. */
@@ -233,7 +234,7 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
  if(!capable(CAP_SYS_RAWIO))return -EPERM;
  if(cmd==0x4605){
   words[0]=2;words[1]=READ_ONCE(obs_state);words[2]=READ_ONCE(obs_error);words[3]=atomic_read(&obs_denied);
-  for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=obs_alloc_bytes?:4096;words[115]=65535;
+  for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=obs_alloc_bytes?:4096;words[115]=65535;words[116]=1;
   words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);words[114]=1;
   for(i=0;i<18;i++)words[16+i]=obs_r(0x224+4*i);
   words[40]=obs_readback_status;words[41]=obs_readback_pos;words[42]=obs_readback_version;memcpy(words+48,obs_readback,128);memcpy(words+80,obs_tx_readback,128);words[112]=obs_tx_pd;words[113]=obs_tx_atten;
@@ -250,6 +251,7 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
   obs_rf_closed=false;WRITE_ONCE(obs_rf_owner,f);
   WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));cmd=0x4602;
  }else if(obs_rf_owner && obs_rf_owner!=f){r=-EBUSY;goto out;}
+ else if(cmd==0x4602 && obs_cfg && obs_cfg->tx_rf_on){r=-EPERM;goto out;}
  if(cmd==0x4601||cmd==0x4608){
   if(obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16){r=-EBUSY;goto out;}
   r=obs_install((void __user *)arg,cmd==0x4608);
