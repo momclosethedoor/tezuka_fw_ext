@@ -198,6 +198,10 @@ def control(log, profiles, boot):
                 routes=dict(scan,ranges=ranges,antenna_bands={"0":[[2300000000,2450000000]],
                     "1":[[2395000000,2530000000]],"2":[[2515000000,2600000000]]})
                 cmds=[routes,dict(routes,k=1),dict(scan,run=False)]
+            if os.environ.get("PLANNER_BENCH_PATH_RETURN"):
+                direct=dict(scan,ranges=[dict(lo_hz=2400000000,hi_hz=2402000000,enabled=True)],
+                            antenna_bands={"2":[[2390000000,2410000000]]})
+                cmds=[scan,direct,dict(direct,run=False)]
             for cmd in cmds:
                 if cmd["op"]=="alternative":
                     prev=calls[-1]["status"]["actual"]
@@ -225,6 +229,12 @@ def control(log, profiles, boot):
                         break
                     raise AssertionError("VIEW arrived without initial path ACK")
                 assert status["applied_id"] == ident, status.get("error")
+                if os.environ.get("PLANNER_BENCH_PATH_RETURN") and len(calls)==2:
+                    actual=status["actual"]
+                    pos=actual["spectrum"]["positions"][0]
+                    route=actual["spectrum"]["path_confirmation"]
+                    assert route["required_path"]=="direct" and route["antenna"]==2 and route["confirmed_by_client"]
+                    assert pos["antenna"]==2 and not pos["mixer"] and actual["guard_tx"]["powerdown"]==1
                 if os.environ.get("PLANNER_BENCH_LOWER") and cmd["op"] == "scan" and cmd["run"]:
                     for position in status["actual"]["spectrum"]["positions"]:
                         assert position["side_sign"] == -1, position
