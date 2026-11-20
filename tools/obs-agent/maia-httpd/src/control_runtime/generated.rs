@@ -184,9 +184,13 @@ pub(super) fn transitions(state: &Value, tiles: &[Tile]) -> Result<Vec<Tile>> {
                     }
                 }
             }
-            let target = if state["catalog_policy"] == true && old.tx.is_some() != current.tx.is_some() {
+            let target = if state["catalog_policy"] != true {
+                current.rf[0]
+            } else if old.tx.is_some() != current.tx.is_some() {
                 threshold
-            } else { current.rf[0] };
+            } else {
+                bands[&old.antenna].iter().map(|r| r[1]).max().unwrap()
+            };
             let overlap = common
                 .iter()
                 .filter(|r| r[1] - r[0] >= width)
@@ -256,6 +260,31 @@ pub(super) fn transitions(state: &Value, tiles: &[Tile]) -> Result<Vec<Tile>> {
         result.rotate_left(prefix);
     }
     Ok(result)
+}
+
+/// Requests can reorder subbands. Warm each distinct RX/TX tuning needed to
+/// hand off between any two configured antenna routes, including the wrap.
+pub(super) fn catalog_profiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
+    let mut representatives = BTreeMap::new();
+    let mut profiles = BTreeMap::new();
+    for tile in core {
+        let pll = tile.tx.map(|t| t.pll);
+        representatives.entry((tile.antenna, pll)).or_insert(tile);
+        profiles.insert((tile.rx, pll), tile.clone());
+    }
+    let routes: Vec<_> = representatives.into_values().collect();
+    for (i, left) in routes.iter().enumerate() {
+        for right in &routes[i+1..] {
+            if left.antenna == right.antenna { continue; }
+            // transitions() emits both directions for this two-element ring.
+            for t in transitions(state,&[(*left).clone(),(*right).clone()])? {
+                if t.transition_only {
+                    profiles.insert((t.rx,t.tx.map(|tx|tx.pll)),t);
+                }
+            }
+        }
+    }
+    Ok(profiles.into_values().collect())
 }
 
 pub(super) fn encode(

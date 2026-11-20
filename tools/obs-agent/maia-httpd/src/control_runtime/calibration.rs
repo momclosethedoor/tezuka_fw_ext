@@ -90,7 +90,7 @@ impl Cache {
         full["alternative"] = Value::Null;
         full["scan"]["ranges"] = json!(union.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
         let core = generated::core_tiles(&full)?;
-        let tiles = generated::transitions(&full,&core)?;
+        let tiles = generated::catalog_profiles(&full,&core)?;
         let mut cache = Self::default();
         let (_, desc) = cache.prepare_tiles(&full,shared,tiles,start,cpu_start,true)?;
         cache.core = core;
