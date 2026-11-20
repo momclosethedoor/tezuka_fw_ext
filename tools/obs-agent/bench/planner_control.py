@@ -81,10 +81,26 @@ def verify_recovery(api, url, path, scan, log):
     stop = submit(dict(scan, run=False))
     stopped = wait_for(lambda s: s["applied_id"] == stop)
     assert stopped["failed_id"] == pending and not stopped["actual"]["running"]
-    rejected = submit(dict(scan, antenna_bands={"0": [[100000000,200000000]]}))
+    rejected_ranges = [dict(lo_hz=2400000000,hi_hz=2410000000,enabled=True),
+                       dict(lo_hz=2410000000,hi_hz=2415000000,enabled=True)]
+    rejected = submit(dict(scan, ranges=rejected_ranges, antenna_bands={"0": [[2402000000,2408000000]]}))
     failure = wait_for(lambda s: s["failed_id"] == rejected)
     assert "missing antenna coverage" in failure["error"] and not failure["actual"]["running"]
     assert failure["actual"]["failed_plan"]["applied_rf_ranges"] == []
+    assert failure["actual"]["failed_plan"]["antenna_gaps_hz"] == [
+        [2400000000,2402000000],[2408000000,2410000000],[2410000000,2415000000]]
+    assert len(failure["actual"]["failed_plan"]["unapplied_rf_ranges"]) == 2
+    ranges = [[2410000000,2412000000], [2412000000,2413000000],
+              [2411000000,2412500000], [2449000000,2449000001]]
+    ordered = submit(dict(scan, ranges=[dict(lo_hz=a,hi_hz=b,enabled=True) for a,b in ranges]+
+                          [dict(lo_hz=5999000000,hi_hz=6000000000,enabled=False)],
+                          antenna_bands={"0":[[2399000000,2450000000]]}))
+    ordered_state = wait_for(lambda s:s["applied_id"]==ordered)
+    assert [p["rf_ranges"][0] for p in ordered_state["actual"]["spectrum"]["positions"]] == ranges
+    cross = submit(dict(scan, ranges=[dict(lo_hz=5999000000,hi_hz=6001000000,enabled=True)],
+                        antenna_bands={"0":[[5900000000,6100000000]]}))
+    mixed = wait_for(lambda s:s["failed_id"]==cross)
+    assert "cannot gate TX" in mixed["error"] and not mixed["actual"]["running"]
     resumed = submit(dict(scan, antenna_bands={"0": [[2400000000,2450000000]]}))
     live = wait_for(lambda s: s["applied_id"] == resumed and s["actual"]["running"])
     time.sleep(.12)
@@ -102,7 +118,7 @@ def verify_recovery(api, url, path, scan, log):
     end = submit(dict(scan, run=False))
     wait_for(lambda s: s["applied_id"] == end)
     api.write_json(log/"recovery.json", dict(preparing=preparing, stopped=stopped,
-        failure=failure, reconnected=connected, stale_http=409))
+        failure=failure, ordered=ordered_state, mixed=mixed, reconnected=connected, stale_http=409))
 
 
 def control(log, profiles, boot):

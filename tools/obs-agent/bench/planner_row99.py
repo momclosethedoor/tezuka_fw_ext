@@ -19,4 +19,10 @@ def stage_executables(*args, **kwargs):
 
 if __name__ == "__main__":
     bench.accepted.stage = stage_executables
+    if os.environ.get("PLANNER_BENCH_CAP2"):
+        def capture_and_hold(log, profiles, boot):
+            bench.accepted.run_case(log, profiles, boot, "window-18432", "reuse", 18432, 102, save=True)
+            bench.accepted.mode_smoke(log, profiles, boot)
+        bench.accepted.video_smoke = capture_and_hold
+        sys.argv.append("--reference")
     bench.main()
