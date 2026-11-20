@@ -17,13 +17,14 @@ from planner_laps import Laps
 
 def record_laps(receiver,data,status,folder,index):
     laps = Laps(status["actual"])
-    deadline=time.monotonic()+3.5
+    load_test = os.environ.get("PLANNER_BENCH_LOAD") == "1"
+    deadline=time.monotonic()+(8 if load_test else 3.5)
     with (folder/f"lap-{index}.dat").open("wb") as f:
         while time.monotonic()<deadline:
             if data[:8]==b"GVIEW4\0\0":
                 f.write(struct.pack("<I",len(data))+data)
                 laps.accept(data)
-                if len(laps.ticks)>=5 and len(laps.seen)==laps.n:break
+                if not load_test and len(laps.ticks)>=5 and len(laps.seen)==laps.n:break
             data,_=receiver.recvfrom(65535)
     return laps.result()
 
@@ -159,6 +160,8 @@ def control(log, profiles, boot):
             receiver.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4<<20)
             receiver.settimeout(2)
             cmds=[scan,scan,dict(scan,k=1),dict(scan,k=1023),analysis,scan,dict(scan,run=False)]
+            if os.environ.get("PLANNER_BENCH_LOAD") == "1":
+                cmds = [scan, dict(scan, run=False)]
             if os.environ.get("PLANNER_BENCH_ALTERNATIVE")=="1":
                 cmds[1:1]=[dict(op="alternative"),dict(op="cancel_alternative")]
             if os.environ.get("PLANNER_BENCH_VIDEO"):
