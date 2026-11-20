@@ -29,7 +29,7 @@ type R<T>=Result<T,String>;
  #[serde(default)]diagnostic_sync:Option<String>,
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
- #[serde(default)]tx_active:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
+ #[serde(default)]tx_active:bool,#[serde(default)]managed_tx:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
 }
 fn batchdefault()->usize{32}
 fn tracedefault()->usize{400000}
@@ -48,7 +48,8 @@ impl Hardware{
   for p in std::fs::read_dir("/proc").map_err(|e|e.to_string())?{let p=p.map_err(|e|e.to_string())?.path();if p.file_name().and_then(|n|n.to_str()).and_then(|n|n.parse::<u32>().ok()).is_none_or(|pid|pid==std::process::id()){continue;}if std::fs::read_to_string(p.join("comm")).is_ok_and(|s|s.trim()=="maia-httpd"){return Err("legacy Maia owner active".into())}}
   if c.hot{
    let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard").map_err(|e|e.to_string())?;let mut status=[0u32;128];
-   if unsafe{libc::ioctl(guard.as_raw_fd(),0x4605,status.as_mut_ptr())}!=0||status[0]!=2||status[1]!=2||status[2]!=0||!matches!(status[9],3|7){return Err("guard must own calibrated SPI lease".into())}
+   if unsafe{libc::ioctl(guard.as_raw_fd(),0x4605,status.as_mut_ptr())}!=0||status[0]!=2||status[1]!=2||status[2]!=0||
+      (if c.managed_tx { status[9]!=31 || status[117]!=0x31475458 } else {!matches!(status[9],3|7)}){return Err("guard must own calibrated SPI lease".into())}
   }else{
    if read("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()!=if c.tx_active{"0"}else{"1"}{return Err("TX readback differs from declared test mode".into())}
    if read("/sys/bus/iio/devices/iio:device0/in_voltage_sampling_frequency")?.trim()!="61440000"{return Err("Fs prerequisite".into())}

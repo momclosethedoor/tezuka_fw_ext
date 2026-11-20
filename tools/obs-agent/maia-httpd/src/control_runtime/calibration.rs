@@ -140,7 +140,8 @@ impl Cache {
     fn prepare_tiles(&mut self, pending: &Value, shared: &Shared, tiles: Vec<generated::Tile>,
                      start: Instant, cpu_start: u64, catalog_only: bool) -> Result<(Vec<u8>, Value)> {
         let stop = &shared.switch;
-        if !catalog_only && pending["pl_timing_only"] != true && tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
+        if !catalog_only && pending["pl_timing_only"] != true && pending["xtg1_wait_ticks"].is_null()
+            && tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
             let requested = pending["scan"]["ranges"]
                 .as_array()
                 .into_iter()

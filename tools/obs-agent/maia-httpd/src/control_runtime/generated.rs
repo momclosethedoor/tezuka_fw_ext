@@ -27,6 +27,7 @@ pub(super) struct Tile {
     transition_only: bool,
     handover: &'static str,
     grid: Option<(&'static str, [u64; 2])>,
+    marker_path: Option<&'static str>,
 }
 
 pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
@@ -171,6 +172,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 transition_only: false,
                 handover: "none",
                 grid: None,
+                marker_path: None,
             });
             lo = hi;
         }
@@ -185,7 +187,14 @@ pub(super) fn transitions(state: &Value, tiles: &[Tile]) -> Result<Vec<Tile>> {
     for (i, current) in tiles.iter().enumerate() {
         let old = &tiles[(i + tiles.len() - 1) % tiles.len()];
         let mut main = current.clone();
-        if old.antenna != current.antenna {
+        if state["xtg1_wait_ticks"].is_number() && old.tx.is_some() != current.tx.is_some() {
+            // Request the physical path at the held boundary. An early ACK
+            // could switch the antenna while preceding visits are still valid.
+            main.notify = Some(main.antenna);
+            main.hold = true;
+            main.marker_path = Some(if main.tx.is_some() {"mixer"} else {"direct"});
+            main.handover = "path";
+        } else if old.antenna != current.antenna {
             let width = mixer_math::TILE_WIDTH as u64;
             let mut common = Vec::new();
             for l in &bands[&old.antenna] {
@@ -322,6 +331,7 @@ pub(super) fn encode(
     // Timing fixture recalls the actual TX bank while the driver keeps RF muted.
     let timing_only = state["pl_timing_only"] == true;
     let tx_rf_on = !tx.is_empty() && !timing_only;
+    let managed = tx_rf_on && state["xtg1_wait_ticks"].is_number();
     let tail = 40 + 3 * stride;
     let mut bytes = vec![0; tail + 160];
     for (p, v) in [
@@ -342,6 +352,7 @@ pub(super) fn encode(
         (tail, (!tx.is_empty()) as u32),
         (tail + 4, tx_rf_on as u32),
         (tail + 8, if tx_rf_on { 3000 } else { 89750 }),
+        (tail + 156, if managed {1 | (state["xtg1_wait_ticks"].as_u64().unwrap() as u32) << 16} else {0}),
     ] {
         put(&mut bytes, p, v);
     }
@@ -403,7 +414,8 @@ pub(super) fn encode(
         }
         let flags = slot.map_or(0, |s| 4 | ((s as u32) << 8))
             | v.notify.map_or(0, |id| 1 | ((id as u32) << 16))
-            | if v.hold { 2 } else { 0 };
+            | if v.hold { 2 } else { 0 }
+            | if managed && slot.is_some() { 16 } else { 0 };
         for page in [40 + stride, 40 + 2 * stride] {
             let at = page + i * 32;
             put(&mut bytes, at, rxkeys.binary_search(&v.rx).unwrap() as u32);
@@ -431,11 +443,14 @@ pub(super) fn encode(
             row["bench_grid_phase"] = json!(phase);
             row["bench_segment_hz"] = json!(bounds);
         }
+        let row = positions.last_mut().unwrap();
+        row["marker_path"] = json!(v.marker_path);
+        row["tx_gate_requested"] = if managed {json!(slot.is_some())} else {Value::Null};
     }
     // The guard drives TX for the full map. A mixed direct/mixer map requires
     // validated per-route gating or a measured direct model with the TX still on.
     ensure!(
-        !tx_rf_on || tiles.iter().all(|t| t.tx.is_some()),
+        !tx_rf_on || managed || tiles.iter().all(|t| t.tx.is_some()),
         "direct/mixer map needs TX gating at route boundary"
     );
     Ok((

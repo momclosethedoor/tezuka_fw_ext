@@ -732,6 +732,27 @@ fn guard_cmd(fd: &File, cmd: libc::c_ulong) -> Result<[u32; 128]> {
     guard(fd, cmd, std::ptr::null_mut())
 }
 
+const XTG1: u32 = 0x31475458;
+
+fn gate_receipt(words: &[u32; 128], spectrum: &Value) -> Value {
+    let status = words[118];
+    let epoch = (u64::from(words[124]) << 32) | u64::from(words[123]);
+    let position = words[121] as usize;
+    let expected = &spectrum["positions"][position];
+    let count = spectrum["positions"].as_array().map_or(0, Vec::len);
+    let on = status & 2 != 0;
+    let slot = (status >> 3) & 7;
+    let bound = words[117] == XTG1 && status & 0x1c5 == 0x45
+        && spectrum["version"] == words[120] && count > 0
+        && spectrum["map_epoch"].as_u64().is_some_and(|start|
+            epoch.checked_sub(start).is_some_and(|e| e % count as u64 == position as u64))
+        && expected["tx_gate_requested"] == on
+        && expected["tx_slot"].as_u64().is_none_or(|s| s == u64::from(slot));
+    json!({"capability":words[117],"raw_status":status,"duration_ticks":words[119],
+        "version":words[120],"position":position,"pass":words[122],"epoch":epoch,
+        "on":bound.then_some(on),"slot":bound.then_some(slot),"reason":(status>>9)&7})
+}
+
 struct Route {
     stream: Option<TcpStream>,
     key: (u32, u64, u32, u32, u32),
@@ -755,6 +776,7 @@ fn acknowledge(
 ) -> std::result::Result<Option<u32>, String> {
     let key = (id, epoch, version, position, antenna);
     let initial_path = source.strip_prefix("startup_");
+    let visit_path = source.strip_prefix("visit_");
     if route.as_ref().is_none_or(|r| r.key != key) {
         let mut v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
             "source":if source=="PLv2" {"PL"} else {source},"ack_version":if source=="PLv2" {2}else{1}});
@@ -764,6 +786,13 @@ fn acknowledge(
             v["required_path"] = json!(path);
             v["boot_id"] = json!(c.boot_id);
             v["ack_version"] = json!(3);
+        }
+        if let Some(path) = visit_path {
+            v["source"] = json!("PL");
+            v["event"] = json!("visit_path");
+            v["required_path"] = json!(path);
+            v["boot_id"] = json!(c.boot_id);
+            v["ack_version"] = json!(4);
         }
         let mut out = serde_json::to_vec(&v).unwrap();
         out.push(b'\n');
@@ -814,6 +843,8 @@ fn acknowledge(
     }
     let expected = if let Some(path) = initial_path {
         format!("ACK3 {} {generation} {version} {antenna} {path}", c.boot_id)
+    } else if let Some(path) = visit_path {
+        format!("ACK4 {} {generation} {version} {epoch} {position} {id} {antenna} {path}", c.boot_id)
     } else if source == "PLv2" {
         format!("ACK2 {generation} {version} {epoch} {position} {id} {antenna}")
     } else {
@@ -1335,6 +1366,7 @@ fn worker(
         })();
         let mut guard_taken = false;
         let mut guard_rf = false;
+        let mut managed_tx = false;
         let actual = RefCell::new(pending);
         let watch = RefCell::new(None);
         let result = (|| {
@@ -1356,11 +1388,16 @@ fn worker(
                 });
             }
             if let Some(setup) = setup.as_mut() {
-                let expected_control = 3 | (word(setup, setup.len() - 160) << 2);
+                managed_tx = word(setup, setup.len() - 4) & 1 != 0;
+                let expected_control = if managed_tx {31} else {3 | (word(setup, setup.len() - 160) << 2)};
                 guard_rf = word(setup, setup.len() - 156) != 0;
                 if actual.borrow()["scan"]["planner_version"] == 2 {
-                    let required = c.scan["path_ack_version"] == 1 || actual.borrow()["scan"]["path_ack_version"] == 1;
-                    let path = if guard_rf {"mixer"} else {"direct"};
+                    let required = c.scan["xtg1_wait_ticks"].is_number()
+                        || c.scan["path_ack_version"] == 1 || actual.borrow()["scan"]["path_ack_version"] == 1;
+                    let first_mixer = if managed_tx {
+                        actual.borrow()["spectrum"]["positions"][0]["mixer"] == true
+                    } else { guard_rf };
+                    let path = if first_mixer {"mixer"} else {"direct"};
                     let mut confirmation = json!({"required_path":path,"confirmed_by_client":false});
                     if required {
                         shared.inbox.lock().unwrap().phase = "waiting_path_ack";
@@ -1372,7 +1409,7 @@ fn worker(
                             ensure!(!shared.switch.load(Ordering::Acquire) && !shared.shutdown.load(Ordering::Acquire),
                                 "initial path confirmation cancelled");
                             let ack = acknowledge(&mut socket, &c, &shared, generation, 0, 0, version, 0, antenna,
-                                if guard_rf {"startup_mixer"} else {"startup_direct"}).map_err(|e|anyhow!(e))?;
+                                if first_mixer {"startup_mixer"} else {"startup_direct"}).map_err(|e|anyhow!(e))?;
                             if ack.is_some() { break; }
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -1383,8 +1420,9 @@ fn worker(
                     actual.borrow_mut()["spectrum"]["path_confirmation"] = confirmation;
                 }
                 if guard_rf {
+                    let cap = guard_cmd(&guard_fd, 0x4605)?;
                     ensure!(
-                        guard_cmd(&guard_fd, 0x4605)?[114] == 1,
+                        cap[114] == 1 && (!managed_tx || cap[117] == XTG1),
                         "guard with RF lease required"
                     );
                     let pll = actual.borrow()["spectrum"]["first_tx_pll_hz"]
@@ -1412,18 +1450,23 @@ fn worker(
                 ensure!(
                     s[1] == 2
                         && s[9] == expected_control
-                        && s[112] == (!guard_rf) as u32
-                        && (!guard_rf || s[113] == word(setup, setup.len() - 152)),
+                        && s[112] == (!guard_rf || managed_tx) as u32
+                        && (if managed_tx {s[113] == 89750}
+                            else {!guard_rf || s[113] == word(setup, setup.len() - 152)}),
                     "guard take readback"
                 );
                 actual.borrow_mut()["bank_apply"] = json!({"load_us":load_us,"take_us":take_start.elapsed().as_micros() as u64,
                     "bytes_per_table":loaded[7],"loaded_map_version":word(setup,16)});
-                if guard_rf {
+                if managed_tx {
+                    actual.borrow_mut()["tx"] = json!({"on":null,"powerdown":null,"owner":"obs_fl_guard",
+                        "carrier_source":"cyclic_fs_div_64","mode":"per_visit"});
+                } else if guard_rf {
                     actual.borrow_mut()["tx"] = json!({"on":true,"powerdown":s[112],"attenuation_mdb":s[113],
                         "owner":"obs_fl_guard","carrier_source":"cyclic_fs_div_64"});
                 }
                 actual.borrow_mut()["guard_tx"] =
-                    json!({"executor":s[9]&4!=0,"powerdown":s[112],"attenuation_mdb":s[113]});
+                    json!({"executor":s[9]&4!=0,"powerdown":s[112],"attenuation_mdb":s[113],
+                        "readback_scope":"take","per_visit":managed_tx});
             }
             let scan = mode == "scan";
             let tx_active = actual.borrow()["tx"]["on"] == true;
@@ -1432,7 +1475,8 @@ fn worker(
             let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":1,"previous_mode":1,
                 "seconds":1.0,"warmup":0.0,"shift544":true,"settling":0,"batch_limit":64,"direct":true,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
-                "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true});
+                "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
+            let applied = std::cell::Cell::new(false);
             let started = |h: crate::system_reader::Header| {
                 let mut a = actual.borrow_mut();
                 let version = a["map_version"].clone();
@@ -1461,7 +1505,7 @@ fn worker(
                         "view_bins",
                         json!([0, 512, 1024, 2048][((h.flags >> 3) & 3) as usize]),
                     ),
-                    ("TX_OFF", json!(!tx_active)),
+                    ("TX_OFF", if managed_tx {Value::Null} else {json!(!tx_active)}),
                 ] {
                     s.insert(k.into(), v);
                 }
@@ -1480,6 +1524,7 @@ fn worker(
                     }
                 }
                 receipt(&shared, &a, id, None);
+                applied.set(true);
             };
             let route = RefCell::new(None);
             let route_fn = |id, epoch, version, position, antenna| {
@@ -1492,6 +1537,14 @@ fn worker(
                 } else {
                     position
                 };
+                let a = actual.borrow();
+                let marker = &a["spectrum"]["positions"][marker_position as usize];
+                let source = match marker["marker_path"].as_str() {
+                    Some("mixer") if managed_tx => "visit_mixer",
+                    Some("direct") if managed_tx => "visit_direct",
+                    _ if a["scan"]["planner_version"] == 2 => "PLv2",
+                    _ => "PL",
+                };
                 acknowledge(
                     &mut route.borrow_mut(),
                     &c,
@@ -1502,11 +1555,7 @@ fn worker(
                     version,
                     marker_position,
                     antenna,
-                    if actual.borrow()["scan"]["planner_version"] == 2 {
-                        "PLv2"
-                    } else {
-                        "PL"
-                    },
+                    source,
                 )
             };
             let last_renew = std::cell::Cell::new(Instant::now());
@@ -1527,7 +1576,14 @@ fn worker(
                         if !carrier.guarded_lease_live() || !carrier.buffer_live() {
                             return Err("guarded TX lease or buffer lost".into());
                         }
-                        guard_cmd(&guard_fd, 0x4606).map_err(|e| e.to_string())?;
+                        let s = guard_cmd(&guard_fd, 0x4606).map_err(|e| e.to_string())?;
+                        if managed_tx && applied.get() {
+                            let mut a = actual.borrow_mut();
+                            let gate = gate_receipt(&s, &a["spectrum"]);
+                            a["tx"]["on"] = gate["on"].clone();
+                            a["tx"]["visit"] = gate;
+                            shared.inbox.lock().unwrap().actual["tx"] = a["tx"].clone();
+                        }
                         last_renew.set(Instant::now());
                     } else if !guard_rf && tx_active && c.external_mixer.is_none() {
                         if !tx::lease_is_live()
@@ -1769,7 +1825,13 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let pl_timing_only = c.scan["bench_timing_only"] == true;
     ensure!(!pl_timing_only || (c.external_mixer.is_none() && c.field_preview.is_none()
             && c.scan["planner_version"] == 2), "PL timing fixture requires a v2 scan-only configuration");
-    let initial = json!({"mode":initial_mode,"generation":clock_ns()/1000,"map_version":1,"epoch":0,"boot":c.boot_id,
+    let guard_info = guard_cmd(&guard_fd, 0x4605)?;
+    let xtg1 = if c.scan["xtg1_wait_ticks"].is_null() { None } else {
+        ensure!(guard_info[117] == XTG1 && guard_info[114] == 1 && c.scan["planner_version"] == 2
+                && c.external_mixer.is_none(), "XTG1 opt-in requires compatible PL, RF guard and v2 scan");
+        Some(int(&c.scan, "xtg1_wait_ticks", 0, 65535)?)
+    };
+    let mut initial = json!({"mode":initial_mode,"generation":clock_ns()/1000,"map_version":1,"epoch":0,"boot":c.boot_id,
         "pl_timing_only":pl_timing_only,
         "catalog_policy":catalog_policy,"catalog_antennas":c.scan["antenna_bands"],"catalog_mixer":c.scan["mixer"],
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
@@ -1777,6 +1839,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
         "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual,
         "scan_bounds":bounds});
+    initial["xtg1_wait_ticks"] = json!(xtg1);
     let profiles = c
         .scan_tx
         .iter()
@@ -1787,10 +1850,11 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         })
         .collect::<Vec<_>>();
     let (threshold, mult) = generated::environment()?;
-    let rf_guard = guard_cmd(&guard_fd, 0x4605)?[114] == 1;
+    let rf_guard = guard_info[114] == 1;
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
-        "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1,
+        "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
+        "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
         "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"tx_model_pll_hz":[2250000000u64,2490000000u64]}}); 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {

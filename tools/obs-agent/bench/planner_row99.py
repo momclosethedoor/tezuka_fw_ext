@@ -2,6 +2,8 @@
 from pathlib import Path
 import sys
 import os
+import hashlib
+import json
 
 workspace = Path("C:/proj/pluto_ag")
 sys.path.insert(0, str(workspace.parent / "goofy_scan/local-only/HOST-SCAN-CONTROL-001"))
@@ -14,7 +16,26 @@ def stage_executables(*args, **kwargs):
     if "PLANNER_BENCH_MODULES" in os.environ:
         args=(args[0],Path(os.environ["PLANNER_BENCH_MODULES"]),*args[2:])
     stage(*args, **kwargs)
-    bench.accepted.ssh(f"cd {bench.accepted.REMOTE} && chmod 700 cap2-run sig0-arm")
+    api = bench.accepted
+    api.ssh(f"cd {api.REMOTE} && chmod 700 cap2-run sig0-arm")
+    if image := os.environ.get("PLANNER_BENCH_XTG1"):
+        image = Path(image)
+        expected = "a79c03ace0524a43b4ee90a1582fe01ebec4e0f368ab0a98138eb78e1c1ed5f8"
+        assert image.stat().st_size == 1_124_992 and api.digest(image) == expected
+        log = args[0]
+        loader = log / "loader/check-row99.sh"
+        original = "7401ebc0de93033f6388c3c081561e61a5a9004f029c25fe0551caa719ecab78"
+        script = loader.read_bytes()
+        assert script.count(original.encode()) == 1
+        loader.write_bytes(script.replace(original.encode(), expected.encode()) +
+                           b'\ntest "$(devmem 0x7c460328)" = 0x31475458\n./obs-fl-ctl gate-status\n')
+        api.upload(image, api.REMOTE, "row99.bit.bin")
+        api.upload(loader, api.REMOTE, loader.name)
+        board = log / "staged.json"
+        staged = json.loads(board.read_text())
+        staged.update({"row99.bit.bin": expected,
+                       loader.name: hashlib.sha256(loader.read_bytes()).hexdigest()})
+        api.write_json(board, staged)
 
 
 if __name__ == "__main__":
