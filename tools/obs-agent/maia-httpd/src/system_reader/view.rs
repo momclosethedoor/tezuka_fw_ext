@@ -143,6 +143,6 @@ impl PairReader{
   impl PairIo for Mock{fn snapshot(&mut self)->Result<Snapshot,String>{Ok(self.s)}fn copy_full(&mut self,slot:usize,out:&mut[u8])->Result<(),String>{assert_eq!(slot,self.s.released as usize&1023);out.copy_from_slice(&self.full);Ok(())}fn copy_view(&mut self,slot:usize,out:&mut[u8])->Result<(),String>{assert_eq!(slot,self.s.released as usize&1023);assert_eq!(out.len(),self.view.len());out.copy_from_slice(&self.view);self.vc+=1;Ok(())}fn release(&mut self,run:u32,tail:u64)->Result<(),String>{assert_eq!(run,7);assert_eq!(tail,self.s.released+1);self.s.released=tail;Ok(())}}
   let mut io=Mock{full:vec![],view:vec![],s:Snapshot{cookie:7,committed:0,reserved:0,released:0,..Default::default()},vc:0};let mut r=PairReader::attach(io.s).unwrap();let mut expected_views=0;
   for ordinal in 0..2050u64{let mode=ordinal%4;let p=root().join(format!("mode{mode}/ordinal-0-k2.hex"));io.full=bytes(&p);io.view=bytes(&p.with_extension("viewhex"));for(i,b)in ordinal.to_le_bytes().iter().enumerate(){io.full[(56+i)*8+7]=*b;}io.s.committed+=1;io.s.reserved+=1;if mode!=0{expected_views+=1;}r.service(&mut io,|h,p,v|{assert_eq!(h.ordinal,ordinal);assert_eq!(p.len(),4096);assert_eq!(v.len(),view_len(h));Ok(())}).unwrap();assert_eq!(io.s.released,ordinal+1);}
-  assert_eq!(r.consumed,514);assert_eq!(io.vc,expected_views);
+  assert_eq!(r.consumed,io.s.committed);assert_eq!(io.vc,expected_views);
  }
 }

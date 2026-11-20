@@ -86,7 +86,7 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
                     })?
             };
             // Allow the maximum 10 Hz PLL readback error at either edge.
-            let mut hi = edge.min(lo + 47_600_000 - 20);
+            let mut hi = edge.min(lo + mixer_math::TILE_WIDTH as u64);
             if path == "auto" && lo < threshold {
                 hi = hi.min(threshold);
             }
@@ -104,25 +104,12 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
             } else {
                 None
             };
-            let mid = lo + (hi - lo) / 2;
-            let mut rx = tx.map_or(mid, |t| (mid as i64 - t.mixer_lo).unsigned_abs());
+            let edges = tx.map_or([lo as i64, hi as i64], |t| t.if_edges);
+            let rx = mixer_math::place_rx(edges, state["alternative"]["excluded_rx_lo_hz"].as_i64())
+                .ok_or_else(|| anyhow!("no RX tuning with DC clearance for [{lo},{hi})"))?
+                as u64;
             if let Some(t) = tx {
                 previous = Some(t.pll);
-            }
-            if tx.is_none()
-                && let Some(old) = state["alternative"]["excluded_rx_lo_hz"].as_u64()
-            {
-                let lowest = hi.saturating_sub(23_800_000 - 10).max(70_000_000);
-                let highest = (lo + 23_800_000 - 10).min(6_000_000_000);
-                rx = if lowest.abs_diff(old) > highest.abs_diff(old) {
-                    lowest
-                } else {
-                    highest
-                };
-                ensure!(
-                    rx.abs_diff(old) >= 15_000,
-                    "no distinct RX observation fits [{lo},{hi})"
-                );
             }
             tiles.push(Tile {
                 rf: [lo, hi],
@@ -142,7 +129,7 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
         let old = &tiles[(i + tiles.len() - 1) % tiles.len()];
         let mut main = current.clone();
         if old.antenna != current.antenna {
-            let width = 47_600_000;
+            let width = mixer_math::TILE_WIDTH as u64;
             let mut common = Vec::new();
             for l in &bands[&old.antenna] {
                 for r in &bands[&current.antenna] {
@@ -178,11 +165,12 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
                             break;
                         }
                     }
-                    v.rx =
-                        v.tx.map_or(center, |tx| (center as i64 - tx.mixer_lo).unsigned_abs());
-                    if !(70_000_000..=6_000_000_000).contains(&v.rx) {
+                    let edges =
+                        v.tx.map_or([window[0] as i64, window[1] as i64], |t| t.if_edges);
+                    let Some(rx) = mixer_math::place_rx(edges, None) else {
                         break;
-                    }
+                    };
+                    v.rx = rx as u64;
                     pair.push(v);
                 }
                 if pair.len() == 2 {
@@ -292,6 +280,11 @@ pub(super) fn encode(
         let side = v.tx.map_or(1, |t| t.side);
         let center = offset + side * rx_hz as i64;
         ensure!(
+            center + mixer_math::DC_CLEARANCE <= a as i64
+                || center - mixer_math::DC_CLEARANCE >= b as i64,
+            "readback places DC in useful interval [{a},{b})"
+        );
+        ensure!(
             (a as i64 - center).unsigned_abs() <= 23_800_000
                 && (b as i64 - center).unsigned_abs() <= 23_800_000,
             "readback leaves uncovered RF edge [{a},{b})"
@@ -322,7 +315,7 @@ pub(super) fn encode(
         positions.push(json!({"rf_ranges":[v.rf],"rx_lo_hz":rx_hz,"rf_center_hz":center,"antenna":v.antenna,
             "side_sign":side,"mixer":slot.is_some(),"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
             "mixer_lo_hz":tone.map(|_|offset),"if_edges_hz":if side==1 {[a as i64-offset,b as i64-offset]}else{[offset-b as i64,offset-a as i64]},
-            "ddc_hz":0,"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
+            "ddc_hz":0,"dc_clearance_hz":mixer_math::DC_CLEARANCE,"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
             "tx_if_veto_hz":tone.map(|f|[f-35_520_000,f+35_520_000]),"tx_model_extrapolated":pll.is_some_and(|p|!(2_250_000_000..=2_490_000_000).contains(&p)),
             "rx_available":!v.transition_only,"transition_only":v.transition_only,"marker_route":v.notify,
             "hold_boundary":v.hold,"transition":v.handover}));

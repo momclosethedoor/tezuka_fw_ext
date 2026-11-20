@@ -4,6 +4,26 @@ pub const OFFSET: i64 = 960_000;
 const IF_MIN: i64 = 70_000_000;
 const IF_MAX: i64 = 6_000_000_000;
 const PILOT_HALF_SPAN: i64 = 61_440_000 / 2 + 4_800_000;
+// The largest first bin below one VIEW code above the local floor was
+// 10 native bins from DC. Include a full 8-bin VIEW512 cell on each edge.
+pub const DC_CLEARANCE: i64 = (10 + 8) * 15_000;
+pub const HALF_PASS: i64 = 23_800_000;
+// RX readback <=10 Hz plus multiplier * TX readback <=20 Hz.
+const READBACK_MARGIN: i64 = 30;
+pub const TILE_WIDTH: i64 = HALF_PASS - DC_CLEARANCE - 2 * READBACK_MARGIN;
+
+pub fn place_rx(edges: [i64; 2], exclude: Option<i64>) -> Option<i64> {
+    let [a, b] = edges;
+    if a < IF_MIN || a >= b || b > IF_MAX || b - a > TILE_WIDTH {
+        return None;
+    }
+    let guard = DC_CLEARANCE + READBACK_MARGIN;
+    [a - guard, b + guard]
+        .into_iter()
+        .filter(|v| (IF_MIN..=IF_MAX).contains(v))
+        .filter(|v| exclude.is_none_or(|x| v.abs_diff(x) >= 15_000))
+        .max_by_key(|v| exclude.map_or(0, |x| v.abs_diff(x)))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Tuning {
@@ -99,6 +119,34 @@ pub fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_boundary_useful_band_and_dc_are_disjoint_even_after_readback() {
+        for a in [IF_MIN, 1_000_000_000, IF_MAX - TILE_WIDTH] {
+            for w in [1, TILE_WIDTH - 1, TILE_WIDTH] {
+                let b = a + w;
+                let rx = place_rx([a, b], None).unwrap();
+                assert!(
+                    rx + DC_CLEARANCE + READBACK_MARGIN <= a
+                        || rx - DC_CLEARANCE - READBACK_MARGIN >= b
+                );
+                assert!(
+                    rx.abs_diff(a) <= (HALF_PASS - READBACK_MARGIN) as u64
+                        && rx.abs_diff(b) <= (HALF_PASS - READBACK_MARGIN) as u64
+                );
+                if a == 1_000_000_000 {
+                    assert_ne!(rx, place_rx([a, b], Some(rx)).unwrap());
+                }
+            }
+        }
+        for bad in [
+            [0, 1],
+            [IF_MAX, IF_MAX],
+            [IF_MIN, IF_MIN + TILE_WIDTH + 1],
+            [i64::MIN, i64::MAX],
+        ] {
+            assert!(place_rx(bad, None).is_none());
+        }
+    }
     #[test]
     fn owned_boundary_integer_solver_matches_exhaustive_pll_and_sides() {
         for p in [70_000_000, 2_250_000_000, 5_999_039_980] {

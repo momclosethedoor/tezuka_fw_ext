@@ -9,6 +9,7 @@ import time
 import uuid
 
 from planner_row99 import bench, stage_executables
+from planner_sinks import Sinks
 
 
 def lease_loop(stop, ready):
@@ -47,6 +48,8 @@ def control(log, profiles, boot):
     if mixer:
         assert v2
         scan["ranges"]=[dict(lo_hz=6748000000,hi_hz=6752000000,enabled=True)]
+        if os.environ.get("PLANNER_BENCH_SOURCE58"):
+            scan["ranges"]=[dict(lo_hz=5864000000,hi_hz=5866500000,path="mixer",enabled=True)]
     analysis = dict(op="analysis", center_hz=2425000000, width_hz=24000000,
                     k=700, gain_db=35, agc="manual")
     cfg = dict(boot_id=boot, output=remote+"/control", view=ip+":18010",
@@ -61,6 +64,7 @@ def control(log, profiles, boot):
     calls = []
     stop,ready=threading.Event(),threading.Event()
     thread=None
+    sinks=Sinks(ip,log)
     try:
         if mixer:
             thread=threading.Thread(target=lease_loop,args=(stop,ready),daemon=True)
@@ -78,6 +82,16 @@ def control(log, profiles, boot):
             cmds=[scan,scan,dict(scan,k=1),dict(scan,k=1023),analysis,scan,dict(scan,run=False)]
             if os.environ.get("PLANNER_BENCH_ALTERNATIVE")=="1":
                 cmds[1:1]=[dict(op="alternative"),dict(op="cancel_alternative")]
+            if os.environ.get("PLANNER_BENCH_VIDEO"):
+                cmds[-1:-1]=[analysis,dict(op="video",center_hz=2425000000,width_hz=6000000),dict(op="return")]
+            if os.environ.get("PLANNER_BENCH_BANK"):
+                cmds=[dict(scan,ranges=[dict(lo_hz=70000000,hi_hz=70000000+n*23_529_940,enabled=True)])
+                      for n in (127,128,129)]+[dict(scan,run=False)]
+            if os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
+                ranges=[dict(lo_hz=2300000000,hi_hz=2600000000,enabled=True)]
+                routes=dict(scan,ranges=ranges,antenna_bands={"0":[[2300000000,2450000000]],
+                    "1":[[2395000000,2530000000]],"2":[[2515000000,2600000000]]})
+                cmds=[routes,dict(routes,k=1),dict(scan,run=False)]
             for cmd in cmds:
                 if cmd["op"]=="alternative":
                     prev=calls[-1]["status"]["actual"]
@@ -89,14 +103,19 @@ def control(log, profiles, boot):
                 start = time.monotonic_ns()
                 accepted = a.request(url,"POST",path,dict(cmd,id=ident),timeout=2)
                 assert accepted["accepted_id"] == ident
-                while time.monotonic_ns()-start < 10_000_000_000:
+                while time.monotonic_ns()-start < 35_000_000_000:
                     status = a.request(url,"GET",path,timeout=1)
                     if ident in (status["applied_id"],status["failed_id"]): break
                     time.sleep(.02)
                 calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.monotonic_ns()-start))
                 a.write_json(log/"commands.json",calls)
                 assert status["applied_id"] == ident, status.get("error")
-                if status["actual"]["running"]:
+                if status["actual"]["running"] and status["actual"]["mode"]=="video":
+                    deadline=time.monotonic()+3
+                    while time.monotonic()<deadline and status["actual"]["generation"] not in sinks.video:
+                        time.sleep(.01)
+                    assert sinks.video[status["actual"]["generation"]]>0
+                elif status["actual"]["running"]:
                     deadline=time.monotonic()+3
                     discarded=0
                     while time.monotonic()<deadline:
@@ -109,12 +128,17 @@ def control(log, profiles, boot):
                     (log/f"view-{len(calls)}.bin").write_bytes(data)
                     calls[-1].update(stale_datagrams_discarded=discarded,fresh_host_ns=time.monotonic_ns()-start)
                     a.write_json(log/"commands.json",calls)
+                    if os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
+                        time.sleep(.3)
+                    if os.environ.get("PLANNER_BENCH_BANK"):
+                        time.sleep(.25)
     finally:
         try:
             (log/"owner.log").write_text(a.ssh(f"cd {remote}; kill -TERM $(cat owner.pid) 2>/dev/null || :; sleep 1; cat owner.log"))
         finally:
             stop.set()
             if thread: thread.join(3)
+            sinks.close()
 
 
 if __name__ == "__main__":
