@@ -13,6 +13,9 @@ def main():
     p.add_argument("output", type=Path)
     p.add_argument("--workspace", type=Path, default=Path("C:/proj/pluto_ag"))
     p.add_argument("--route", choices=["direct", "mixer"], required=True)
+    p.add_argument("--rf-hz",type=int,default=6750000000)
+    p.add_argument("--pll-hz",type=int,nargs="+",default=[2250000000,2370000000,2490000000])
+    p.add_argument("--source-58",action="store_true",help="locate the enabled 5.8 GHz reference with TX muted")
     args = p.parse_args()
     host = args.workspace.parent / "goofy_scan"
     sys.path[:0] = [str(args.workspace / "obs-007a-hw-system/scripts"), str(host),
@@ -76,9 +79,14 @@ def main():
         patch("ad9361", {"sampling_frequency": 61440000, "rx_rf_bandwidth": 48000000,
                          "rx_gain_mode": "Manual", "rx_gain": 35})
         patch("spectrometer", {"input": "AD9361", "mode": "Average", "number_integrations": 128})
-        for pll in (2250000000, 2370000000, 2490000000):
+        if args.source_58:
+            assert args.route=="direct"
+            for rx in range(5640000000,5980000001,20000000):
+                capture(None,rx,None,{"powerdown":1})
+            return
+        for pll in args.pll_hz:
             tone = pll + 960000
-            points = (tone - 4800000, tone + 4800000, 6750000000 - 2*tone)
+            points = (tone - 4800000, tone + 4800000, abs(args.rf_hz - 2*tone))
             for rx in points:
                 capture(pll, rx, None, {"powerdown": 1})
             if args.route == "mixer":

@@ -15,11 +15,16 @@ pub(super) fn environment() -> Result<(u64, i64)> {
     Ok((threshold, multiplier))
 }
 
+#[derive(Clone)]
 pub(super) struct Tile {
     pub rf: [u64; 2],
     pub antenna: u64,
     pub tx: Option<Tuning>,
     pub rx: u64,
+    notify: Option<u64>,
+    hold: bool,
+    transition_only: bool,
+    handover: &'static str,
 }
 
 pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
@@ -35,6 +40,15 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
         ensure!(range["tx_slot"].is_null(), "v2 selects TX from RF");
         let mut lo = int(range, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
         let end = int(range, "hi_hz", lo + 1, plan_math::MAX_RF)?;
+        let path = range.get("path").and_then(Value::as_str).unwrap_or("auto");
+        ensure!(
+            matches!(path, "auto" | "mixer" | "direct"),
+            "invalid RF path"
+        );
+        ensure!(
+            path != "direct" || end <= 6_000_000_000,
+            "direct path cannot cover [{lo},{end})"
+        );
         while lo < end {
             let (antenna, edge) = if bands.is_empty() {
                 (state["route"]["antenna"].as_u64().unwrap_or(0), end)
@@ -61,10 +75,10 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
             };
             // Allow the maximum 10 Hz PLL readback error at either edge.
             let mut hi = edge.min(lo + 47_600_000 - 20);
-            if lo < threshold {
+            if path == "auto" && lo < threshold {
                 hi = hi.min(threshold);
             }
-            let tx = if lo >= threshold {
+            let tx = if path == "mixer" || path == "auto" && lo >= threshold {
                 Some(
                     choose(
                         [lo as i64, hi as i64],
@@ -103,11 +117,94 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
                 antenna,
                 tx,
                 rx,
+                notify: None,
+                hold: false,
+                transition_only: false,
+                handover: "none",
             });
             lo = hi;
         }
     }
-    Ok(tiles)
+    let mut result = Vec::new();
+    for (i, current) in tiles.iter().enumerate() {
+        let old = &tiles[(i + tiles.len() - 1) % tiles.len()];
+        let mut main = current.clone();
+        if old.antenna != current.antenna {
+            let width = 47_600_000;
+            let mut common = Vec::new();
+            for l in &bands[&old.antenna] {
+                for r in &bands[&current.antenna] {
+                    let a = l[0].max(r[0]);
+                    let b = l[1].min(r[1]);
+                    if a < b {
+                        common.push([a, b]);
+                    }
+                }
+            }
+            let overlap = common
+                .iter()
+                .filter(|r| r[1] - r[0] >= width)
+                .map(|r| current.rf[0].clamp(r[0] + width / 2, r[1] - width / 2))
+                .min_by_key(|f| f.abs_diff(current.rf[0]));
+            if let Some(center) = overlap {
+                let window = [center - width / 2, center + width / 2];
+                let mut pair = Vec::new();
+                for t in [old, current] {
+                    let mut v = t.clone();
+                    v.rf = window;
+                    v.transition_only = true;
+                    v.handover = "overlap";
+                    if let Some(tx) = t.tx {
+                        v.tx = choose(
+                            [window[0] as i64, window[1] as i64],
+                            mult,
+                            [tx.pll, tx.pll],
+                            Some(tx.pll),
+                            None,
+                        );
+                        if v.tx.is_none() {
+                            break;
+                        }
+                    }
+                    v.rx =
+                        v.tx.map_or(center, |tx| (center as i64 - tx.mixer_lo).unsigned_abs());
+                    if !(70_000_000..=6_000_000_000).contains(&v.rx) {
+                        break;
+                    }
+                    pair.push(v);
+                }
+                if pair.len() == 2 {
+                    // Leave margin for PLL readback while preserving the entire
+                    // requested main coverage adjoining the handover.
+                    for v in &mut pair {
+                        v.rf[0] += 10;
+                        v.rf[1] -= 10;
+                    }
+                    pair[0].notify = Some(main.antenna);
+                    pair[1].hold = true;
+                    result.extend(pair);
+                } else {
+                    main.handover = "no_common_tuning";
+                }
+            } else {
+                main.handover = if common.is_empty() {
+                    "no_overlap"
+                } else {
+                    "overlap_too_narrow"
+                };
+            }
+            if main.handover != "none" {
+                main.notify = Some(main.antenna);
+                main.hold = true;
+            }
+        }
+        if i == 0 && result.is_empty() && Some(main.antenna) != state["route"]["antenna"].as_u64() {
+            main.notify = Some(main.antenna);
+            main.hold = true;
+        }
+        result.push(main);
+    }
+    Ok(result)
 }
 
 pub(super) fn encode(
@@ -118,30 +215,39 @@ pub(super) fn encode(
     state: &Value,
 ) -> Result<(Vec<u8>, Value)> {
     ensure!(
-        !tiles.is_empty() && tiles.len() <= 128 && rx.len() <= 128 && tx.len() <= 8,
-        "row99 requires {} visits, {} RX, {} TX; capacities 128/128/8",
+        !tiles.is_empty() && tiles.len() <= 65535 && rx.len() <= 65535 && tx.len() <= 8,
+        "row99 requires {} visits, {} RX, {} TX; capacities 65535/65535/8",
         tiles.len(),
         rx.len(),
         tx.len()
     );
     let version = int(state, "map_version", 1, 0x7fff_fffe)? as u32;
-    let mut bytes = vec![0; 12488];
+    let stride = 32 * tiles.len().max(rx.len()).max(128);
+    let tail = 40 + 3 * stride;
+    let mut bytes = vec![0; tail + 160];
     for (p, v) in [
-        (0, 0x3747534f),
+        (
+            0,
+            if stride > 4096 {
+                0x3847534f
+            } else {
+                0x3747534f
+            },
+        ),
         (4, rx.len().max(8) as u32),
         (8, tiles.len() as u32),
         (12, tiles.len() as u32),
         (16, version),
         (20, version + 1),
         (24, 512),
-        (12328, (!tx.is_empty()) as u32),
-        (12332, (!tx.is_empty()) as u32),
-        (12336, if tx.is_empty() { 89750 } else { 3000 }),
+        (tail, (!tx.is_empty()) as u32),
+        (tail + 4, (!tx.is_empty()) as u32),
+        (tail + 8, if tx.is_empty() { 89750 } else { 3000 }),
     ] {
         put(&mut bytes, p, v);
     }
     put_hz(&mut bytes, 32, restore[0]);
-    put_hz(&mut bytes, 12344, restore[1]);
+    put_hz(&mut bytes, tail + 16, restore[1]);
     let rxkeys = rx.keys().copied().collect::<Vec<_>>();
     let txkeys = tx.keys().copied().collect::<Vec<_>>();
     for i in 0..rx.len().max(8) {
@@ -152,7 +258,8 @@ pub(super) fn encode(
     }
     if !tx.is_empty() {
         for i in 0..8 {
-            bytes[12352 + 16 * i..12368 + 16 * i].copy_from_slice(&tx[&txkeys[i % tx.len()]].1);
+            bytes[tail + 24 + 16 * i..tail + 40 + 16 * i]
+                .copy_from_slice(&tx[&txkeys[i % tx.len()]].1);
         }
     }
     let (threshold, mult) = environment()?;
@@ -162,7 +269,7 @@ pub(super) fn encode(
         .iter()
         .find_map(|v| v.tx)
         .map(|t| txkeys.binary_search(&(t.pll as u64)).unwrap());
-    put(&mut bytes, 12340, first.unwrap_or(0) as u32);
+    put(&mut bytes, tail + 12, first.unwrap_or(0) as u32);
     for (i, v) in tiles.iter().enumerate() {
         let [a, b] = v.rf;
         let rx_hz = rx[&v.rx].0;
@@ -184,30 +291,27 @@ pub(super) fn encode(
                 "PLL readback puts measured interference in [{a},{b})"
             );
         }
-        let before = &tiles[(i + tiles.len() - 1) % tiles.len()];
-        let marker = before.antenna != v.antenna
-            || i == 0 && Some(v.antenna) != state["route"]["antenna"].as_u64();
         let flags = slot.map_or(0, |s| 4 | ((s as u32) << 8))
-            | if marker {
-                3 | ((v.antenna as u32) << 16)
-            } else {
-                0
-            };
-        for page in [MAP, NEXT] {
+            | v.notify.map_or(0, |id| 1 | ((id as u32) << 16))
+            | if v.hold { 2 } else { 0 };
+        for page in [40 + stride, 40 + 2 * stride] {
             let at = page + i * 32;
             put(&mut bytes, at, rxkeys.binary_search(&v.rx).unwrap() as u32);
             put(&mut bytes, at + 4, flags);
-            if marker {
+            if v.notify.is_some() {
                 put(&mut bytes, at + 8, version + i as u32);
             }
             put_hz(&mut bytes, at + 16, a);
             put_hz(&mut bytes, at + 24, b);
         }
-        ranges.push(v.rf);
+        if !v.transition_only {
+            ranges.push(v.rf);
+        }
         positions.push(json!({"rf_ranges":[v.rf],"rx_lo_hz":rx_hz,"rf_center_hz":center,"antenna":v.antenna,
             "side_sign":side,"mixer":slot.is_some(),"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
             "mixer_lo_hz":tone.map(|_|offset),"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
-            "rx_available":true,"transition_only":false,"marker_route":marker.then_some(v.antenna),"hold_boundary":marker}));
+            "rx_available":!v.transition_only,"transition_only":v.transition_only,"marker_route":v.notify,
+            "hold_boundary":v.hold,"transition":v.handover}));
     }
     // The guard drives TX for the full map. A mixed direct/mixer map requires
     // validated per-route gating or a measured direct model with the TX still on.

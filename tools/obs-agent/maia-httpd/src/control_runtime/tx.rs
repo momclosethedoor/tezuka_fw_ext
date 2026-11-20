@@ -97,8 +97,36 @@ impl Carrier {
             .stderr(Stdio::null())
             .status();
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // libiio disables the cyclic device buffer in its signal cleanup.
+            unsafe {
+                libc::kill(child.id() as i32, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while child.try_wait()?.is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+                child.wait()?;
+            }
+            if let Some(device) = &self.device
+                && buffer_enabled(device)
+            {
+                // This owner opened buffer 0 after checking it was idle.
+                let en = device.join("buffer0/enable");
+                fs::write(
+                    if en.exists() {
+                        en
+                    } else {
+                        device.join("buffer/enable")
+                    },
+                    "0",
+                )?;
+                ensure!(
+                    !buffer_enabled(device),
+                    "cyclic buffer remains enabled after TX off"
+                );
+            }
         }
         self.device = None;
         ensure!(gate?.success(), "TX gate did not confirm");

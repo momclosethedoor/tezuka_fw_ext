@@ -8,6 +8,23 @@ permissions:
   contents: read
   actions: read
 jobs:
+  pentium-math:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          rustc +1.94.0 --edition=2024 --test tools/obs-agent/owned-reader-tests.rs -o planner-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./planner-tests.exe owned_boundary
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc +1.94.0 --edition=2024 tools/obs-agent/mixer-check.rs -o mixer-check.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pentium-math
+          path: |
+            planner-tests.exe
+            mixer-check.exe
   agent:
     runs-on: ubuntu-22.04
     timeout-minutes: 45

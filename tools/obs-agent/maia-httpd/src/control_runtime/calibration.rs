@@ -69,6 +69,7 @@ fn calibrate(
 impl Cache {
     pub fn prepare(&mut self, pending: &Value, stop: &AtomicBool) -> Result<(Vec<u8>, Value)> {
         let start = Instant::now();
+        let cpu_start = cpu_ns()?;
         let tiles = generated::tiles(pending)?;
         let rx_keys = tiles.iter().map(|v| v.rx).collect::<BTreeSet<_>>();
         let tx_keys = tiles
@@ -76,8 +77,8 @@ impl Cache {
             .filter_map(|v| v.tx.map(|t| t.pll as u64))
             .collect::<BTreeSet<_>>();
         ensure!(
-            tiles.len() <= 128 && rx_keys.len() <= 128 && tx_keys.len() <= 8,
-            "row99 needs {} visits, {} RX and {} TX; capacities 128/128/8",
+            tiles.len() <= 65535 && rx_keys.len() <= 65535 && tx_keys.len() <= 8,
+            "row99 needs {} visits, {} RX and {} TX; capacities 65535/65535/8",
             tiles.len(),
             rx_keys.len(),
             tx_keys.len()
@@ -128,7 +129,22 @@ impl Cache {
         self.rx = rx;
         self.tx = tx;
         desc["preparation"] = json!({"planner_version":2,"math_us":math_us+compile.elapsed().as_micros() as u64,
-            "prepare_us":prepare_us,"rx_calibrated":rx_cold,"tx_calibrated":tx_cold,"rx_catalog_count":word(&bytes,4)});
+            "prepare_us":prepare_us,"worker_cpu_ns":cpu_ns()?.saturating_sub(cpu_start),
+            "rss_kib":fs::read_to_string("/proc/self/status")?.lines().find_map(|l|
+                l.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse::<u64>().ok()),
+            "rx_calibrated":rx_cold,"tx_calibrated":tx_cold,"rx_catalog_count":word(&bytes,4)});
         Ok((bytes, desc))
     }
+}
+
+fn cpu_ns() -> Result<u64> {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    ensure!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0,
+        "worker CPU clock"
+    );
+    Ok(t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64)
 }

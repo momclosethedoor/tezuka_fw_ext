@@ -67,7 +67,11 @@ pub fn choose(
             }
             let mid = lo + (hi - lo) / 2;
             for pll in [previous.unwrap_or(mid).clamp(lo, hi), mid, lo, hi] {
-                if Some(pll) == exclude {
+                // The two images of this target are disjoint if the external LO
+                // changes by more than half the target width (same side).
+                if exclude
+                    .is_some_and(|old| pll.abs_diff(old) * (2 * mult) as u64 <= (b - a) as u64 + 40)
+                {
                     continue;
                 }
                 let rank = (

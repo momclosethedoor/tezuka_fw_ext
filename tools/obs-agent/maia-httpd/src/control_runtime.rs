@@ -262,6 +262,18 @@ fn validate(v: &Value) -> Result<()> {
             }
         }
         Some("return") => {}
+        Some("alternative") => {
+            int(v, "source_generation", 1, u64::MAX)?;
+            int(v, "source_position", 0, 65534)?;
+            let lo = int(v, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
+            int(v, "hi_hz", lo + 1, plan_math::MAX_RF)?;
+        }
+        Some("cancel_alternative") => {
+            ensure!(
+                v["request_id"].as_str().is_some_and(|s| s.len() == 32),
+                "alternative request_id"
+            );
+        }
         Some("route") => {
             ensure!(
                 matches!(v["kind"].as_str(), Some("direct" | "mixer")),
@@ -313,6 +325,47 @@ async fn submit(
         );
     }
     let mut q = shared.inbox.lock().unwrap();
+    if cmd["op"] == "alternative" {
+        let source = &q.actual;
+        let p = &source["spectrum"]["positions"][cmd["source_position"].as_u64().unwrap() as usize];
+        let lo = cmd["lo_hz"].as_u64().unwrap();
+        let hi = cmd["hi_hz"].as_u64().unwrap();
+        if source["generation"] != cmd["source_generation"]
+            || source["running"] != true
+            || source["scan"]["planner_version"] != 2
+            || source["mode"] != "scan"
+            || !source["alternative"].is_null()
+            || !p["rf_ranges"].as_array().is_some_and(|rs| {
+                rs.iter().any(|r| {
+                    r[0].as_u64().is_some_and(|a| a <= lo) && r[1].as_u64().is_some_and(|b| hi <= b)
+                })
+            })
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"stale source or target outside source visit"})),
+            );
+        }
+    }
+    if cmd["op"] == "cancel_alternative" {
+        let preparing = q
+            .pending
+            .as_ref()
+            .is_some_and(|p| p["op"] == "alternative" && p["id"] == cmd["request_id"]);
+        if !preparing && q.actual["alternative"]["request_id"] != cmd["request_id"] {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"unmatched alternative request"})),
+            );
+        }
+        if preparing && q.next.is_none() {
+            q.next = Some(cmd.clone());
+            q.queued_ns = clock_ns();
+            shared.switch.store(true, Ordering::Release);
+            shared.wake.notify_one();
+            return (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})));
+        }
+    }
     if q.next.is_some() || q.pending.is_some() {
         return (
             StatusCode::CONFLICT,
@@ -670,7 +723,8 @@ fn acknowledge(
         let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50))
             .map_err(|e| e.to_string())?;
         stream.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,"source":source});
+        let v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
+            "source":if source=="PLv2" {"PL"} else {source},"ack_version":if source=="PLv2" {2}else{1}});
         let mut out = serde_json::to_vec(&v).unwrap();
         out.push(b'\n');
         shared.inbox.lock().unwrap().route_pending = v;
@@ -705,7 +759,11 @@ fn acknowledge(
     if r.input.len() > 512 {
         return Err("route ACK length".into());
     }
-    let expected = format!("ACK {id}");
+    let expected = if source == "PLv2" {
+        format!("ACK2 {generation} {version} {epoch} {position} {id} {antenna}")
+    } else {
+        format!("ACK {id}")
+    };
     while let Some(end) = r.input.iter().position(|b| *b == b'\n') {
         let ok = &r.input[..end] == expected.as_bytes();
         r.input.drain(..=end);
@@ -954,6 +1012,7 @@ fn worker(
     let manual = state["manual_tx_available"] == true;
     let mut carrier = tx::Carrier::default();
     let mut calibration = calibration::Cache::default();
+    let mut resume_scan: Option<Value> = None;
     while !shared.shutdown.load(Ordering::Acquire) {
         let cmd = {
             let mut q = shared.inbox.lock().unwrap();
@@ -1005,7 +1064,36 @@ fn worker(
                 "close video before changing mode"
             );
             match op {
+                "alternative" => {
+                    ensure!(
+                        before["generation"] == cmd["source_generation"],
+                        "stale source generation"
+                    );
+                    let position = cmd["source_position"].as_u64().unwrap() as usize;
+                    let p = &before["spectrum"]["positions"][position];
+                    resume_scan = Some(before["scan"].clone());
+                    pending["alternative"] = json!({"request_id":id,"source_generation":before["generation"],
+                        "source_position":position,"rf_hz":[cmd["lo_hz"],cmd["hi_hz"]],
+                        "excluded_tx_pll_hz":p["tx_pll_hz"],"excluded_rx_lo_hz":p["rx_lo_hz"]});
+                    pending["scan"]["ranges"] = json!([{"lo_hz":cmd["lo_hz"],"hi_hz":cmd["hi_hz"],"enabled":true,
+                        "path":if p["mixer"]==true {"mixer"}else{"direct"}}]);
+                    pending["scan"]["antenna_bands"] = json!(BTreeMap::from([(
+                        p["antenna"].as_u64().unwrap(),
+                        [[
+                            cmd["lo_hz"].as_u64().unwrap(),
+                            cmd["hi_hz"].as_u64().unwrap()
+                        ]]
+                    )]));
+                }
+                "cancel_alternative" | "return"
+                    if resume_scan.is_some() && previous_mode == "scan" =>
+                {
+                    pending["scan"] = resume_scan.take().unwrap();
+                    pending["alternative"] = Value::Null;
+                }
                 "scan" | "analysis" => {
+                    resume_scan = None;
+                    pending["alternative"] = Value::Null;
                     if op == "scan" && carrier.on() {
                         pending["tx"] = carrier.off()?;
                     }
@@ -1099,7 +1187,7 @@ fn worker(
                         pending["video"] = Value::Null;
                     }
                 }
-                _ => unreachable!(),
+                _ => bail!("observation already finished"),
             };
             if pending["mode"] == "scan" {
                 pending["map_version"] = json!((generation % 0x7fff_fffd) + 1);
@@ -1137,7 +1225,7 @@ fn worker(
                 if pending["running"] == true {
                     pending["spectrum"] = spectrum;
                 }
-                if word(&bytes, 12328) == 1 && word(&bytes, 12332) == 0 {
+                if word(&bytes, bytes.len() - 160) == 1 && word(&bytes, bytes.len() - 156) == 0 {
                     pending["waiting"] = json!("TX profiles loaded, mixer RF off");
                 }
                 Ok::<_, anyhow::Error>(Some(bytes))
@@ -1173,8 +1261,8 @@ fn worker(
                 });
             }
             if let Some(setup) = setup.as_mut() {
-                let expected_control = 3 | (word(setup, 12328) << 2);
-                guard_rf = word(setup, 12332) != 0;
+                let expected_control = 3 | (word(setup, setup.len() - 160) << 2);
+                guard_rf = word(setup, setup.len() - 156) != 0;
                 if guard_rf {
                     ensure!(
                         guard_cmd(&guard_fd, 0x4605)?[114] == 1,
@@ -1185,16 +1273,26 @@ fn worker(
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
                     carrier.prepare_guarded(pll)?;
                 }
-                guard(&guard_fd, 0x4601, setup.as_mut_ptr().cast())?;
+                let load_start = Instant::now();
+                let load_cmd = if word(setup, 0) == 0x3847534f {
+                    0x4608
+                } else {
+                    0x4601
+                };
+                let loaded = guard(&guard_fd, load_cmd, setup.as_mut_ptr().cast())?;
+                let load_us = load_start.elapsed().as_micros() as u64;
+                let take_start = Instant::now();
                 guard_taken = true;
                 let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })?;
                 ensure!(
                     s[1] == 2
                         && s[9] == expected_control
                         && s[112] == (!guard_rf) as u32
-                        && (!guard_rf || s[113] == word(setup, 12336)),
+                        && (!guard_rf || s[113] == word(setup, setup.len() - 152)),
                     "guard take readback"
                 );
+                actual.borrow_mut()["bank_apply"] = json!({"load_us":load_us,"take_us":take_start.elapsed().as_micros() as u64,
+                    "bytes_per_table":loaded[7],"loaded_map_version":word(setup,16)});
                 if guard_rf {
                     actual.borrow_mut()["tx"] = json!({"on":true,"powerdown":s[112],"attenuation_mdb":s[113],
                         "owner":"obs_fl_guard","carrier_source":"cyclic_fs_div_64"});
@@ -1219,6 +1317,11 @@ fn worker(
                     h.epoch
                 };
                 a["epoch"] = json!(epoch);
+                if !a["alternative"].is_null() {
+                    a["alternative"]["generation"] = json!(generation);
+                    a["alternative"]["first_epoch"] = json!(h.epoch);
+                    a["alternative"]["first_observed_arm_ns"] = json!(clock_ns());
+                }
                 let s = a["spectrum"].as_object_mut().unwrap();
                 for (k, v) in [
                     ("generation", json!(generation)),
@@ -1274,7 +1377,11 @@ fn worker(
                     version,
                     marker_position,
                     antenna,
-                    "PL",
+                    if actual.borrow()["scan"]["planner_version"] == 2 {
+                        "PLv2"
+                    } else {
+                        "PL"
+                    },
                 )
             };
             let last_renew = std::cell::Cell::new(Instant::now());
@@ -1329,6 +1436,8 @@ fn worker(
                     s[1] == 3 && s[9] == 0 && s[112] == 1,
                     "guard return credential"
                 );
+                actual.borrow_mut()["bank_apply"] = json!({"load_us":load_us,"take_us":take_start.elapsed().as_micros() as u64,
+                    "bytes_per_table":loaded[7],"loaded_map_version":word(setup,16)});
                 if guard_rf {
                     actual.borrow_mut()["tx"] = carrier.off()?;
                 }
