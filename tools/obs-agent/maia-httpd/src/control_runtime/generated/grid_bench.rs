@@ -2,11 +2,14 @@
 //! route, mixing side and calibrated TX for every contiguous compatible span.
 use super::*;
 
-pub(super) fn schedule(core: &[Tile], overlap: u64, half_pass: u64) -> Result<Vec<Tile>> {
+pub(super) fn schedule(core: &[Tile], overlap: u64, half_pass: u64, state: Option<&Value>) -> Result<Vec<Tile>> {
     let step = 2 * half_pass - overlap;
     let mut first = Vec::new();
     let mut second = Vec::new();
     let mut remaining = core;
+    let bands = parse_antenna_bands(state.map_or(&Value::Null, |s| &s["scan"]["antenna_bands"]))?;
+    let mult = environment()?.1;
+    let mut previous: Option<&Tile> = None;
     while let Some(start) = remaining.first() {
         let key = |v: &Tile| (v.rf_row, v.antenna, v.tx.map(|t| (t.pll, t.side)));
         let count = 1 + remaining.windows(2).take_while(|w|
@@ -14,6 +17,21 @@ pub(super) fn schedule(core: &[Tile], overlap: u64, half_pass: u64) -> Result<Ve
         let [lo, hi] = [start.rf[0], remaining[count - 1].rf[1]];
         let width = hi - lo;
         let cells = width.div_ceil(step);
+        if let Some((old, request)) = previous.zip(state) && old.rf_row == start.rf_row && old.rf[1] == lo {
+            let r = &request["scan"]["ranges"][start.rf_row];
+            let requested = [r["lo_hz"].as_u64().unwrap(), r["hi_hz"].as_u64().unwrap()];
+            let window = [requested[0].max(lo - 8_000_000), requested[1].min(lo + 8_000_000)];
+            if window[1] - window[0] >= 8_000_000 {
+                for candidate in [start, old] {
+                    let admits = bands.get(&candidate.antenna).is_none_or(|rs|
+                        rs.iter().any(|r| r[0] <= window[0] && window[1] <= r[1]));
+                    if admits && let Some(v) = channel_bridge(candidate, window, mult) {
+                        second.push(v);
+                        break;
+                    }
+                }
+            }
+        }
         // Equalize cells within each route so neither RF edge is lost.
         for i in 0..cells {
             let center = lo + width * (2*i + 1) / (2*cells);
@@ -22,10 +40,27 @@ pub(super) fn schedule(core: &[Tile], overlap: u64, half_pass: u64) -> Result<Ve
         for i in 0..=cells {
             second.push(position(start, [lo,hi], lo + width*i/cells, "offset")?);
         }
+        previous = Some(&remaining[count-1]);
         remaining = &remaining[count..];
     }
     first.extend(second);
     Ok(first)
+}
+
+fn channel_bridge(template: &Tile, window: [u64;2], mult: i64) -> Option<Tile> {
+    let mut v = template.clone();
+    let edges = window.map(|f| f as i64);
+    let if_edges = if let Some(old) = v.tx {
+        let tuned = choose(edges, mult, [old.pll;2], Some(old.pll), None)?;
+        if tuned.side != old.side {return None;}
+        v.tx = Some(tuned);
+        tuned.if_edges
+    } else {edges};
+    v.rx = mixer_math::place_rx(if_edges, None)? as u64;
+    v.rf = window;
+    v.grid = Some(("offset", window));
+    v.channel_bridge = true;
+    Some(v)
 }
 
 fn position(template: &Tile, bounds: [u64;2], center: u64, phase: &'static str) -> Result<Tile> {

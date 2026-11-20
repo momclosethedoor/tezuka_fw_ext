@@ -29,6 +29,7 @@ pub(super) struct Tile {
     grid: Option<(&'static str, [u64; 2])>,
     marker_path: Option<&'static str>,
     pub rf_row: usize,
+    channel_bridge: bool,
 }
 
 pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
@@ -68,11 +69,11 @@ pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>
         ensure!(matches!(overlap, 8_000_000 | 9_000_000), "unsupported bench overlap");
         let half = state["scan"]["bench_half_pass_hz"].as_u64().unwrap_or(mixer_math::HALF_PASS as u64);
         ensure!(matches!(half,23_800_000 | 27_700_000), "unsupported bench aperture");
-        let schedule = grid_bench::schedule(core, overlap, half)?;
+        let schedule = grid_bench::schedule(core, overlap, half, None)?;
         return transitions(state, &schedule);
     }
     if state["grid_27"] == true && state["alternative"].is_null() {
-        return transitions(state, &grid_bench::schedule(core, 9_000_000, 27_000_000)?);
+        return transitions(state, &grid_bench::schedule(core, 9_000_000, 27_000_000, Some(state))?);
     }
     transitions(state, core)
 }
@@ -178,6 +179,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 grid: None,
                 marker_path: None,
                 rf_row,
+                channel_bridge: false,
             });
             lo = hi;
         }
@@ -470,6 +472,7 @@ pub(super) fn encode(
             row["image_rf_ranges_hz"] = json!(tone.map(|_| useful.iter()
                 .map(|&[l,h]| [2*offset-h as i64,2*offset-l as i64]).collect::<Vec<_>>()));
             row["rf_row"] = json!(v.rf_row);
+            row["channel_bridge"] = json!(v.channel_bridge && !v.transition_only);
             row["sweep_phase"] = json!(v.grid.map(|(p,_)| if p == "main" {"A"} else {"B"}));
         }
     }

@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import statistics
+import struct
 
 
 def percentiles(sequence):
@@ -30,6 +31,33 @@ def uncovered(lo, hi, intervals):
     if lo<hi:
         result.append([lo,hi])
     return result
+
+
+def physical_passes(folder, index, desc, generation):
+    rows=desc["positions"]
+    anchor=desc["map_epoch"]
+    passes={}
+    with (folder/f"lap-{index}.dat").open("rb") as src:
+        while header:=src.read(4):
+            payload=src.read(struct.unpack("<I",header)[0])
+            for offset in range(0,len(payload),576):
+                _,_,epoch,tick,_,_,gen=struct.unpack_from("<7Q",payload,offset+8)
+                if gen!=generation or epoch<anchor:
+                    continue
+                cycle,pos=divmod(epoch-anchor,len(rows))
+                if rows[pos]["transition_only"]:
+                    continue
+                phase="AB".index(rows[pos]["sweep_phase"])
+                passes.setdefault(2*cycle+phase,{}).setdefault(pos,tick)
+    by_phase={}
+    for phase,label in enumerate("AB"):
+        expected={i for i,r in enumerate(rows) if not r["transition_only"] and r["sweep_phase"]==label}
+        complete=[(sid,ticks) for sid,ticks in passes.items() if sid%2==phase and set(ticks)==expected]
+        by_phase[label]=dict(complete=len(complete),span_ms=percentiles([
+            (ticks[max(expected)]-ticks[min(expected)])/62500 for _,ticks in complete]),
+            to_next_start_ms=percentiles([(next(iter(passes[sid+1].values()))-ticks[min(expected)])/62500
+                for sid,ticks in complete if sid+1 in passes]))
+    return by_phase
 
 
 def summarize(folder):
@@ -69,6 +97,7 @@ def summarize(folder):
                 iface_after=reader["end_interface"],regs=v["regs"])
         if d.get("sweep_wire_version")!=1:
             continue
+        item["pl_passes"] = physical_passes(folder,i,d,actual["generation"])
         item["maps"]={p:[sum(not r["transition_only"] and r["sweep_phase"]==p and r["rf_row"]==j
                            for r in d["positions"]) for j,_ in enumerate(c["command"]["ranges"])] for p in "AB"}
         item["coverage"]=[]
