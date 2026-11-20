@@ -26,6 +26,11 @@ static DECLARE_WAIT_QUEUE_HEAD(obs_wait);
 static DECLARE_COMPLETION(obs_done);
 static DEFINE_MUTEX(obs_command_lock);
 static int obs_command,obs_error,obs_state;
+/* The persistent FD used by the RF-enabled ARM owner renews a short lease.
+ * The kthread retains the SPI lock and is the only task that may hand it back. */
+static struct file *obs_rf_owner;
+static bool obs_rf_closed;
+static unsigned long obs_rf_deadline;
 static u32 obs_readback_status,obs_readback_pos,obs_readback_version;
 static u8 obs_readback[128],obs_tx_readback[128];
 static u32 obs_tx_pd,obs_tx_atten;
@@ -137,8 +142,27 @@ static int obs_return(void){int i,r;u32 v;unsigned long hz;
  mutex_unlock(&obs_phy->lock);obs_held=false;obs_state=3;up_write(&obs_gate);WRITE_ONCE(obs_block,false);return 0;
 }
 static int obs_thread(void *arg){int cmd,r;
- for(;;){wait_event(obs_wait,READ_ONCE(obs_command)!=0);cmd=READ_ONCE(obs_command);r=0;
-  if(cmd==2)r=obs_take();
+ for(;;){
+  if(READ_ONCE(obs_rf_owner) && READ_ONCE(obs_state)==2){
+   wait_event_timeout(obs_wait,READ_ONCE(obs_command)!=0,msecs_to_jiffies(100));
+   if(!READ_ONCE(obs_command) && time_after_eq(jiffies,READ_ONCE(obs_rf_deadline))){
+    if(mutex_trylock(&obs_command_lock)){
+     if(!obs_command && time_after_eq(jiffies,obs_rf_deadline)){
+      obs_error=obs_return();if(obs_error)obs_state=4;
+      WRITE_ONCE(obs_rf_owner,NULL);
+     }
+     mutex_unlock(&obs_command_lock);
+    }
+   }
+  }else wait_event(obs_wait,READ_ONCE(obs_command)!=0);
+  cmd=READ_ONCE(obs_command);if(!cmd)continue;r=0;
+  if(cmd==2){
+   r=obs_take();
+   if(r && obs_rf_owner && obs_held){
+    /* obs_take can fail while PS owns SPI or while waiting for mux ACK. */
+    if(obs_bus_locked)obs_return();else obs_tx_off();
+   }
+  }
   else if(cmd==3){if(obs_state!=2||obs_r(0x228)&16)r=-EBUSY;else{dma_wmb();obs_w(0x1f8,obs_dma[2]);obs_w(0x1fc,obs_cfg->next_count);obs_w(0x200,obs_cfg->next_version);obs_w(0x220,1);}}
   else if(cmd==4)r=obs_return();else r=-EINVAL;
   obs_error=r;if(r)obs_state=4;WRITE_ONCE(obs_command,0);complete(&obs_done);
@@ -166,12 +190,22 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
  if(cmd==0x4605){
   words[0]=2;words[1]=READ_ONCE(obs_state);words[2]=READ_ONCE(obs_error);words[3]=atomic_read(&obs_denied);
   for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=4096;
-  words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);
+  words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);words[114]=1;
   for(i=0;i<18;i++)words[16+i]=obs_r(0x224+4*i);
   words[40]=obs_readback_status;words[41]=obs_readback_pos;words[42]=obs_readback_version;memcpy(words+48,obs_readback,128);memcpy(words+80,obs_tx_readback,128);words[112]=obs_tx_pd;words[113]=obs_tx_atten;
   return copy_to_user((void __user *)arg,words,sizeof(words))?-EFAULT:0;
  }
  if(mutex_lock_interruptible(&obs_command_lock))return -EINTR;
+ if(cmd==0x4606){
+  if(obs_rf_closed || obs_rf_owner!=f || obs_state!=2){r=-ESTALE;goto out;}
+  if(time_after_eq(jiffies,obs_rf_deadline)){r=-ETIMEDOUT;goto out;}
+  WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));goto out;
+ }
+ if(cmd==0x4607){
+  if(obs_rf_owner || !obs_cfg || !obs_cfg->tx_rf_on || obs_held){r=-EBUSY;goto out;}
+  obs_rf_closed=false;WRITE_ONCE(obs_rf_owner,f);
+  WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));cmd=0x4602;
+ }else if(obs_rf_owner && obs_rf_owner!=f){r=-EBUSY;goto out;}
  if(cmd==0x4601){
   if(obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16){r=-EBUSY;goto out;}
   cfg=memdup_user((void __user *)arg,sizeof(*cfg));if(IS_ERR(cfg)){r=PTR_ERR(cfg);goto out;}
@@ -186,10 +220,20 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
   }
   reinit_completion(&obs_done);WRITE_ONCE(obs_command,cmd-0x4600);wake_up(&obs_wait);
   if(!wait_for_completion_timeout(&obs_done,msecs_to_jiffies(10000)))r=-ETIMEDOUT;else r=obs_error;
+  if(cmd==0x4604 && !r)WRITE_ONCE(obs_rf_owner,NULL);
+  if(cmd==0x4602 && obs_rf_owner==f && !r)WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));
  }else r=-ENOTTY;
 out:mutex_unlock(&obs_command_lock);return r;
 }
-static const struct file_operations obs_fops={.owner=THIS_MODULE,.unlocked_ioctl=obs_ioctl};
+static int obs_file_release(struct inode *inode,struct file *f){
+ mutex_lock(&obs_command_lock);
+ if(obs_rf_owner==f){
+  obs_rf_closed=true;WRITE_ONCE(obs_rf_deadline,jiffies);
+  if(!obs_held)WRITE_ONCE(obs_rf_owner,NULL);
+ }
+ mutex_unlock(&obs_command_lock);return 0;
+}
+static const struct file_operations obs_fops={.owner=THIS_MODULE,.unlocked_ioctl=obs_ioctl,.release=obs_file_release};
 static struct miscdevice obs_misc={.minor=MISC_DYNAMIC_MINOR,.name="obs_fl_guard",.fops=&obs_fops,.mode=0600};
 static int obs_guard_probe(struct ad9361_rf_phy *phy){int r;
  if(obs_phy)return -EBUSY;obs_csr=ioremap(0x7c460000,4096);if(!obs_csr)return -ENOMEM;
