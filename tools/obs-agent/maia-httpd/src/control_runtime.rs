@@ -1,5 +1,6 @@
 //! Interactive owner for the row99 guarded RAM runtime.
 #![allow(missing_docs)]
+mod calibration;
 mod field;
 mod plan_math;
 mod tx;
@@ -37,11 +38,13 @@ extern "C" fn shutdown_signal(_: libc::c_int) {
 #[serde(deny_unknown_fields)]
 struct Config {
     boot_id: String,
+    #[serde(default)]
     setup: PathBuf,
     output: PathBuf,
     view: SocketAddr,
     video: SocketAddr,
     route: SocketAddr,
+    #[serde(default)]
     positions: Vec<u64>,
     scan: Value,
     analysis: Value,
@@ -212,7 +215,16 @@ fn validate(v: &Value) -> Result<()> {
             let mut enabled = false;
             for r in ranges {
                 let lo = int(r, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
-                int(r, "hi_hz", lo + 120_000, plan_math::MAX_RF)?;
+                int(
+                    r,
+                    "hi_hz",
+                    lo + if v["planner_version"] == 2 {
+                        1
+                    } else {
+                        120_000
+                    },
+                    plan_math::MAX_RF,
+                )?;
                 enabled |= r["enabled"]
                     .as_bool()
                     .ok_or_else(|| anyhow!("enabled must be boolean"))?;
@@ -357,6 +369,16 @@ struct Visit {
 }
 
 fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec<u8>, Value)> {
+    plan_positions(c, &c.positions, template, state, marker)
+}
+
+fn plan_positions(
+    c: &Config,
+    positions: &[u64],
+    template: &[u8],
+    state: &Value,
+    marker: bool,
+) -> Result<(Vec<u8>, Value)> {
     use plan_math::{Candidate, Segment};
     let direct_antenna = state["route"]["antenna"].as_u64().unwrap_or(0);
     let received = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
@@ -414,10 +436,19 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
             continue;
         }
         let lo = int(row, "lo_hz", min_rf, max_rf)?;
-        let hi = int(row, "hi_hz", lo + 120_000, max_rf)?;
+        let hi = int(
+            row,
+            "hi_hz",
+            lo + if state["scan"]["planner_version"] == 2 {
+                1
+            } else {
+                120_000
+            },
+            max_rf,
+        )?;
         let mut list = Vec::new();
         if row["tx_slot"] == "auto" {
-            list = plan_math::automatic(&c.positions, &mixer, previous, lo, hi)
+            list = plan_math::automatic(positions, &mixer, previous, lo, hi)
                 .ok_or_else(|| anyhow!("RF {lo}..{hi} Hz: no complete mixer coverage"))?;
         } else if let Some(slot) = row["tx_slot"].as_u64() {
             let profile = mixer
@@ -426,15 +457,13 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
                 .ok_or_else(|| {
                     anyhow!("TX slot {slot} is unavailable for the configured antennas")
                 })?;
-            list.push(
-                plan_math::cover(&c.positions, profile, lo, hi).ok_or_else(|| {
-                    anyhow!("RF {lo}..{hi} Hz: no complete coverage with TX slot {slot}")
-                })?,
-            );
+            list.push(plan_math::cover(positions, profile, lo, hi).ok_or_else(|| {
+                anyhow!("RF {lo}..{hi} Hz: no complete coverage with TX slot {slot}")
+            })?);
         } else {
             let direct_hi = hi.min(plan_math::DIRECT_LIMIT);
             if lo < direct_hi {
-                list = plan_math::automatic(&c.positions, &direct, previous, lo, direct_hi)
+                list = plan_math::automatic(positions, &direct, previous, lo, direct_hi)
                     .ok_or_else(|| {
                         anyhow!("RF {lo}..{direct_hi} Hz: no complete calibrated direct coverage")
                     })?;
@@ -442,7 +471,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
             if hi > plan_math::DIRECT_LIMIT {
                 let mixer_lo = lo.max(plan_math::DIRECT_LIMIT);
                 let next = plan_math::automatic(
-                    &c.positions,
+                    positions,
                     &mixer,
                     list.last().map(|s| (s.slot, s.antenna)).or(previous),
                     mixer_lo,
@@ -471,7 +500,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
         if needs_route {
             let handover = if i > 0 && prior.hi == section.lo {
                 plan_math::handover(
-                    &c.positions,
+                    positions,
                     candidate_for(prior),
                     candidate,
                     [range[0].min(*prev_lo), range[1].max(*prev_hi)],
@@ -503,7 +532,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
                 });
                 overlaps.push(json!({"from":prior.antenna,"to":section.antenna,"rf_hz":rf,
                     "notify_position":before,"wait_position":before+1,
-                    "old_if_hz":c.positions[old_idx],"new_if_hz":c.positions[new_idx]}));
+                    "old_if_hz":positions[old_idx],"new_if_hz":positions[new_idx]}));
             }
         }
         let needs_immediate_hold = needs_route && visits.len() == before;
@@ -548,7 +577,7 @@ fn plan(c: &Config, template: &[u8], state: &Value, marker: bool) -> Result<(Vec
     bytes[MAP..NEXT + 4096].fill(0);
     let mut locations = Vec::with_capacity(visits.len());
     for (i, v) in visits.iter().enumerate() {
-        let intermediate = c.positions[v.index];
+        let intermediate = positions[v.index];
         let profile = v.slot.map(|slot| &c.scan_tx[slot]);
         let offset = profile.map_or(0, ScanTxProfile::offset);
         let rf = offset + v.side * intermediate as i64;
@@ -922,6 +951,7 @@ fn worker(
     let mut state = shared.inbox.lock().unwrap().actual.clone();
     let manual = state["manual_tx_available"] == true;
     let mut carrier = tx::Carrier::default();
+    let mut calibration = calibration::Cache::default();
     while !shared.shutdown.load(Ordering::Acquire) {
         let cmd = {
             let mut q = shared.inbox.lock().unwrap();
@@ -1093,7 +1123,14 @@ fn worker(
                 pending["ddc_fs_hz"] = json!(FS / 4);
             }
             if mode == "scan" {
-                let (bytes, spectrum) = plan(&c, &template, &pending, op == "route")?;
+                if pending["running"] != true {
+                    return Ok(None);
+                }
+                let (bytes, spectrum) = if pending["scan"]["planner_version"] == 2 {
+                    calibration.direct(&c, &pending, op == "route", &shared.switch)?
+                } else {
+                    plan(&c, &template, &pending, op == "route")?
+                };
                 pending["rx_gain_db"] = json!(apply_gain(&pending["scan_rx"])?);
                 if pending["running"] == true {
                     pending["spectrum"] = spectrum;
@@ -1344,7 +1381,17 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
             "TX must be off before startup"
         );
     }
-    let template = fs::read(&c.setup)?;
+    let template = if c.setup.as_os_str().is_empty() && c.scan["planner_version"] == 2 {
+        ensure!(
+            c.positions.is_empty() && c.scan_tx.is_empty(),
+            "generated catalog must start empty"
+        );
+        let mut blank = vec![0; 12488];
+        put(&mut blank, 0, 0x3747534f);
+        blank
+    } else {
+        fs::read(&c.setup)?
+    };
     ensure!(
         template.len() == 12488 && word(&template, 0) == 0x3747534f && word(&template, 12332) == 0,
         "guard template must start RF off"
@@ -1370,7 +1417,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     }
     ensure!(
         c.positions.len() == word(&template, 8) as usize
-            && (1..=128).contains(&c.positions.len())
+            && (c.positions.len() <= 128
+                && (!c.positions.is_empty() || c.scan["planner_version"] == 2))
             && c.positions.windows(2).all(|p| p[0] < p[1]),
         "calibrated position registry"
     );

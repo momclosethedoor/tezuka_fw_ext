@@ -5,6 +5,47 @@ const HALF_USEFUL: u64 = 23_800_000;
 const MIN_IF: i64 = 70_000_000;
 const MAX_IF: i64 = 6_000_000_000;
 
+/// RX PLL targets for half-open direct RF intervals. Split at antenna edges
+/// before centering each tile so a short last tile keeps its requested bins.
+pub(super) fn direct_centers(ranges: &[[u64; 2]], bands: &[[u64; 2]]) -> Result<Vec<u64>, String> {
+    let mut positions = Vec::new();
+    for &[lo, hi] in ranges {
+        if lo < MIN_IF as u64 || hi > MAX_IF as u64 || hi <= lo {
+            return Err(format!("direct RF outside tuner bounds: [{lo},{hi})"));
+        }
+        let mut cursor = lo;
+        while cursor < hi {
+            let end = if bands.is_empty() {
+                hi
+            } else {
+                bands
+                    .iter()
+                    .filter(|b| b[0] <= cursor && cursor < b[1])
+                    .map(|b| b[1].min(hi))
+                    .max()
+                    .ok_or_else(|| {
+                        let next = bands
+                            .iter()
+                            .map(|b| b[0])
+                            .filter(|a| *a > cursor)
+                            .min()
+                            .unwrap_or(hi)
+                            .min(hi);
+                        format!("no antenna covers [{cursor},{next}) Hz")
+                    })?
+            };
+            while cursor < end {
+                let edge = end.min(cursor + 2 * HALF_USEFUL);
+                positions.push(cursor + (edge - cursor) / 2);
+                cursor = edge;
+            }
+        }
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    Ok(positions)
+}
+
 pub(super) struct Candidate<'a> {
     pub offset: i64,
     pub slot: Option<usize>,
@@ -76,7 +117,10 @@ fn prefix(positions: &[u64], candidate: &Candidate<'_>, lo: u64, hi: u64) -> Opt
             positions.len() - 1 - ordinal
         };
         let rf = offset + side * positions[idx] as i64;
-        if rf < MIN_IF || rf > MAX_RF as i64 + HALF_USEFUL as i64 {
+        if !(MIN_IF as u64..=MAX_IF as u64).contains(&positions[idx])
+            || rf < 0
+            || rf > MAX_RF as i64 + HALF_USEFUL as i64
+        {
             continue;
         }
         let f = rf as u64;
@@ -217,6 +261,35 @@ mod tests {
         1_387_080_000,
     ];
     const LO: i64 = 4_501_920_000;
+
+    #[test]
+    fn owned_boundary_generated_centers_and_high_mixer_rf() {
+        let lo = 70_000_000;
+        let hi = lo + 2 * HALF_USEFUL + 1;
+        assert_eq!(
+            direct_centers(&[[lo, hi]], &[]).unwrap(),
+            [lo + HALF_USEFUL, hi - 1]
+        );
+        assert!(direct_centers(&[[lo, hi]], &[[lo, lo + 1], [lo + 2, hi]]).is_err());
+        assert!(direct_centers(&[[lo, u64::MAX]], &[]).is_err());
+        let mixer = Candidate {
+            offset: 9_500_000_000,
+            slot: Some(0),
+            antenna: 0,
+            antenna_bands: &[],
+        };
+        for center in [8_150_000_000, 10_850_000_000] {
+            assert!(
+                cover(
+                    &[1_345_000_000, 1_355_000_000],
+                    &mixer,
+                    center - 1_000_000,
+                    center + 1_000_000
+                )
+                .is_some()
+            );
+        }
+    }
 
     #[test]
     fn owned_boundary_full_range_uses_one_slot_and_labels_both_images() {
