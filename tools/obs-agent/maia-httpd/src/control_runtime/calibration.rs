@@ -67,7 +67,8 @@ fn calibrate(
 }
 
 impl Cache {
-    pub fn prepare(&mut self, pending: &Value, stop: &AtomicBool) -> Result<(Vec<u8>, Value)> {
+    pub fn prepare(&mut self, pending: &Value, shared: &Shared) -> Result<(Vec<u8>, Value)> {
+        let stop = &shared.switch;
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
         let tiles = generated::tiles(pending)?;
@@ -84,6 +85,7 @@ impl Cache {
             tx_keys.len()
         );
         let math_us = start.elapsed().as_micros() as u64;
+        shared.inbox.lock().unwrap().phase = "calibrating";
         let now = Instant::now();
         let snapshot = [
             "in_voltage_sampling_frequency",

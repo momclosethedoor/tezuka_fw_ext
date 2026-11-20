@@ -31,6 +31,18 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
     let (threshold, mult) = environment()?;
     let scan = &state["scan"];
     let bands = parse_antenna_bands(&scan["antenna_bands"])?;
+    let pll_bounds = if scan["mixer"]["pll_range_hz"].is_null() {
+        [2_250_000_000, 2_490_000_000]
+    } else {
+        let limits: [i64; 2] = serde_json::from_value(scan["mixer"]["pll_range_hz"].clone())?;
+        ensure!(
+            limits[0] >= 70_000_000
+                && limits[0] <= limits[1]
+                && limits[1] <= 6_000_000_000 - OFFSET,
+            "invalid TX PLL interval"
+        );
+        limits
+    };
     let mut tiles = Vec::new();
     let mut previous = None;
     for range in scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))? {
@@ -83,7 +95,7 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
                     choose(
                         [lo as i64, hi as i64],
                         mult,
-                        [2_250_000_000, 2_490_000_000],
+                        pll_bounds,
                         previous,
                         state["alternative"]["excluded_tx_pll_hz"].as_i64(),
                     )
@@ -309,7 +321,9 @@ pub(super) fn encode(
         }
         positions.push(json!({"rf_ranges":[v.rf],"rx_lo_hz":rx_hz,"rf_center_hz":center,"antenna":v.antenna,
             "side_sign":side,"mixer":slot.is_some(),"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
-            "mixer_lo_hz":tone.map(|_|offset),"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
+            "mixer_lo_hz":tone.map(|_|offset),"if_edges_hz":if side==1 {[a as i64-offset,b as i64-offset]}else{[offset-b as i64,offset-a as i64]},
+            "ddc_hz":0,"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
+            "tx_if_veto_hz":tone.map(|f|[f-35_520_000,f+35_520_000]),"tx_model_extrapolated":pll.is_some_and(|p|!(2_250_000_000..=2_490_000_000).contains(&p)),
             "rx_available":!v.transition_only,"transition_only":v.transition_only,"marker_route":v.notify,
             "hold_boundary":v.hold,"transition":v.handover}));
     }
@@ -321,7 +335,7 @@ pub(super) fn encode(
     );
     Ok((
         bytes,
-        json!({"rf_ranges":ranges,"positions":positions,"planner_version":2,
+        json!({"rf_ranges":ranges,"requested_ranges":state["scan"]["ranges"],"positions":positions,"planner_version":2,
         "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"first_tx_pll_hz":first.map(|s|tx[&txkeys[s]].0)}),
     ))
 }

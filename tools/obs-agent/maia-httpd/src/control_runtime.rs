@@ -163,6 +163,7 @@ impl Mixer {
 
 #[derive(Default)]
 struct Inbox {
+    phase: &'static str,
     next: Option<Value>,
     pending: Option<Value>,
     actual: Value,
@@ -303,7 +304,7 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
         "pending_id":q.next.as_ref().or(q.pending.as_ref()).map(|v|&v["id"]),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
         "route_pending":q.route_pending,"arm_clock_ns":q.receipt_ns.to_string(),
-        "command_timing":q.command_timing,"capabilities":q.capabilities,"metrics":{"owner":q.metrics,"reader":reader}}),
+        "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,"metrics":{"owner":q.metrics,"reader":reader}}),
     )
 }
 
@@ -377,6 +378,7 @@ async fn submit(
     }
     let id = id.clone();
     q.next = Some(cmd);
+    q.phase = "accepted";
     q.queued_ns = clock_ns();
     shared.switch.store(true, Ordering::Release);
     shared.wake.notify_one();
@@ -387,6 +389,13 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     let mut q = shared.inbox.lock().unwrap();
     q.pending = None;
     q.actual = state.clone();
+    q.phase = if error.is_some() {
+        "failed"
+    } else if state["running"] == true {
+        "running"
+    } else {
+        "stopped"
+    };
     q.receipt_ns = clock_ns();
     if !id.is_null() {
         q.command_timing = json!({"id":id,"received_ns":q.received_ns.to_string(),
@@ -1042,6 +1051,12 @@ fn worker(
         };
         let id = &cmd["id"];
         let before = state.clone();
+        {
+            let mut q = shared.inbox.lock().unwrap();
+            q.phase = "calculating";
+            q.actual["running"] = json!(false);
+            q.actual["spectrum"] = Value::Null;
+        }
         let op = cmd["op"].as_str().unwrap();
         let mut pending = state.clone();
         let previous_mode = pending["mode"].clone();
@@ -1217,7 +1232,7 @@ fn worker(
                     return Ok(None);
                 }
                 let (bytes, spectrum) = if pending["scan"]["planner_version"] == 2 {
-                    calibration.prepare(&pending, &shared.switch)?
+                    calibration.prepare(&pending, &shared)?
                 } else {
                     plan(&c, &template, &pending, op == "route")?
                 };
@@ -1273,6 +1288,7 @@ fn worker(
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
                     carrier.prepare_guarded(pll)?;
                 }
+                shared.inbox.lock().unwrap().phase = "loading";
                 let load_start = Instant::now();
                 let load_cmd = if word(setup, 0) == 0x3847534f {
                     0x4608
@@ -1281,6 +1297,7 @@ fn worker(
                 };
                 let loaded = guard(&guard_fd, load_cmd, setup.as_mut_ptr().cast())?;
                 let load_us = load_start.elapsed().as_micros() as u64;
+                shared.inbox.lock().unwrap().phase = "applying";
                 let take_start = Instant::now();
                 guard_taken = true;
                 let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })?;
@@ -1436,8 +1453,6 @@ fn worker(
                     s[1] == 3 && s[9] == 0 && s[112] == 1,
                     "guard return credential"
                 );
-                actual.borrow_mut()["bank_apply"] = json!({"load_us":load_us,"take_us":take_start.elapsed().as_micros() as u64,
-                    "bytes_per_table":loaded[7],"loaded_map_version":word(setup,16)});
                 if guard_rf {
                     actual.borrow_mut()["tx"] = carrier.off()?;
                 }
@@ -1656,6 +1671,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     }
     let shared = Arc::new(Shared {
         inbox: Mutex::new(Inbox {
+            phase: "stopped",
             actual: initial,
             capabilities,
             ..Inbox::default()
