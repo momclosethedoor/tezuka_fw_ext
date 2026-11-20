@@ -11,6 +11,7 @@ class Sinks:
         self.folder=folder
         self.stop=threading.Event()
         self.video={}
+        self.fields={}
         self.missing=False
         self.threads=[]
         self.sockets=[]
@@ -62,16 +63,26 @@ class Sinks:
             self.stop.wait(2.3)
 
     def real8(self,conn):
+        from sdr.source.field1_stream import Field1Stream
+        field = Field1Stream()
         with conn.makefile("rb") as stream:
             while not self.stop.is_set():
                 header=stream.read(12)
                 if not header:return
-                assert header[:4]==b"R8V1"
+                assert header[:4] in (b"R8V1", b"R8P2")
                 m,n=struct.unpack_from("<II",header,4)
-                assert m<4096 and n<=65536
+                assert m<16384 and n<=4*1024*1024
                 meta=json.loads(stream.read(m))
                 block=stream.read(n)
                 if len(block)!=n:return
+                if header[:4]==b"R8P2":
+                    field.accept(meta, block)
+                    if meta["kind"] != "data":
+                        with (self.folder/"field.ndjson").open("a") as out:
+                            print(json.dumps(meta),file=out)
+                    if meta["kind"] == "end":
+                        self.fields[meta["watch_generation"]] = meta
+                    continue
                 gen=meta["generation"]
                 if gen not in self.video:
                     (self.folder/f"real8-{gen}.bin").write_bytes(block)

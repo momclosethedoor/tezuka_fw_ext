@@ -7,6 +7,7 @@ import statistics
 import struct
 
 import numpy as np
+from planner_laps import from_capture
 
 
 def powers(folder,row):
@@ -54,7 +55,8 @@ def control(folder):
                         fresh_ms=c.get("fresh_host_ns",0)/1e6 if c.get("fresh_host_ns") else None,
                         view_generation_matches=gen==a["generation"] if gen is not None else None,
                         tiles=len(spec.get("positions",[])),prep=spec.get("preparation"),
-                        load=a.get("bank_apply"),tx=a.get("guard_tx")))
+                        load=a.get("bank_apply"),tx=a.get("guard_tx"),
+                        laps=from_capture(folder/f"lap-{i}.dat",a) if (folder/f"lap-{i}.dat").exists() else None))
     measured=[]
     for line in (folder/"owner.log").read_text(errors="replace").splitlines():
         if not line.startswith("{"):continue
