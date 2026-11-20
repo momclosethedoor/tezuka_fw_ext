@@ -1,5 +1,6 @@
 use super::*;
 use mixer_math::{OFFSET, Tuning, choose};
+mod grid_bench;
 
 pub(super) fn environment() -> Result<(u64, i64)> {
     let threshold = option_env!("GOOFY_MIXER_THRESHOLD_HZ")
@@ -25,6 +26,7 @@ pub(super) struct Tile {
     hold: bool,
     transition_only: bool,
     handover: &'static str,
+    grid: Option<(&'static str, [u64; 2])>,
 }
 
 pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
@@ -54,7 +56,18 @@ pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
 }
 
 pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
-    transitions(state, &core_tiles(state)?)
+    executable_tiles(state, &core_tiles(state)?)
+}
+
+pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
+    if let Some(overlap) = state["scan"].get("bench_overlap_hz") {
+        ensure!(state["pl_timing_only"] == true, "grid experiment requires muted timing fixture");
+        let overlap = overlap.as_u64().ok_or_else(|| anyhow!("invalid overlap"))?;
+        ensure!(matches!(overlap, 8_000_000 | 9_000_000), "unsupported bench overlap");
+        let schedule = grid_bench::schedule(core, overlap)?;
+        return transitions(state, &schedule);
+    }
+    transitions(state, core)
 }
 
 pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
@@ -155,6 +168,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 hold: false,
                 transition_only: false,
                 handover: "none",
+                grid: None,
             });
             lo = hi;
         }
@@ -410,6 +424,11 @@ pub(super) fn encode(
             "tx_if_veto_hz":tone.map(|f|[f-35_520_000,f+35_520_000]),"tx_model_extrapolated":pll.is_some_and(|p|!(2_250_000_000..=2_490_000_000).contains(&p)),
             "rx_available":!v.transition_only && !timing_only,"transition_only":v.transition_only,"marker_route":v.notify,
             "hold_boundary":v.hold,"transition":v.handover}));
+        if let Some((phase, bounds)) = v.grid && !v.transition_only {
+            let row = positions.last_mut().unwrap();
+            row["bench_grid_phase"] = json!(phase);
+            row["bench_segment_hz"] = json!(bounds);
+        }
     }
     // The guard drives TX for the full map. A mixed direct/mixer map requires
     // validated per-route gating or a measured direct model with the TX still on.

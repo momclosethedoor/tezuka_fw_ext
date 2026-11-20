@@ -11,7 +11,7 @@ const PILOT_HALF_SPAN: i64 = 61_440_000 / 2 + 4_800_000;
 pub const DC_CLEARANCE: i64 = (10 + 8) * 15_000;
 pub const HALF_PASS: i64 = 23_800_000;
 // RX readback <=10 Hz plus multiplier * TX readback <=20 Hz.
-const READBACK_MARGIN: i64 = 30;
+pub(super) const READBACK_MARGIN: i64 = 30;
 pub const TILE_WIDTH: i64 = HALF_PASS - DC_CLEARANCE - 2 * READBACK_MARGIN;
 
 pub fn place_rx(edges: [i64; 2], exclude: Option<i64>) -> Option<i64> {

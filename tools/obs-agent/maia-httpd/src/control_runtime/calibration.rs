@@ -132,7 +132,7 @@ impl Cache {
                 }
                 ensure!(cursor == hi,"uncovered RF [{cursor},{hi})");
             }
-            generated::transitions(pending,&subset)?
+            generated::executable_tiles(pending,&subset)?
         } else { generated::tiles(pending)? };
         self.prepare_tiles(pending,shared,tiles,start,cpu_start,false)
     }
