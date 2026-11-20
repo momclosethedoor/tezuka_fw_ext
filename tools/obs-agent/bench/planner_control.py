@@ -16,15 +16,22 @@ from planner_laps import Laps
 
 
 def record_laps(receiver,data,status,folder,index):
-    laps = Laps(status["actual"])
     load_test = os.environ.get("PLANNER_BENCH_LOAD") == "1"
-    deadline=time.monotonic()+(8 if load_test else 3.5)
+    wide = "PLANNER_BENCH_SWEEP" in os.environ
+    timing_position = 0
+    if wide:
+        positions = status["actual"]["spectrum"]["positions"]
+        timing_position = next((i for i,p in enumerate(positions)
+                                if not p["transition_only"] and p["marker_route"] is None), 0)
+    laps = Laps(status["actual"], timing_position)
+    deadline=time.monotonic()+(15 if wide else 8 if load_test else 3.5)
     with (folder/f"lap-{index}.dat").open("wb") as f:
         while time.monotonic()<deadline:
             if data[:8]==b"GVIEW4\0\0":
                 f.write(struct.pack("<I",len(data))+data)
                 laps.accept(data)
-                if not load_test and len(laps.ticks)>=5 and len(laps.seen)==laps.n:break
+                if wide and len(laps.ticks)>=13:break
+                if not wide and not load_test and len(laps.ticks)>=5 and len(laps.seen)==laps.n:break
             data,_=receiver.recvfrom(65535)
     return laps.result()
 
@@ -154,6 +161,8 @@ def control(log, profiles, boot):
         cfg["field_preview"] = dict(collector=remote+"/obs-field1", target_hz=2425000000, timeout_ms=90)
     if v2:
         scan["planner_version"] = 2
+        if os.environ.get("PLANNER_BENCH_TIMING_ONLY") == "1":
+            scan["bench_timing_only"] = True
         if os.environ.get("PLANNER_BENCH_PATH_ACK") == "1":
             scan["path_ack_version"] = 1
     else:
@@ -202,6 +211,10 @@ def control(log, profiles, boot):
                 direct=dict(scan,ranges=[dict(lo_hz=2400000000,hi_hz=2402000000,enabled=True)],
                             antenna_bands={"2":[[2390000000,2410000000]]})
                 cmds=[scan,direct,dict(direct,run=False)]
+            sweep = os.environ.get("PLANNER_BENCH_SWEEP")
+            if sweep:
+                cases = json.loads(Path(sweep).read_text(encoding="utf-8-sig"))
+                cmds = [dict(scan, **case) for case in cases] + [dict(scan,run=False)]
             for cmd in cmds:
                 if cmd["op"]=="alternative":
                     prev=calls[-1]["status"]["actual"]
@@ -213,12 +226,15 @@ def control(log, profiles, boot):
                 start = time.monotonic_ns()
                 accepted = a.request(url,"POST",path,dict(cmd,id=ident),timeout=2)
                 assert accepted["accepted_id"] == ident
-                while time.monotonic_ns()-start < 35_000_000_000:
-                    status = a.request(url,"GET",path,timeout=1)
+                while time.monotonic_ns()-start < (75 if sweep else 35)*1_000_000_000:
+                    status = a.request(url,"GET",path,timeout=5 if sweep else 1)
                     if ident in (status["applied_id"],status["failed_id"]): break
                     time.sleep(.02)
                 calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.monotonic_ns()-start))
                 a.write_json(log/"commands.json",calls)
+                if sweep and status["failed_id"]==ident:
+                    print("Sweep rejected:",status["error"],flush=True)
+                    continue
                 if os.environ.get("PLANNER_BENCH_PATH_TIMEOUT"):
                     assert status["failed_id"]==ident and not status["actual"]["running"]
                     assert "ACK timeout" in status["error"]
@@ -229,6 +245,11 @@ def control(log, profiles, boot):
                         break
                     raise AssertionError("VIEW arrived without initial path ACK")
                 assert status["applied_id"] == ident, status.get("error")
+                if cmd.get("run") and scan.get("bench_timing_only"):
+                    actual=status["actual"]
+                    assert actual["spectrum"]["pl_timing_only"] and not actual["spectrum"]["rf_ranges"]
+                    assert not any(p["rx_available"] for p in actual["spectrum"]["positions"])
+                    assert actual["guard_tx"]["powerdown"]==1
                 if os.environ.get("PLANNER_BENCH_PATH_RETURN") and len(calls)==2:
                     actual=status["actual"]
                     pos=actual["spectrum"]["positions"][0]

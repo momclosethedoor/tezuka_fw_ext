@@ -250,6 +250,9 @@ pub(super) fn encode(
     );
     let version = int(state, "map_version", 1, 0x7fff_fffe)? as u32;
     let stride = 32 * tiles.len().max(rx.len()).max(128);
+    // Timing fixture recalls the actual TX bank while the driver keeps RF muted.
+    let timing_only = state["pl_timing_only"] == true;
+    let tx_rf_on = !tx.is_empty() && !timing_only;
     let tail = 40 + 3 * stride;
     let mut bytes = vec![0; tail + 160];
     for (p, v) in [
@@ -268,8 +271,8 @@ pub(super) fn encode(
         (20, version + 1),
         (24, 512),
         (tail, (!tx.is_empty()) as u32),
-        (tail + 4, (!tx.is_empty()) as u32),
-        (tail + 8, if tx.is_empty() { 89750 } else { 3000 }),
+        (tail + 4, tx_rf_on as u32),
+        (tail + 8, if tx_rf_on { 3000 } else { 89750 }),
     ] {
         put(&mut bytes, p, v);
     }
@@ -342,7 +345,7 @@ pub(super) fn encode(
             put_hz(&mut bytes, at + 16, a);
             put_hz(&mut bytes, at + 24, b);
         }
-        if !v.transition_only {
+        if !v.transition_only && !timing_only {
             ranges.push(v.rf);
         }
         positions.push(json!({"rf_ranges":[v.rf],"rx_lo_hz":rx_hz,"rf_center_hz":center,"antenna":v.antenna,
@@ -352,18 +355,18 @@ pub(super) fn encode(
             "image_in_antenna":tone.and_then(|_|antennas.get(&v.antenna).map(|bands|bands.iter().any(|r|
                 (r[0] as i64)<2*offset-a as i64 && (r[1] as i64)>2*offset-b as i64))),
             "tx_if_veto_hz":tone.map(|f|[f-35_520_000,f+35_520_000]),"tx_model_extrapolated":pll.is_some_and(|p|!(2_250_000_000..=2_490_000_000).contains(&p)),
-            "rx_available":!v.transition_only,"transition_only":v.transition_only,"marker_route":v.notify,
+            "rx_available":!v.transition_only && !timing_only,"transition_only":v.transition_only,"marker_route":v.notify,
             "hold_boundary":v.hold,"transition":v.handover}));
     }
     // The guard drives TX for the full map. A mixed direct/mixer map requires
     // validated per-route gating or a measured direct model with the TX still on.
     ensure!(
-        tx.is_empty() || tiles.iter().all(|t| t.tx.is_some()),
+        !tx_rf_on || tiles.iter().all(|t| t.tx.is_some()),
         "direct/mixer map needs TX gating at route boundary"
     );
     Ok((
         bytes,
         json!({"rf_ranges":ranges,"requested_ranges":state["scan"]["ranges"],"positions":positions,"planner_version":2,
-        "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"first_tx_pll_hz":first.map(|s|tx[&txkeys[s]].0)}),
+        "pl_timing_only":timing_only,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"first_tx_pll_hz":first.map(|s|tx[&txkeys[s]].0)}),
     ))
 }

@@ -4,11 +4,12 @@ import struct
 
 
 class Laps:
-    def __init__(self, actual):
+    def __init__(self, actual, timing_position=0):
         spectrum = actual["spectrum"]
         self.n = len(spectrum["positions"])
         self.anchor = spectrum["map_epoch"]
         self.generation = actual["generation"]
+        self.timing_position = timing_position
         self.seen = set()
         self.boundaries = []
         self.ticks = []
@@ -25,7 +26,7 @@ class Laps:
                 continue
             pos = (epoch - self.anchor) % self.n
             self.seen.add(pos)
-            if pos == 0 and (not self.boundaries or epoch != self.boundaries[-1]):
+            if pos == self.timing_position and (not self.boundaries or epoch != self.boundaries[-1]):
                 self.boundaries.append(epoch)
                 self.ticks.append(tick)
             if self.last is not None:

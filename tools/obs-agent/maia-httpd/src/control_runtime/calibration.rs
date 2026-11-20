@@ -72,7 +72,7 @@ impl Cache {
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
         let tiles = generated::tiles(pending)?;
-        if tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
+        if pending["pl_timing_only"] != true && tiles.iter().any(|t| t.tx.is_some()) && tiles.iter().any(|t| t.tx.is_none()) {
             let requested = pending["scan"]["ranges"]
                 .as_array()
                 .into_iter()

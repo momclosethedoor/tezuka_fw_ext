@@ -69,6 +69,13 @@ class Sinks:
         fields=[event[k] for k in ("generation","version","epoch","position","marker_id","route")]
         def ack(f):
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
+        if os.environ.get("PLANNER_BENCH_SWEEP"):
+            received=time.monotonic_ns()
+            conn.sendall(ack(fields))
+            with (self.folder/"antenna.ndjson").open("a") as out:
+                print(json.dumps(dict(event=event,host_ns=received,host_ack_ns=time.monotonic_ns(),
+                                      correct_ack=True,physical_switch=False)),file=out)
+            return
         old=fields.copy()
         old[0]-=1
         wrong=fields.copy()

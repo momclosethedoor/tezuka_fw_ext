@@ -1109,6 +1109,10 @@ fn worker(
         pending["failed_plan"] = Value::Null;
         pending["field_watch"] = Value::Null;
         let config_result = (|| {
+            if pending["pl_timing_only"] == true {
+                ensure!(op == "scan" && cmd["planner_version"] == 2,
+                        "PL timing fixture accepts v2 scan commands only");
+            }
             ensure!(
                 previous_mode != "video" || op == "return" || op == "tx",
                 "close video before changing mode"
@@ -1708,7 +1712,11 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         Some(mixer) => mixer.route(),
         None => json!({"kind":"direct","antenna":0,"multiplier":1,"side":1}),
     };
+    let pl_timing_only = c.scan["bench_timing_only"] == true;
+    ensure!(!pl_timing_only || (c.external_mixer.is_none() && c.field_preview.is_none()
+            && c.scan["planner_version"] == 2), "PL timing fixture requires a v2 scan-only configuration");
     let initial = json!({"mode":initial_mode,"generation":clock_ns()/1000,"map_version":1,"epoch":0,"boot":c.boot_id,
+        "pl_timing_only":pl_timing_only,
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
