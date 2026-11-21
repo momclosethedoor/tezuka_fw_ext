@@ -38,12 +38,21 @@ fn replay(q:Replay,s:Shared,warmup:f64)->Result<Value>{
 pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  let listener=tokio::net::TcpListener::bind(listen).await?;
  let c:Config=serde_json::from_slice(&std::fs::read(path)?)?;
- ensure!(c.reader["hot"]==true&&c.reader["scan"]==true&&c.reader["k"]==2&&c.reader["mode"]==1,"guarded K2 VIEW512 only");
+ let capture=c.reader["command"]=="capture";
+ let view_mode=c.reader["mode"].as_u64();
+ ensure!(c.reader["hot"]==true&&c.reader["scan"]==true&&c.reader["k"]==2&&
+        (view_mode==Some(1)||capture&&matches!(view_mode,Some(2|3))),
+        "guarded K2 VIEW512, or offline reference capture in VIEW1024/2048");
  ensure!(std::fs::read_to_string("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()=="1","TX must be off");
  ensure!(c.reader["boot_id"].as_str()==Some(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()),"boot mismatch");
  let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard")?;let mut setup=std::fs::read(&c.setup)?;
  ensure!(setup.len()==12488,"calibrated map layout");
  let rf_on=u32::from_le_bytes(setup[12332..12336].try_into().unwrap());
+ if capture {
+  ensure!(rf_on==0 && c.replay.is_none() && c.reader["udp"].is_null()
+          && c.reader["seconds"].as_f64().is_some_and(|t| t>0. && t<=0.05),
+          "reference capture requires RX only, no network output and at most 50 ms");
+ }
  ensure!((rf_on==0&&!c.tx_authorized&&c.reader["tx_active"]!=true)||(rf_on==1&&c.tx_authorized&&c.reader["tx_active"]==true),"RF-on requires explicit operator-series authorization and declared reader mode");
  ensure!(unsafe{libc::ioctl(guard.as_raw_fd(),0x4601,setup.as_mut_ptr())}==0,"guard load");
  let taken=match guard_ioctl(&guard,0x4602){Ok(v)=>v,Err(e)=>{let _=guard_ioctl(&guard,0x4604);return Err(e)}};

@@ -2,6 +2,7 @@ use std::{io,net::UdpSocket,time::{Duration,Instant}};
 pub struct UdpBatch {
  pub bytes:Vec<u8>,pub pending:u64,pub sent:u64,pub dropped:u64,pub datagrams:u64,pub send_calls:u64,
  pub mtu:Option<u32>,pub ip_fragmentation:bool,
+ pub oldest_wait_bins:[u64;32],
  pub max_records:usize,pub phase_on:bool,pub send_ns:u128,pub coalesce_us:u64,pub max_wait_ns:u128,
  pub sent_bytes:u64,pub high_records:u64,pub would_block:u64,pub send_errors:u64,
  pub last_errno:Option<i32>,pub notes_sent:u64,pub notes_lost:u64,pub transition:u64,
@@ -12,7 +13,7 @@ impl UdpBatch {
  pub fn configured(coalesce_us:u64,phase_on:bool,max_records:usize,record_size:usize)->Self {
   assert!(matches!(max_records,1|2|4|8|16));
   Self{max_records,bytes:Vec::with_capacity(record_size*max_records),pending:0,sent:0,dropped:0,datagrams:0,
-   phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,send_calls:0,mtu:None,ip_fragmentation:false,
+   phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,send_calls:0,mtu:None,ip_fragmentation:false,oldest_wait_bins:[0;32],
    sent_bytes:0,high_records:0,would_block:0,send_errors:0,last_errno:None,
    notes_sent:0,notes_lost:0,transition:0,rejected_before_queue:0,suppressed:0}
  }
@@ -53,7 +54,15 @@ impl UdpBatch {
  pub fn flush(&mut self,s:&UdpSocket){
   if self.pending==0{return}
   self.high_records=self.high_records.max(self.pending);
-  let now=Instant::now();if let Some(t)=self.first{self.max_wait_ns=self.max_wait_ns.max(now.duration_since(t).as_nanos());}
+  let now=Instant::now();
+  if let Some(t)=self.first {
+   let age=now.duration_since(t).as_nanos();
+   self.max_wait_ns=self.max_wait_ns.max(age);
+   if self.phase_on {
+    let upper_exponent=u128::BITS-age.saturating_sub(1).leading_zeros();
+    self.oldest_wait_bins[upper_exponent.min(31) as usize]+=1;
+   }
+  }
   for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
    self.send_calls+=1;
    match s.send(packet){

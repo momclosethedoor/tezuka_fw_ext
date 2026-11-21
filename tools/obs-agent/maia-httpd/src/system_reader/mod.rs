@@ -343,6 +343,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   save(c,"unreleased.json",&io.counters()?)?;
   // Heavy whole-ring evidence is outside every rate window, before ANY release.
   for(r,n)in[(0,0x2000000),(1,0x200000)]{let mut b=vec![0;n];io.copy(r,0,&mut b)?;std::fs::write(c.output.join(if r==0{"full-ring.bin"}else{"view-ring.bin"}),b).map_err(|e|e.to_string())?;io.give_back()?;}
+  // Diagnostic export owns both copied rings. Drain the descriptor tail
+  // before handing the radio back, so another diagnostic can start safely.
+  let drained=io.snapshot()?;
+  io.release(drained.cookie,drained.committed)?;
   return Ok(())
  }
  if c.command!="rate"&&c.command!="drain"{return Err("command must be capture, drain, rate".into())}
@@ -490,5 +494,5 @@ impl UdpBatch {
   "rejected_before_queue":self.rejected_before_queue,"transition_records":self.transition,"suppressed_records":self.suppressed,
   "completion_sent":self.notes_sent,"completion_send_drop":self.notes_lost,
   "send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,
-  "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string()})}
+  "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string(),"oldest_view_wait_ns_pow2":self.phase_on.then_some(self.oldest_wait_bins),})}
 }
