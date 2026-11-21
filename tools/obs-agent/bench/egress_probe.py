@@ -47,8 +47,9 @@ def row(lo, hi):
 
 
 class Receiver(Sinks):
-    def __init__(self, folder, capture_pal=False):
+    def __init__(self, folder, capture_pal=False, window_s=30):
         self.capture_pal = capture_pal
+        self.window_ns = window_s * 1_000_000_000
         self.acks = 0
         self.pause_video = threading.Event()
         self.video_established = threading.Event()
@@ -192,7 +193,7 @@ class Receiver(Sinks):
                         raise ValueError("invalid R8V1 payload/context")
                     v = self.video_stats.setdefault(gen, dict(first_ns=now, last_ns=now, packets=0,
                         bytes=0, wire_bytes=0, pos=meta["pos"], gap_bytes=0, sequence_gaps=0,
-                        seq=meta["seq"], reset_count=0, intervals=[]))
+                        seq=meta["seq"], reset_count=0, intervals=[], window_bytes=0, window_packets=0))
                     if v["packets"]:
                         v["intervals"].append(now-v["last_ns"])
                     v["gap_bytes"] += abs(v["pos"]-meta["pos"])
@@ -204,6 +205,9 @@ class Receiver(Sinks):
                     v["packets"] += 1
                     v["bytes"] += n
                     v["wire_bytes"] += n + m + HEADER.size
+                    if now-v["first_ns"] < self.window_ns:
+                        v["window_bytes"] += n
+                        v["window_packets"] += 1
                     if self.capture_pal:
                         if not clips:
                             clips[gen] = meta, bytearray()
@@ -233,6 +237,11 @@ class Receiver(Sinks):
             if d:
                 row["interarrival_ms"] = {k:d[round((len(d)-1)*p)]/1e6 for k,p in (
                     ("p50", .5), ("p95", .95), ("p99", .99), ("max", 1))}
+            if source["window_packets"] >= 2 and source["last_ns"]-source["first_ns"] >= self.window_ns:
+                window = sorted(source["intervals"][:source["window_packets"]-1])
+                row["fixed_window"] = dict(seconds=self.window_ns/1e9, bytes=source["window_bytes"],
+                    frames=source["window_packets"], interarrival_ms={k:window[round((len(window)-1)*p)]/1e6
+                    for k,p in (("p50", .5), ("p95", .95), ("p99", .99), ("max", 1))})
             snapshots[generation] = row
         return dict(video=snapshots, views=self.views, field=self.field_stats,
                     malformed_udp=self.malformed_udp, tcp_errors=self.protocol_errors, ack_stub=self.acks)
@@ -342,7 +351,7 @@ def main():
         cfg = folder/"egress-config.json"
         board.write_json(cfg, config)
         board.upload(cfg, remote, cfg.name)
-        receiver = Receiver(folder, args.pal_check)
+        receiver = Receiver(folder, args.pal_check, args.seconds)
         lease_stop, lease_ready, silence = threading.Event(), threading.Event(), threading.Event()
         lease = threading.Thread(target=lease_loop, args=(lease_stop, lease_ready, folder, silence), daemon=True)
         lease.start()

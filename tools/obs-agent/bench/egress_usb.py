@@ -124,7 +124,8 @@ def measure(board, folder, seconds, expected_lo, host_sample):
                 break
         else:
             raise RuntimeError("native ARM handoff not armed")
-        intervals, calls = [], []
+        intervals, calls, window_intervals = [], [], []
+        window_bytes = 0
         last, first = None, None
         bytes_received = 0
         clip = bytearray()
@@ -171,6 +172,10 @@ def measure(board, folder, seconds, expected_lo, host_sample):
                     deadline = first + seconds*1_000_000_000
                 else:
                     intervals.append(now-last)
+                if now < deadline:
+                    window_bytes += block_bytes
+                    if last is not None:
+                        window_intervals.append(now-last)
                 last = now
                 calls.append(now-before)
                 bytes_received += block_bytes
@@ -186,6 +191,8 @@ def measure(board, folder, seconds, expected_lo, host_sample):
             first_after_stream_start_ms=(first-stream_started)/1e6 if first else None,
             interval_s=(last-first)/1e9 if first and last else None,
             interarrival_ms=quantiles(intervals), dequeue_wall_ms=quantiles(calls), source_errors=source_errors,
+            fixed_window=(dict(seconds=seconds, bytes=window_bytes, frames=window_bytes//block_bytes,
+                interarrival_ms=quantiles(window_intervals)) if first and last >= deadline else None),
             expected_rf_lo=expected_lo, effective_ddc_fs=15_360_000, process=resources,
             host_os=os.name, continuity_limit="IIO block size and cadence; no native source sequence")
         board.write_json(folder/"native-usb.json", result)
