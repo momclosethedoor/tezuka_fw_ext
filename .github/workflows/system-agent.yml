@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001]
+    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-view-opt-001-reference]
     paths: ['tools/obs-agent/**', 'tools/obs-guard/obs-field1.c', '.github/workflows/system-agent.yml']
   workflow_dispatch:
 permissions:

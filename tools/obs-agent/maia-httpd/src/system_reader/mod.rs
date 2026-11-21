@@ -325,7 +325,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  // The managed control sink delivers VIEW. Full FFT ownership and diagnostic
  // captures use the separate local reader paths.
- let managed_view_only=control.is_some();
+ let managed_view_only=control.is_some()&&c.scan&&c.k==1&&c.direct;
  let mut io=Hardware::open(c,managed_view_only)?;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
