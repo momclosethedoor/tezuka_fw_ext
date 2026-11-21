@@ -1863,8 +1863,9 @@ fn worker(
             let work = c.output.join("reader");
             let k = actual.borrow()["k"].clone();
             let mode_index = view_mode(&actual.borrow()[&mode])?;
-            let previous_mode = regs.read(0x1a4) & 3;
-            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":previous_mode,
+            // A drained START sets the new split544 width. The setup CSR
+            // is not a readback credential for the first record's prefix.
+            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":mode_index,
                 "seconds":1.0,"warmup":0.0,"shift544":true,"settling":0,"batch_limit":64,"direct":true,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});

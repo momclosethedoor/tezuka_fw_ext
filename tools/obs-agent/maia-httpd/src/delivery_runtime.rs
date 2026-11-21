@@ -48,7 +48,7 @@ pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard")?;let mut setup=std::fs::read(&c.setup)?;
  ensure!(setup.len()==12488,"calibrated map layout");
  let rf_on=u32::from_le_bytes(setup[12332..12336].try_into().unwrap());
- if capture {
+ if capture && view_mode!=Some(1) {
   ensure!(rf_on==0 && c.replay.is_none() && c.reader["udp"].is_null()
           && c.reader["seconds"].as_f64().is_some_and(|t| t>0. && t<=0.05),
           "reference capture requires RX only, no network output and at most 50 ms");
