@@ -33,11 +33,14 @@ static int obs_command,obs_error,obs_state;
 /* The persistent FD used by the RF-enabled ARM owner renews a short lease.
  * The kthread retains the SPI lock and is the only task that may hand it back. */
 static struct file *obs_rf_owner;
+/* PS-controlled carrier ownership ends with the last reference to this FD. */
+static struct file *obs_ps_rf_owner;
 static bool obs_rf_closed;
 static unsigned long obs_rf_deadline;
 #define OBS_TAKE_ASYNC 0x4609
 #define OBS_TAKE_CANCEL 0x460a
 #define OBS_TAKE_GET 0x460b
+#define OBS_PS_RF_CLAIM 0x460c
 #define OBS_TAKE_MS 1000
 #define OBS_OWNER_LEASE_MS 750
 #define OBS_TRACE_LEN 64
@@ -562,7 +565,7 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
   words[0]=2;words[1]=READ_ONCE(obs_state);words[2]=READ_ONCE(obs_error);words[3]=atomic_read(&obs_denied);
   for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=obs_alloc_bytes?:4096;words[115]=65535;words[116]=1;
   words[117]=obs_r(OBS_GATE_ID_REG);
-  words[125]=1;
+  words[125]=1;words[126]=1;
   if(words[117]==OBS_GATE_ID)obs_gate_snapshot(words);
   words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);words[114]=1;
   for(i=0;i<18;i++)words[16+i]=obs_r(0x224+4*i);
@@ -573,6 +576,14 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
  /* The previous worker owns the command slot until it has completed every
   * cleanup step, even when a synchronous caller has returned on timeout. */
  if(READ_ONCE(obs_command)){r=-EBUSY;goto out;}
+ if(cmd==OBS_PS_RF_CLAIM){
+  if(obs_ps_rf_owner || obs_rf_owner || obs_held || obs_r(0x1e0) || obs_r(0x228)&7){
+   r=-EBUSY;goto out;
+  }
+  obs_ps_rf_owner=f;
+  goto out;
+ }
+ if(obs_ps_rf_owner){r=-EBUSY;goto out;}
  if(cmd==OBS_TAKE_ASYNC){
   if(!id || !obs_cfg || !obs_cfg->tx_rf_on || !(obs_cfg->extra_reserved & OBS_GATE_OPT)){r=-EINVAL;goto out;}
   if(obs_rf_owner || obs_held || obs_r(0x1e0) || obs_r(0x228)&7 || obs_r(0x64)!=16){r=-EBUSY;goto out;}
@@ -632,6 +643,15 @@ out:mutex_unlock(&obs_command_lock);return r;
 static int obs_file_release(struct inode *inode,struct file *f){
  unsigned long flags;
  mutex_lock(&obs_command_lock);
+ if(obs_ps_rf_owner==f){
+  int r;
+
+  mutex_lock(&obs_phy->lock);
+  r=obs_tx_off();
+  mutex_unlock(&obs_phy->lock);
+  if(r)dev_err(&obs_phy->spi->dev,"PS RF owner exit: TX mute readback failed (%d)\n",r);
+  obs_ps_rf_owner=NULL;
+ }
  spin_lock_irqsave(&obs_operation_lock,flags);
  if(obs_rf_owner==f){
   if(obs_operation.state==OBS_PENDING && !obs_execution)obs_cancelled=true;

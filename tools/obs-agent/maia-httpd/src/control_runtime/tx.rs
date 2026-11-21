@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+const PS_RF_CLAIM: libc::c_ulong = 0x460c;
 const IIO_TX: &str = "/usr/bin/iio_writedev";
 const OFF: &str = "/usr/sbin/goofy_tx_off";
 const DEVICE: &str = "cf-ad9361-dds-core-lpc";
@@ -30,6 +31,22 @@ pub fn lock_radio(cancel: &AtomicBool) -> Result<File> {
         let err=std::io::Error::last_os_error();
         if err.kind()!=ErrorKind::WouldBlock {return Err(err.into());}
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub fn child_follows_owner(cmd: &mut Command) {
+    let owner = unsafe { libc::getpid() };
+    // IIO buffer descriptors belong to the ARM process.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != owner {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
     }
 }
 
@@ -141,8 +158,14 @@ impl Drop for LeaseDecisions {
     }
 }
 
+struct ProcessOwner {
+    guard: File,
+    radio: File,
+}
+
 #[derive(Default)]
 pub struct Carrier {
+    process_owner: Option<ProcessOwner>,
     lease: Option<LeaseDecisions>,
     child: Option<Child>,
     device: Option<PathBuf>,
@@ -153,6 +176,24 @@ impl Carrier {
         self.child.is_some()
     }
 
+    pub fn radio_lock(&self, cancel: &AtomicBool) -> Result<File> {
+        match &self.process_owner {
+            Some(owner) => Ok(owner.radio.try_clone()?),
+            None => lock_radio(cancel),
+        }
+    }
+
+    pub fn take_process_ownership(&mut self, radio: &File) -> Result<Value> {
+        if self.process_owner.is_none() {
+            let guard = OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard")?;
+            if unsafe { libc::ioctl(guard.as_raw_fd(), PS_RF_CLAIM) } != 0 {
+                return Err(anyhow!("PS RF owner claim: {}", std::io::Error::last_os_error()));
+            }
+            self.process_owner = Some(ProcessOwner { guard, radio: radio.try_clone()? });
+        }
+        self.verify()
+    }
+
     pub fn off(&mut self) -> Result<Value> {
         // Gate before tearing down the buffer. Drop also closes a partially opened child.
         let gate = Command::new(OFF)
@@ -160,7 +201,13 @@ impl Carrier {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        self.close_buffer(false)?;
+        let closed = self.close_buffer(false);
+        if let Some(ProcessOwner { guard, radio }) = self.process_owner.take() {
+            // Close the safety FD while legacy writers are still excluded.
+            drop(guard);
+            drop(radio);
+        }
+        closed?;
         ensure!(gate?.success(), "TX gate did not confirm");
         self.muted_readback()
     }
@@ -289,18 +336,7 @@ impl Carrier {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-        let parent = unsafe { libc::getpid() };
-        // If this worker is killed, release the cyclic buffer with the parent.
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
-                    || libc::getppid() != parent
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        child_follows_owner(&mut cmd);
         self.child = Some(cmd.spawn()?);
         self.device = Some(device);
         let child = self.child.as_mut().unwrap();
@@ -374,7 +410,8 @@ impl Carrier {
     }
 
     pub fn verify(&mut self) -> Result<Value> {
-        ensure!(lease_is_live(), "TX lease lost");
+        let local = self.process_owner.is_some();
+        ensure!(local || lease_is_live(), "TX lease lost");
         ensure!(
             self.child
                 .as_mut()
@@ -382,7 +419,7 @@ impl Carrier {
                 && self.device.as_ref().is_some_and(|d| buffer_enabled(d)),
             "cyclic carrier stopped"
         );
-        let result = readback(OFFSET)?;
+        let mut result = readback(OFFSET)?;
         ensure!(
             result["powerdown"] == 0
                 && result["frequency_hz"]
@@ -390,6 +427,7 @@ impl Carrier {
                     .is_some_and(|f| f.abs_diff(self.frequency_hz) <= 10),
             "TX readback changed"
         );
+        result["owner"] = json!(if local { "arm_process" } else { "client_lease" });
         Ok(result)
     }
 }

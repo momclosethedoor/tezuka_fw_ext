@@ -1180,7 +1180,6 @@ fn continuous(
     state: &Value,
     id: &Value,
     regs: &Registers,
-    verify_tx: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     ensure!(
         regs.read(0x64) == 16 && regs.read(0x1e0) == 0 && regs.read(0x284) == 0,
@@ -1208,12 +1207,13 @@ fn continuous(
     regs.write(0x30, phase);
     regs.write(0x38, 1);
     regs.write(0x40, 24);
-    let spawned = Command::new("iio_readdev")
+    let mut reader = Command::new("iio_readdev");
+    reader
         .args(["-b", "8192", "cf-ad9361-lpc", "voltage0", "voltage1"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let result = match spawned {
+        .stderr(Stdio::null());
+    tx::child_follows_owner(&mut reader);
+    let result = match reader.spawn() {
         Ok(mut child) => {
             let result = (|| {
                 let mut stdout = child
@@ -1238,14 +1238,8 @@ fn continuous(
                 ensure!(regs.read(0x284) == 1, "stream_run readback");
                 let mut bytes = [0u8; video_egress::MAX_BLOCK_BYTES];
                 let mut have = 0;
-                let mut lo_check = Instant::now();
                 let mut status_due = Instant::now();
-                let mut last_read = Instant::now();
                 while !shared.switch.load(Ordering::Acquire) {
-                    if lo_check.elapsed() >= Duration::from_millis(200) {
-                        verify_tx()?;
-                        lo_check = Instant::now();
-                    }
                     let previous_sent = queue.counts.frames;
                     let sent = queue.pump(&mut conn).map_err(|e| anyhow!("real8 socket send: {e}"))?;
                     if previous_sent == 0 && queue.counts.frames != 0 {
@@ -1262,7 +1256,6 @@ fn continuous(
                         Ok(n) => {
                             queue.counts.source_reads += 1;
                             queue.counts.source_bytes += n as u64;
-                            last_read = Instant::now();
                             n
                         }
                         Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => 0,
@@ -1284,10 +1277,6 @@ fn continuous(
                         status_due = Instant::now();
                     }
                     if !sent && n == 0 {
-                        if last_read.elapsed() >= Duration::from_secs(3) {
-                            queue.counts.source_errors += 1;
-                            bail!("IIO real8 pipe stalled");
-                        }
                         let mut fds = [
                             libc::pollfd {fd, events:libc::POLLIN, revents:0},
                             libc::pollfd {fd:conn.as_raw_fd(), events:libc::POLLOUT, revents:0},
@@ -1454,7 +1443,7 @@ fn worker(
         let (radio_lock, lock_error) = if manual && pending["xtg1_wait_ticks"].is_number()
             && (matches!(op,"antennas"|"scan"|"alternative"|"cancel_alternative")
                 || op == "return" && pending["return_mode"] == "scan") {
-            match tx::lock_radio(&shared.switch) {
+            match carrier.radio_lock(&shared.switch) {
                 Ok(file) => (Some(file), None),
                 Err(error) => (None, Some(error)),
             }
@@ -1695,15 +1684,19 @@ fn worker(
                 return Ok(());
             }
             if mode == "video" {
-                return continuous(&c, &shared, &actual.borrow(), id, &regs, &mut || {
+                let _radio = if c.external_mixer.is_none() {
+                    // The stock lease daemon uses the same lock for its legacy
+                    // TX and DDC writer. Keep it excluded throughout capture.
+                    let radio = carrier.radio_lock(&shared.switch)?;
                     if carrier.on() {
-                        carrier.verify()?;
+                        let confirmed = carrier.take_process_ownership(&radio)?;
+                        actual.borrow_mut()["tx"] = confirmed;
                     }
-                    if let Some(mixer) = &c.external_mixer {
-                        mixer.confirm_tx()?;
-                    }
-                    Ok(())
-                });
+                    Some(radio)
+                } else {
+                    None
+                };
+                return continuous(&c, &shared, &actual.borrow(), id, &regs);
             }
             let mut sweep = None;
             let mut next_spectrum = None;
@@ -2417,7 +2410,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let (threshold, mult) = generated::environment()?;
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
-    let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
+    let capabilities = json!({"tx_on":manual,"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
