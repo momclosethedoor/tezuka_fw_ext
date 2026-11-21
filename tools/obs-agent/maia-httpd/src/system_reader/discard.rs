@@ -5,7 +5,7 @@ pub(super) fn execute(c:&Config)->R<()>{
  let scope=c.diagnostic_sync.as_deref().unwrap();
  if !matches!(scope,"none"|"header"|"all")||c.mode!=1||!c.shift544||c.previous_mode!=1||c.udp.is_some()||c.save_ring||c.owned_pipeline{return Err("discard diagnostic: fixed split544 VIEW512, no network/ring export/private queue".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
- let mut io=Hardware::open(c)?;io.prepare(c)?;io.start()?;
+ let mut io=Hardware::open(c,false)?;io.prepare(c)?;io.start()?;
  let initial=io.snapshot()?;let run=initial.cookie;let mut next=initial.released;let mut read=0u64;
  let start=Instant::now();let mut begin=None;let mut end=None;let mut begin_epoch=u64::MAX;let mut end_epoch=u64::MAX;
  let mut valid=0u64;let mut stale=0u64;let mut invalid=0u64;let mut reversed=0u64;let mut last:Option<Header>=None;let mut unique=0u64;let mut last_counted=None;let mut duplicates=0u64;let mut inside_hold_missing=0u64;let mut first_gap=None;
