@@ -20,15 +20,23 @@ def stage_executables(*args, **kwargs):
     api.ssh(f"cd {api.REMOTE} && chmod 700 cap2-run sig0-arm")
     if image := os.environ.get("PLANNER_BENCH_XTG1"):
         image = Path(image)
-        expected = "a79c03ace0524a43b4ee90a1582fe01ebec4e0f368ab0a98138eb78e1c1ed5f8"
-        assert image.stat().st_size == 1_124_992 and api.digest(image) == expected
+        variants = {
+            "a79c03ace0524a43b4ee90a1582fe01ebec4e0f368ab0a98138eb78e1c1ed5f8": (1_124_992, b""),
+            "07399ea386ed080b49e130d0d58db32627abf3f406c1b6d036c38370004ae94b": (
+                1_083_552, b'test "$(devmem 0x7c46033c)" = 0x00000000\necho XTG1_CONTROL=1\n'
+            ),
+        }
+        expected = api.digest(image)
+        if expected not in variants or image.stat().st_size != variants[expected][0]:
+            raise ValueError("Unrecognized XTG1 RAM image or size")
         log = args[0]
         loader = log / "loader/check-row99.sh"
         original = "7401ebc0de93033f6388c3c081561e61a5a9004f029c25fe0551caa719ecab78"
         script = loader.read_bytes()
         assert script.count(original.encode()) == 1
         loader.write_bytes(script.replace(original.encode(), expected.encode()) +
-                           b'\ntest "$(devmem 0x7c460328)" = 0x31475458\necho XTG1_ID=0x31475458\n')
+                           b'\ntest "$(devmem 0x7c460328)" = 0x31475458\necho XTG1_ID=0x31475458\n' +
+                           variants[expected][1])
         api.upload(image, api.REMOTE, "row99.bit.bin")
         api.upload(loader, api.REMOTE, loader.name)
         board = log / "staged.json"

@@ -57,12 +57,13 @@ def physical_passes(folder, index, desc, generation):
             (ticks[max(expected)]-ticks[min(expected)])/62500 for _,ticks in complete]),
             to_next_start_ms=percentiles([(next(iter(passes[sid+1].values()))-ticks[min(expected)])/62500
                 for sid,ticks in complete if sid+1 in passes]))
-    waits=[]
+    waits={"A_to_B": [], "B_to_A": []}
     targets=desc["requested_ranges"]
     for sid,first in passes.items():
-        if sid%2 or sid+1 not in passes:
+        if sid+1 not in passes:
             continue
         second=passes[sid+1]
+        direction="B_to_A" if sid%2 else "A_to_B"
         for index,tick in first.items():
             row=rows[index]
             center=row["rf_center_hz"]
@@ -73,10 +74,10 @@ def physical_passes(folder, index, desc, generation):
             clean=lambda p: rows[p]["rf_row"]==rf_row and any(a<=center<b for a,b in rows[p]["rf_ranges"])
             if any(clean(p) for p in first):
                 continue
-            candidates=[t for p,t in second.items() if clean(p)]
+            candidates=[t for p,t in second.items() if t>=tick and clean(p)]
             if candidates:
-                waits.append((min(candidates)-tick)/62500)
-    return by_phase,percentiles(waits)
+                waits[direction].append((min(candidates)-tick)/62500)
+    return by_phase,{direction:percentiles(values) for direction,values in waits.items()}
 
 
 def summarize(folder):
@@ -116,7 +117,11 @@ def summarize(folder):
                 iface_after=reader["end_interface"],regs=v["regs"])
         if d.get("sweep_wire_version")!=1:
             continue
-        item["pl_passes"],item["dc_closure_ms"] = physical_passes(folder,i,d,actual["generation"])
+        item["pl_passes"],item["dc_closure_by_direction_ms"] = physical_passes(folder,i,d,actual["generation"])
+        item["dc_closure_ms"] = item["dc_closure_by_direction_ms"]["A_to_B"]
+        item["map_entries"]=len(d["positions"])
+        item["path_markers"]=sum(bool(row.get("marker_path")) for row in d["positions"])
+        item["channel_bridges"]=sum(row.get("channel_bridge",False) for row in d["positions"])
         item["maps"]={p:[sum(not r["transition_only"] and r["sweep_phase"]==p and r["rf_row"]==j
                            for r in d["positions"]) for j,_ in enumerate(c["command"]["ranges"])] for p in "AB"}
         item["coverage"]=[]

@@ -469,6 +469,13 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
             if mixer:
                 (log/"lease-board.txt").write_text(a.ssh("ls -l /run/goofy; cat /run/goofy/goofy_lease.pid; pidof goofy_lease.sh; logread | tail -60"))
             (log/"owner.log").write_text(a.ssh(f"cd {remote}; kill -TERM $(cat owner.pid) 2>/dev/null || :; sleep 1; cat owner.log"))
+            if os.environ.get("PLANNER_BENCH_VERIFY_HANDBACK"):
+                returned = json.loads(a.ssh(f"cd {remote} && ./obs-fl-ctl status"))
+                radio = a.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown "
+                              "/sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain").splitlines()
+                a.write_json(log/"handback.json",dict(guard=returned,radio=radio))
+                assert returned["fld_control"] == 0
+                assert radio[0] == "1" and float(radio[1].split()[0]) == -89.75
         finally:
             stop.set()
             if thread: thread.join(3)
