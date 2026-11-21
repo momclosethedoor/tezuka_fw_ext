@@ -1302,25 +1302,54 @@ fn continuous(
                 Ok(())
             })();
             regs.write(0x284, 0);
-            let _ = child.kill();
-            let _ = child.wait();
-            result
+            let cleanup = stop_video_reader(&mut child);
+            (result, cleanup)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => (Err(e.into()), Ok(())),
     };
     regs.write(0x38, 0);
     regs.write(0x30, saved[0]);
     regs.write(0x40, saved[2]);
     regs.write(0x38, saved[1]);
-    shared.inbox.lock().unwrap().metrics =
-        video_counters(generation, &queue, true, result.as_ref().err().map(ToString::to_string));
-    if capture_enabled()? {
-        let error = "IIO buffer remained enabled after real8 cleanup";
-        shared.inbox.lock().unwrap().worker_error = Some(error.into());
-        bail!("{error}");
+    let (result, cleanup) = result;
+    let cleanup = cleanup.and_then(|()| {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while capture_enabled()? {
+            ensure!(Instant::now() < deadline, "IIO buffer remained enabled after real8 cleanup");
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        Ok(())
+    });
+    let mut inbox = shared.inbox.lock().unwrap();
+    let error = result.as_ref().err().or(cleanup.as_ref().err()).map(ToString::to_string);
+    inbox.metrics = video_counters(generation, &queue, true, error);
+    inbox.metrics["cleanup_error"] = json!(cleanup.as_ref().err().map(ToString::to_string));
+    if let Err(error) = &cleanup {
+        inbox.worker_error = Some(error.to_string());
     }
-    result
+    drop(inbox);
+    result.and(cleanup)
 }
+
+fn stop_video_reader(child: &mut std::process::Child) -> Result<()> {
+    // iio_readdev must be allowed to cancel and destroy its libiio buffer.
+    // SIGKILL is a bounded fallback, never evidence that the buffer drained.
+    for (signal, grace_ms) in [(libc::SIGINT, 350), (libc::SIGKILL, 150)] {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        unsafe { libc::kill(child.id() as libc::pid_t, signal); }
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        while Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+    }
+    bail!("IIO real8 reader did not exit")
+}
+
 fn capture_enabled() -> Result<bool> {
     for entry in fs::read_dir("/sys/bus/iio/devices")? {
         let dev = entry?.path();
