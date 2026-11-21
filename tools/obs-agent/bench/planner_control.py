@@ -76,16 +76,25 @@ def verify_range_capacity(api,url,path,command,status):
         assert list(dict.fromkeys(p["rf_row"] for p in positions
                      if p["sweep_phase"]==phase and not p["transition_only"]))==list(range(16))
     overflow=[*rows,dict(enabled=True,lo_hz=2_495_000_000,hi_hz=2_496_000_000)]
+    caps=status["capabilities"]["planner_v2"]
+    threshold=caps["mixer_threshold_hz"]
+    empty=[dict(enabled=True,lo_hz=threshold,hi_hz=threshold)]
+    invalid={
+        "ranges": (dict(ranges=overflow), "ranges: 1..16"),
+        "next_ranges": (dict(next_ranges=overflow), "ranges: 1..16"),
+        "zero_width_at_mixer_threshold": (
+            dict(ranges=empty), f"hi_hz: {threshold+1}..{caps['scan_rf_bounds_hz'][1]}"),
+    }
     rejections={}
-    for field in ("ranges","next_ranges"):
+    for name,(fields,message) in invalid.items():
         try:
-            api.request(url,"POST",path,dict(command,id=uuid.uuid4().hex,**{field:overflow}),timeout=2)
+            api.request(url,"POST",path,dict(command,id=uuid.uuid4().hex,**fields),timeout=2)
         except HTTPError as error:
             report=json.load(error)
-            assert error.code==400 and report["error"]=="ranges: 1..16",report
-            rejections[field]=dict(http=error.code,**report)
+            assert error.code==400 and report["error"]==message,report
+            rejections[name]=dict(http=error.code,**report)
         else:
-            raise AssertionError(f"accepted 17 rows in {field}")
+            raise AssertionError(f"accepted invalid request {name}")
     live=api.request(url,"GET",path,timeout=2)
     assert live["phase"]=="running" and live["applied_id"]==status["applied_id"]
     assert live["actual"]["generation"]==status["actual"]["generation"]
