@@ -61,7 +61,8 @@ class Sinks:
             self.completed.move_to_end(key)
             if len(self.completed) > 128:
                 self.completed.popitem(last=False)
-            sent = attempt > self.drop_ack
+            drop_kind = os.environ.get("PLANNER_BENCH_ACK_DROP_KIND")
+            sent = drop_kind not in (None,str(kind)) or attempt > self.drop_ack
             with log.open("a") as out:
                 print(json.dumps(dict(event=event, host_received_ns=received,
                     host_ack_ns=time.perf_counter_ns() if sent else None, correct_ack=sent,

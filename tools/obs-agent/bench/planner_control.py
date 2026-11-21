@@ -304,8 +304,42 @@ def verify_prepare_cancel(api, url, path, log, scan):
         resumed=resumed,stop_elapsed_ns=stop_ns))
 
 
+def board_sample(api, log, label, blocked=False):
+    if os.environ.get("PLANNER_BENCH_BOARD_SAMPLES") != "1":
+        return
+    source = """
+printf 'uptime '; cat /proc/uptime
+for z in /sys/class/thermal/thermal_zone*; do
+  test -r "$z/type" && printf '%s type=%s temp=%s\\n' "$z" "$(cat "$z/type")" "$(cat "$z/temp")"
+done
+for dev in /sys/bus/iio/devices/iio:device*; do
+  case "$(cat "$dev/name" 2>/dev/null)" in
+    xilinx-xadc|xadc)
+      for a in "$dev"/in_temp*; do test -r "$a" && printf '%s %s\\n' "$a" "$(cat "$a")"; done;;
+  esac
+done
+"""
+    if blocked:
+        source += """
+for p in /proc/[0-9]*; do
+  case "$(cat "$p/comm" 2>/dev/null)" in
+    obs_fl_guard|maia-delivery)
+      for t in "$p"/task/*; do
+        printf '%s ' "$t"; cat "$t/wchan"; cat "$t/stack" 2>&1
+      done;;
+  esac
+done
+"""
+    try:
+        sample=api.ssh(source,5)
+    except (OSError, RuntimeError) as error:
+        sample=str(error)
+    (log/f"board-{label}.txt").write_text(f"host_ns {time.perf_counter_ns()}\n"+sample,encoding="utf-8")
+
+
 def control(log, profiles, boot):
     a = bench.accepted
+    board_sample(a,log,"before")
     v2 = os.environ.get("PLANNER_BENCH_VERSION", "2") == "2"
     remote = a.REMOTE
     url = "http://192.168.2.1:18080"
@@ -373,6 +407,9 @@ exit 1""")
     if replay_window := os.environ.get("PLANNER_BENCH_SIG0_REPLAY"):
         a.upload(Path(replay_window),remote,"replay-window.bin")
     owner_seconds = 215 if scan.get("catalog_on_boot") else 135
+    owner_seconds = int(os.environ.get("PLANNER_BENCH_OWNER_SECONDS", owner_seconds))
+    if not 1 <= owner_seconds <= 240:
+        raise ValueError("owner lifetime must be 1..240 s")
     phase_timing = int(os.environ.get("PLANNER_BENCH_PHASE_TIMING") == "1")
     if os.environ.get("PLANNER_BENCH_RECORD_GATE"):
         a.ssh(f"""cd {remote}
@@ -440,6 +477,10 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
             sweep = os.environ.get("PLANNER_BENCH_SWEEP")
             if sweep:
                 cases = json.loads(Path(sweep).read_text(encoding="utf-8-sig"))
+                repeats = int(os.environ.get("PLANNER_BENCH_REPEAT", "1"))
+                if not 1 <= repeats <= 5:
+                    raise ValueError("each RAM series supports 1..5 repetitions")
+                cases *= repeats
                 cmds = [case if case.get("op")=="antennas" else dict(scan, **case) for case in cases] + [dict(scan,run=False)]
             for cmd in cmds:
                 if cmd["op"]=="alternative":
@@ -452,14 +493,22 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                 start = time.perf_counter_ns()
                 accepted = a.request(url,"POST",path,dict(cmd,id=ident),timeout=2)
                 assert accepted["accepted_id"] == ident
+                sampled = False
                 while time.perf_counter_ns()-start < (75 if sweep else 35)*1_000_000_000:
                     status = a.request(url,"GET",path,timeout=5 if sweep else 1)
                     if ident in (status["applied_id"],status["failed_id"]): break
+                    if not sampled and (status.get("operation") or {}).get("command_id") == ident \
+                            and status["operation"].get("wait_expired_ns"):
+                        board_sample(a,log,f"wait-{len(calls)+1}",blocked=True)
+                        sampled = True
                     time.sleep(.02)
                 calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.perf_counter_ns()-start))
                 a.write_json(log/"commands.json",calls)
                 if sweep and status["failed_id"]==ident:
                     print("Sweep rejected:",status["error"],flush=True)
+                    board_sample(a,log,f"failure-{len(calls)}",blocked=True)
+                    if status.get("worker_error"):
+                        break
                     continue
                 if os.environ.get("PLANNER_BENCH_PATH_TIMEOUT"):
                     assert status["failed_id"]==ident and not status["actual"]["running"]
@@ -521,13 +570,13 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     a.write_json(log/"commands.json",calls)
                     if cmd.get("next_ranges") is not None:
                         verify_next(a,url,path,log,receiver,status,sinks,len(calls))
-                    if os.environ.get("PLANNER_BENCH_SOAK_CASE")==str(len(calls)):
+                    if str(len(calls)) in os.environ.get("PLANNER_BENCH_SOAK_CASE", "").split(","):
                         calls[-1]["soak"]=soak(receiver,status,log,float(os.environ.get("PLANNER_BENCH_SOAK_SECONDS","60")))
                         a.write_json(log/"commands.json",calls)
                     if os.environ.get("PLANNER_BENCH_MISSING_ACK4") and len(calls)==1:
                         sinks.missing=True
                         withheld=time.perf_counter_ns()
-                        while time.perf_counter_ns()-withheld<4_000_000_000:
+                        while time.perf_counter_ns()-withheld<7_000_000_000:
                             failed=a.request(url,"GET",path,timeout=1)
                             if failed["failed_id"]==ident:
                                 break
@@ -658,6 +707,7 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                         (log/f"sig0-replay-{i}.txt").write_text(a.ssh(f"cd {remote} && cat sig0-replay-{i}.txt"))
             if os.environ.get("PLANNER_BENCH_RECORD_GATE"):
                 (log/"gate-probe.ndjson").write_text(a.ssh(f"cd {remote} && cat gate-probe.ndjson"))
+            board_sample(a,log,"after")
             if mixer:
                 (log/"lease-board.txt").write_text(a.ssh("ls -l /run/goofy; cat /run/goofy/goofy_lease.pid; pidof goofy_lease.sh; logread | tail -60"))
             if os.environ.get("PLANNER_BENCH_LEASE_SCRIPT"):
@@ -667,15 +717,24 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                 (log/"dmesg.txt").write_text(a.ssh("dmesg"))
             if os.environ.get("PLANNER_BENCH_VERIFY_HANDBACK"):
                 returned = json.loads(a.ssh(f"cd {remote} && ./obs-fl-ctl status"))
+                a.write_json(log/"guard-after.json",returned)
+                assert returned["fld_control"] == 0
                 radio = a.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown "
                               "/sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain").splitlines()
                 a.write_json(log/"handback.json",dict(guard=returned,radio=radio))
-                assert returned["fld_control"] == 0
                 assert radio[0] == "1" and float(radio[1].split()[0]) == -89.75
                 if os.environ.get("PLANNER_BENCH_TPC2_DIAGNOSTIC"):
                     ident, word = a.ssh("devmem 0x7c46033c 32; devmem 0x7c460344 32").splitlines()
                     assert int(ident,16)==0x32435054
                     a.write_json(log/"tpc2-handback.json",dict(id=ident,word=word))
+        except Exception:
+            board_sample(a,log,"abort",blocked=True)
+            try:
+                owner=a.ssh(f"cd {remote}; cat owner.log",5)
+                (log/"owner-abort.log").write_text(owner,encoding="utf-8")
+            except (OSError,RuntimeError):
+                pass
+            raise
         finally:
             stop.set()
             if thread: thread.join(3)

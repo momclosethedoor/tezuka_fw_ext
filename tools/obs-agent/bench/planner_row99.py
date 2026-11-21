@@ -18,6 +18,21 @@ def stage_executables(*args, **kwargs):
     stage(*args, **kwargs)
     api = bench.accepted
     api.ssh(f"cd {api.REMOTE} && chmod 700 cap2-run sig0-arm")
+    if fault := os.environ.get("PLANNER_BENCH_TAKE_FAULT"):
+        # Guard parameters are only set for this RAM load. Restrict them to
+        # the fixture's numeric stage, bounded delay, count and error flags.
+        stage_id,delay,count,fail,cleanup = map(int, fault.split(","))
+        if not (stage_id in range(4,14) and 0<=delay<=5000 and 1<=count<=3
+                and fail in (0,1) and cleanup in (0,1)):
+            raise ValueError("invalid TAKE_RF injection")
+        loader=args[0]/"loader/guard-rebind.sh"
+        script=loader.read_bytes()
+        original=b'insmod "$R/obs_ad9361.ko"\n'
+        assert script.count(original)==1
+        params=(f"obs_test_stage={stage_id} obs_test_delay_ms={delay} obs_test_attempts={count} "
+                f"obs_test_fail={fail} obs_test_cleanup={cleanup}\n").encode()
+        loader.write_bytes(script.replace(original, original.rstrip()+b" "+params))
+        api.upload(loader,api.REMOTE,loader.name)
     if image := os.environ.get("PLANNER_BENCH_XTG1"):
         image = Path(image)
         variants = {
