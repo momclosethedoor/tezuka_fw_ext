@@ -19,6 +19,18 @@ pub fn ranges(full:u64,full_len:usize,view:u64,view_len:usize)->Result<(),String
     if end>u32::MAX as u64||vend>u32::MAX as u64||!(end<=view||vend<=full){return Err("DMA allocation overlap/end overflow".into())}Ok(())
 }
 pub fn view_len(h:Header)->usize{match(h.flags>>3)&3{0=>0,1=>512,2=>1024,_=>2048}}
+
+// Native OBN2 uses independent full and VIEW slots. The RAM fixture alone
+// needs the owned split544 lookbehind and its displaced VIEW.
+pub(super) fn delivery_offsets(slot:usize,split544:bool,previous_view:usize)->(usize,u32,usize){
+    if split544 {
+        let previous=slot.wrapping_sub(1)&(SLOTS-1);
+        (previous*c::BYTES+28416+previous_view,0,slot*c::BYTES+28416)
+    } else {
+        (slot*c::BYTES,1,slot*VIEW_BYTES)
+    }
+}
+
 pub fn decode(full:&[u8],view:&[u8],power:&mut[f32])->Result<Header,String>{
     let h=c::header_revision(full,3)?;let n=view_len(h);
     if view.len()!=n{return Err("r3 active view length (ignore short-slot tail)".into())}
@@ -137,6 +149,19 @@ impl PairReader{
  fn root()->std::path::PathBuf{std::env::var("OBS_VIEW_VECTOR_ROOT").unwrap_or_else(|_|"maia-httpd/tests/view".into()).into()}
  fn bytes(p:&std::path::Path)->Vec<u8>{let s=std::fs::read_to_string(p).unwrap();let s=s.split_whitespace().collect::<String>();(0..s.len()).step_by(2).map(|i|u8::from_str_radix(&s[i..i+2],16).unwrap()).collect()}
  #[test]fn all_paired_i5_vectors(){let mut count=0;for mode in 0..4{for entry in std::fs::read_dir(root().join(format!("mode{mode}"))).unwrap(){let p=entry.unwrap().path();if p.extension().is_none_or(|s|s!="hex"){continue}let full=bytes(&p);let view=bytes(&p.with_extension("viewhex"));let mut power=vec![0.;4096];let h=decode(&full,&view,&mut power).unwrap();assert_eq!((h.flags>>3)&3,mode);assert!(c::header(&full).is_err());if !view.is_empty(){let mut bad=view.clone();bad[0]^=1;assert!(decode(&full,&bad,&mut power).is_err());assert!(decode(&full,&view[..view.len()-1],&mut power).is_err());}count+=1;}}assert_eq!(count,16);}
+ #[test]fn native_delivery_uses_the_independent_view_allocation(){
+  let p=root().join("mode3/ordinal-0-k2.hex");
+  let reference=bytes(&p.with_extension("viewhex"));
+  let mut full=vec![0x55;2*c::BYTES];
+  full[c::BYTES..].copy_from_slice(&bytes(&p));
+  let mut native_view=vec![0x99;2*VIEW_BYTES];
+  native_view[VIEW_BYTES..].copy_from_slice(&reference);
+  let (header,region,payload)=delivery_offsets(1,false,512);
+  let h=c::header_prefix(&full[header..header+512],3).unwrap();
+  assert_eq!(region,1);
+  assert_eq!(view_len(h),2048);
+  assert_eq!(&native_view[payload..payload+view_len(h)],reference);
+ }
  #[test]fn geometry_and_memory_gate(){assert!(geometry(3,1024,32768,2048).is_ok());assert!(geometry(2,8,32768,2048).is_err());assert!(ranges(0x18000000,FULL_LENGTH,0x1a000000,VIEW_LENGTH).is_ok());for(a,b,l)in[(0x18000001,0x1a000000,FULL_LENGTH),(0x18000000,0x18008000,FULL_LENGTH),(0x18000000,0x1a000000,262144)]{assert!(ranges(a,l,b,VIEW_LENGTH).is_err());}}
  #[test]fn wrap_and_mode_from_each_header(){
   struct Mock{full:Vec<u8>,view:Vec<u8>,s:Snapshot,vc:u64}

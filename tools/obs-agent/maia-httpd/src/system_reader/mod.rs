@@ -247,23 +247,29 @@ impl PairIo for Hardware{
   Ok(())
  }
  fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,slot:usize,full:&mut[u8],overview:&mut[u8],sink:&mut F)->R<()>{
+  if self.managed_view_only {
+   let (header_offset,region,view_offset)=view::delivery_offsets(slot,self.shift,self.previous_view);
+   self.ensure_sync(0,header_offset as u32,512)?;
+   let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(header_offset),512)};
+   let h=continuous::header_prefix(prefix,3)?;
+   let n=view::view_len(h);
+   if n!=0{self.ensure_sync(region,view_offset as u32,n as u32)?;}
+   let base=if region==0{self.full.ptr}else{self.overview.ptr};
+   let payload=unsafe{std::slice::from_raw_parts(base.add(view_offset),n)};
+   let t=Instant::now();
+   sink(h,&[],payload)?;
+   self.process_ns+=t.elapsed().as_nanos();
+   self.view_bytes+=n as u64;
+   self.previous_view=n;
+   return Ok(())
+  }
   if self.direct||self.release_only{
    if !self.shift{return Err("direct/header-only requires shift544".into())}
    let pv=self.previous_view;let prev=(slot+1023)&1023;let a=prev*32768+28416+pv;let b=slot*32768;
-   let prefix_len=if self.release_only||self.managed_view_only{512}else{4352-pv};
+   let prefix_len=if self.release_only{512}else{4352-pv};
    self.ensure_sync(0,a as u32,prefix_len as u32)?;
    let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(a),prefix_len)};
    let h=continuous::header_prefix(prefix,3)?;let n=view::view_len(h);
-   if self.managed_view_only {
-    // Split544 header lives in the owned lookbehind; VIEW is in the current slot.
-    // Synchronize the exact ranges read by this delivery-only path.
-    if n!=0{self.ensure_sync(0,(b+28416)as u32,n as u32)?;}
-    let v=unsafe{std::slice::from_raw_parts(self.full.ptr.add(b+28416),n)};
-    let t=Instant::now();
-    sink(h,&[],v)?;
-    self.process_ns+=t.elapsed().as_nanos();self.view_bytes+=n as u64;self.previous_view=n;
-    return Ok(())
-   }
    if !self.release_only{self.ensure_sync(0,b as u32,28416)?;if pv!=0{self.ensure_sync(1,(prev*2048)as u32,pv as u32)?;}if n!=0{self.ensure_sync(0,(b+28416)as u32,n as u32)?;}}
    let t=Instant::now();
    if self.release_only{sink(h,&[],&[])?;}else{
@@ -348,7 +354,7 @@ fn view_idle_wait(k:u32)->Duration {
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
- if control.is_some() && (!c.direct || c.mode==0) {return Err("managed VIEW requires direct split544 and a VIEW mode".into())}
+ if control.is_some() && c.mode==0 {return Err("managed VIEW requires a VIEW mode".into())}
  if c.diagnostic_sync.is_some(){return discard::execute(c)}
  if c.owned_pipeline{return Err("full-copy experiment rejected; use immediate release reader".into())}
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
