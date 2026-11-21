@@ -295,12 +295,15 @@ def main():
     cli.add_argument("--video-hz", type=int, default=5865000000)
     cli.add_argument("--seconds", type=int, default=30, choices=range(5, 121))
     cli.add_argument("--video-only", action="store_true")
+    cli.add_argument("--scan-only", action="store_true")
     cli.add_argument("--field-only", action="store_true")
     cli.add_argument("--field-hz", type=int, default=5864800000)
     cli.add_argument("--candidate", action="store_true")
     cli.add_argument("--native-usb", action="store_true")
     cli.add_argument("--phase-timing", action="store_true")
     args = cli.parse_args()
+    if sum((args.video_only, args.field_only, args.scan_only)) > 1 or (args.native_usb and (args.field_only or args.scan_only)):
+        cli.error("choose one data subset; native USB requires the video comparison")
     board = bench.accepted
     reference = Path("C:/proj/pluto_ag/evidence")
     modules = reference/"ARM-SCAN-CONTROL-003/build-ee339de/modules"
@@ -349,24 +352,25 @@ def main():
                 probe.command("STOP after FIELD", stop)
                 return
             analysis_actual = probe.command("analysis", analysis)
-            board.write_json(folder/"counters-video-before.json", probe.counters())
-            running_video = probe.command("continuous real8", video)
-            time.sleep(args.seconds)
-            probe.checks["real8_fresh"] = receiver.video_stats.get(running_video["generation"], {}).get("packets", 0) > 0
-            board.write_json(folder/"counters-video.json", probe.counters())
-            returned = probe.command("RETURN", dict(op="return"))
-            probe.checks["return_analysis"] = returned["mode"] == "analysis" and returned["k"] == 700 and returned["rx_lo_hz"] == analysis_actual["rx_lo_hz"]
-            if args.candidate:
-                probe.command("video for scan transition", video)
-                from_video = probe.command("video to scan", scan)
-                time.sleep(2)
-                probe.checks["video_to_scan"] = from_video["mode"] == "scan" and from_video["running"] and (
-                    receiver.view_stats(from_video["generation"])["received"] > 0)
-                probe.command("STOP after video to scan", stop)
-            else:
-                probe.command("finite FIELD", scan)
-                time.sleep(8)
-                probe.command("STOP after FIELD", stop)
+            if not args.scan_only:
+                board.write_json(folder/"counters-video-before.json", probe.counters())
+                running_video = probe.command("continuous real8", video)
+                time.sleep(args.seconds)
+                probe.checks["real8_fresh"] = receiver.video_stats.get(running_video["generation"], {}).get("packets", 0) > 0
+                board.write_json(folder/"counters-video.json", probe.counters())
+                returned = probe.command("RETURN", dict(op="return"))
+                probe.checks["return_analysis"] = returned["mode"] == "analysis" and returned["running"] and returned["k"] == 700 and returned["rx_lo_hz"] == analysis_actual["rx_lo_hz"]
+                if args.candidate:
+                    probe.command("video for scan transition", video)
+                    from_video = probe.command("video to scan", scan)
+                    time.sleep(2)
+                    probe.checks["video_to_scan"] = from_video["mode"] == "scan" and from_video["running"] and (
+                        receiver.view_stats(from_video["generation"])["received"] > 0)
+                    probe.command("STOP after video to scan", stop)
+                else:
+                    probe.command("finite FIELD", scan)
+                    time.sleep(8)
+                    probe.command("STOP after FIELD", stop)
             if not args.video_only:
                 for k in (1, 1023):
                     probe.command(f"narrow K{k}", dict(scan, k=k))
@@ -417,7 +421,7 @@ def main():
                     receiver.missing = False
                     probe.command("analysis after cancelled route", analysis)
                     probe.command("STOP analysis", stop)
-            if args.candidate and not args.native_usb:
+            if args.candidate and not (args.native_usb or args.scan_only):
                 for i in range(2):
                     probe.command(f"analysis cycle {i}", analysis)
                     probe.command(f"video cycle {i}", video)
