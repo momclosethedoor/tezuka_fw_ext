@@ -248,6 +248,13 @@ pub(crate) struct RunControl<'a>{
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
  pub check:&'a dyn Fn()->R<()>,
  pub sweep:Option<&'a SweepSpec>,
+ pub next:Option<NextView<'a>>,
+}
+pub(crate) struct NextView<'a>{
+ pub generation:u64,
+ pub sweep:&'a SweepSpec,
+ pub anchor:&'a dyn Fn()->Option<u64>,
+ pub started:&'a dyn Fn(Header,u64),
 }
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
@@ -278,11 +285,20 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,io.live64(0x238),q.generation,&mut network.borrow_mut()))));
  let announced=std::cell::Cell::new(false);let draining=std::cell::Cell::new(false);
+ let next_announced=std::cell::Cell::new(false);
  let mut first_view_sent=false;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(q)=control{if draining.get(){return Ok(())}if !announced.replace(true){(q.started)(h);}}
   if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
+   if let Some(next)=control.and_then(|q|q.next.as_ref()) && !next_announced.get()
+      && let Some(anchor)=(next.anchor)() && h.epoch>=anchor {
+    let mut delivery=sweeps.borrow_mut();
+    if let Some(old)=delivery.as_mut(){old.finish(&mut net,sock,false);}
+    *delivery=Some(sweep_delivery::Delivery::new(next.sweep,anchor,next.generation,&mut net));
+    next_announced.set(true);
+    (next.started)(h,anchor);
+   }
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
     if overview.len()!=512{return Err("sweep delivery requires VIEW512".into())}
     sweep.accept(h,overview,&mut net,sock);
@@ -293,7 +309,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  };
  loop{
   if c.command=="rate"&&begin.is_none()&&start.elapsed().as_secs_f64()>=c.warmup{begin_link=interface_counters();begin_network=network.borrow().counts();begin=Some(mark(&mut io,&reader,start)?);deadline=begin.as_ref().unwrap()["time"].as_f64().unwrap()+c.seconds;reader.high_water=0;io.physical_high_water=0;max_service_us=0;max_poll_us=0;io.max_release_gap_us=0;io.last_release=Instant::now();}
-  if c.command=="rate"&&(control.map_or(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed),|q|q.stop.load(Ordering::Acquire))){end_link=interface_counters();end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break}
+  if c.command=="rate"&&(control.map_or(start.elapsed().as_secs_f64()>=deadline||STOP.load(Ordering::Relaxed),|q|q.stop.load(Ordering::Acquire))){
+   if let Some(q)=control{draining.set(true);io.stop();(q.trace)("admission_stop");}
+   end_link=interface_counters();end_network=network.borrow().counts();end=Some(mark(&mut io,&reader,start)?);break
+  }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=Duration::from_millis(100){
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
@@ -311,7 +330,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if s.committed==s.released{std::hint::spin_loop();} // CSR has no completion fd/IRQ; no timer delay.
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
- draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+ if !draining.get(){draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}}
+ let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow_mut().as_mut(){sweep.finish(&mut net,sock,false);}else{net.flush(sock);}

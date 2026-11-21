@@ -2,6 +2,14 @@ use super::*;
 use mixer_math::{OFFSET, Tuning, choose};
 mod grid_bench;
 
+pub(super) fn scan_rf_bounds() -> Result<[u64; 2]> {
+    let lo = option_env!("GOOFY_SCAN_MIN_RF_HZ").unwrap_or("70000000").parse()?;
+    let hi = option_env!("GOOFY_SCAN_MAX_RF_HZ").unwrap_or("12000000000").parse()?;
+    ensure!((70_000_000..hi).contains(&lo) && hi <= plan_math::MAX_RF,
+        "invalid compiled scan RF bounds");
+    Ok([lo, hi])
+}
+
 pub(super) fn environment() -> Result<(u64, i64)> {
     let threshold = option_env!("GOOFY_MIXER_THRESHOLD_HZ")
         .unwrap_or("6000000000")
@@ -62,6 +70,15 @@ pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
     executable_tiles(state, &core_tiles(state)?)
 }
 
+pub(super) fn next_route(previous: &Tile, first: &mut Tile) {
+    if previous.tx.is_some() != first.tx.is_some() || previous.antenna != first.antenna {
+        first.notify = Some(first.antenna);
+        first.hold = true;
+        first.marker_path = Some(if first.tx.is_some() {"mixer"} else {"direct"});
+        first.handover = "path";
+    }
+}
+
 pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
     if let Some(overlap) = state["scan"].get("bench_overlap_hz") {
         ensure!(state["pl_timing_only"] == true, "grid experiment requires muted timing fixture");
@@ -80,6 +97,7 @@ pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>
 
 pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
     let (threshold, mult) = environment()?;
+    let [scan_min, scan_max] = scan_rf_bounds()?;
     let scan = &state["scan"];
     let bands = parse_antenna_bands(&scan["antenna_bands"])?;
     let pll_bounds = if scan["mixer"]["pll_range_hz"].is_null() {
@@ -101,8 +119,8 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
             continue;
         }
         ensure!(range["tx_slot"].is_null(), "v2 selects TX from RF");
-        let mut lo = int(range, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
-        let end = int(range, "hi_hz", lo + 1, plan_math::MAX_RF)?;
+        let mut lo = int(range, "lo_hz", scan_min, scan_max)?;
+        let end = int(range, "hi_hz", lo + 1, scan_max)?;
         let path = range.get("path").and_then(Value::as_str).unwrap_or("auto");
         ensure!(
             matches!(path, "auto" | "mixer" | "direct"),
@@ -332,6 +350,7 @@ pub(super) fn encode(
     tx: &BTreeMap<u64, (u64, [u8; 16])>,
     restore: [u64; 2],
     state: &Value,
+    minimum_stride_entries: usize,
 ) -> Result<(Vec<u8>, Value)> {
     ensure!(
         !tiles.is_empty() && tiles.len() <= 65535 && rx.len() <= 65535 && tx.len() <= 8,
@@ -341,7 +360,7 @@ pub(super) fn encode(
         tx.len()
     );
     let version = int(state, "map_version", 1, 0x7fff_fffe)? as u32;
-    let stride = 32 * tiles.len().max(rx.len()).max(128);
+    let stride = 32 * tiles.len().max(rx.len()).max(128).max(minimum_stride_entries);
     // Timing fixture recalls the actual TX bank while the driver keeps RF muted.
     let timing_only = state["pl_timing_only"] == true;
     let tx_rf_on = !tx.is_empty() && !timing_only;
@@ -491,7 +510,7 @@ pub(super) fn encode(
     );
     let mut desc = json!({"rf_ranges":ranges,"requested_ranges":state["scan"]["ranges"],"positions":positions,"planner_version":2,
         "pl_timing_only":timing_only,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,
-        "first_tx_pll_hz":first.map(|s|tx[&txkeys[s]].0)});
+        "first_tx_pll_hz":first.or_else(|| (!txkeys.is_empty()).then_some(0)).map(|s|tx[&txkeys[s]].0)});
     if working_grid {
         grid_bench::validate_cover(&desc)?;
         desc["sweep_geometry"] = json!({"half_pass_hz":27_000_000,"overlap_hz":9_000_000,

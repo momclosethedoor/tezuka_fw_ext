@@ -181,6 +181,70 @@ def verify_recovery(api, url, path, scan, log):
         failure=failure, ordered=ordered_state, mixed=mixed, reconnected=connected, stale_http=409))
 
 
+def verify_next(api, url, path, log, receiver, previous, sinks, index):
+    active = previous["actual"]
+    ident = uuid.uuid4().hex
+    command = dict(op="next", id=ident, source_generation=active["generation"],
+                   next_version=active["prepared_next_version"])
+    cancel = os.environ.get("PLANNER_BENCH_CANCEL_NEXT") == str(index)
+    cookie = "devmem 0x7c460150 32"
+    initial = api.ssh(cookie).strip()
+    if cancel:
+        sinks.missing = True
+        until = time.perf_counter() + .8
+        while time.perf_counter() < until:
+            if api.request(url,"GET",path,timeout=1)["route_pending"]:
+                break
+            time.sleep(.01)
+        else:
+            raise AssertionError("could not hold active map for pending NEXT")
+    began = time.perf_counter_ns()
+    assert api.request(url,"POST",path,command,timeout=2)["accepted_id"]==ident
+    assert api.request(url,"POST",path,command,timeout=2)["accepted_id"]==ident
+    try:
+        conflict=dict(command,id=uuid.uuid4().hex,next_version=command["next_version"]+1)
+        api.request(url,"POST",path,conflict,timeout=2)
+    except HTTPError as error:
+        assert error.code==409
+    else:
+        raise AssertionError("conflicting NEXT accepted")
+    if cancel:
+        until=time.perf_counter()+.7
+        while time.perf_counter()<until:
+            live=int(api.ssh("devmem 0x7c460228 32").strip(),16)
+            if live & 16:
+                api.write_json(log/f"next-pending-{index}.json",dict(cmd=command,fld_status=live,run=initial))
+                return
+        raise AssertionError("NEXT did not enter pending state")
+    deadline=time.perf_counter()+5
+    while time.perf_counter()<deadline:
+        changed=api.request(url,"GET",path,timeout=1)
+        assert changed["failed_id"]!=ident,changed["error"]
+        if changed["applied_id"]==ident:
+            break
+        time.sleep(.01)
+    else:
+        raise AssertionError("NEXT did not produce an applied map")
+    now=changed["actual"]
+    assert now["map_version"]==command["next_version"] and now["epoch"]>active["epoch"]
+    assert now["generation"]!=active["generation"] and api.ssh(cookie).strip()==initial
+    old=0
+    while time.perf_counter()<deadline:
+        data,_=receiver.recvfrom(65535)
+        if data[:8]!=b"GVIEW4\0\0":continue
+        generations={struct.unpack_from("<Q",data,offset+56)[0] for offset in range(0,len(data),576)}
+        assert len(generations)==1,"mixed generations in one datagram"
+        if now["generation"] in generations:break
+        old+=1
+    else:
+        raise AssertionError("missing fresh GVIEW4 after NEXT")
+    elapsed=time.perf_counter_ns()-began
+    assert struct.unpack_from("<Q",data,24)[0]>=now["epoch"]
+    laps=record_laps(receiver,data,changed,log,100+index)
+    api.write_json(log/f"next-{index}.json",dict(cmd=command,before=previous,after=changed,
+        run=initial,old_datagrams=old,first_fresh_ns=elapsed,laps=laps))
+
+
 def control(log, profiles, boot):
     a = bench.accepted
     v2 = os.environ.get("PLANNER_BENCH_VERSION", "2") == "2"
@@ -396,6 +460,8 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                             time.sleep(.021)
                         a.write_json(log/f"gate-{len(calls)}.json",receipts)
                     a.write_json(log/"commands.json",calls)
+                    if cmd.get("next_ranges") is not None:
+                        verify_next(a,url,path,log,receiver,status,sinks,len(calls))
                     if os.environ.get("PLANNER_BENCH_MISSING_ACK4") and len(calls)==1:
                         sinks.missing=True
                         withheld=time.perf_counter_ns()

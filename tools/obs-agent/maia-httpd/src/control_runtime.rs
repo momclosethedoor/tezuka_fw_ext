@@ -84,12 +84,17 @@ fn parse_antenna_bands(source: &Value) -> Result<AntennaBands> {
     }
     Ok(bands)
 }
-fn scan_bounds(c: &Config, bands: &AntennaBands) -> [u64; 2] {
+fn scan_bounds(c: &Config, bands: &AntennaBands) -> Result<[u64; 2]> {
     let entries = bands.values().flatten();
-    let lower = entries.clone().map(|b| b[0]).min().unwrap_or(70_000_000);
+    let [rf_min, rf_max] = if c.scan["planner_version"] == 2 {
+        generated::scan_rf_bounds()?
+    } else {
+        [70_000_000, plan_math::MAX_RF]
+    };
+    let lower = entries.clone().map(|b| b[0]).min().unwrap_or(rf_min).max(rf_min);
     let upper = entries.map(|b| b[1]).max().unwrap_or_else(|| {
         if c.scan["planner_version"] == 2 {
-            return plan_math::MAX_RF;
+            return rf_max;
         }
         c.scan_tx
             .iter()
@@ -98,7 +103,7 @@ fn scan_bounds(c: &Config, bands: &AntennaBands) -> [u64; 2] {
             .unwrap_or(plan_math::DIRECT_LIMIT)
             .min(plan_math::MAX_RF)
     });
-    [lower, upper]
+    Ok([lower, upper.min(rf_max)])
 }
 
 #[derive(Clone, Deserialize)]
@@ -180,6 +185,7 @@ struct Inbox {
     capabilities: Value,
     route_pending: Value,
     metrics: Value,
+    next_map_request: Option<(Value, u64)>,
 }
 struct Shared {
     inbox: Mutex<Inbox>,
@@ -232,8 +238,13 @@ fn validate(v: &Value) -> Result<()> {
                 .filter(|r| (1..=16).contains(&r.len()))
                 .ok_or_else(|| anyhow!("ranges: 1..16"))?;
             let mut enabled = false;
+            let [rf_min, rf_max] = if v["planner_version"] == 2 {
+                generated::scan_rf_bounds()?
+            } else {
+                [70_000_000, plan_math::MAX_RF]
+            };
             for r in ranges {
-                let lo = int(r, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
+                let lo = int(r, "lo_hz", rf_min, rf_max)?;
                 int(
                     r,
                     "hi_hz",
@@ -242,7 +253,7 @@ fn validate(v: &Value) -> Result<()> {
                     } else {
                         120_000
                     },
-                    plan_math::MAX_RF,
+                    rf_max,
                 )?;
                 enabled |= r["enabled"]
                     .as_bool()
@@ -256,6 +267,17 @@ fn validate(v: &Value) -> Result<()> {
                 ensure!(!bands.is_null(), "antenna_bands must be an object");
                 parse_antenna_bands(bands)?;
             }
+            if let Some(ranges) = v.get("next_ranges") {
+                ensure!(run && v["planner_version"] == 2,"NEXT preparation requires v2 scan run");
+                let mut second = v.clone();
+                second.as_object_mut().unwrap().remove("next_ranges");
+                second["ranges"] = ranges.clone();
+                validate(&second)?;
+            }
+        }
+        Some("next") => {
+            int(v,"source_generation",1,u64::MAX)?;
+            int(v,"next_version",1,0x7fff_fffe)?;
         }
         Some("analysis") | Some("video") => {
             int(v, "center_hz", 70_000_000, 18_000_000_000)?;
@@ -285,8 +307,9 @@ fn validate(v: &Value) -> Result<()> {
         Some("alternative") => {
             int(v, "source_generation", 1, u64::MAX)?;
             int(v, "source_position", 0, 65534)?;
-            let lo = int(v, "lo_hz", 70_000_000, plan_math::MAX_RF)?;
-            int(v, "hi_hz", lo + 1, plan_math::MAX_RF)?;
+            let [rf_min, rf_max] = generated::scan_rf_bounds()?;
+            let lo = int(v, "lo_hz", rf_min, rf_max)?;
+            int(v, "hi_hz", lo + 1, rf_max)?;
         }
         Some("cancel_alternative") => {
             ensure!(
@@ -320,7 +343,8 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
     let reader = crate::system_reader::status();
     Json(
         json!({"abi":1,"kind":"guarded-control","origin":"hardware","actual":q.actual,
-        "pending_id":q.next.as_ref().or(q.pending.as_ref()).map(|v|&v["id"]),
+        "pending_id":q.next.as_ref().or(q.pending.as_ref()).map(|v|&v["id"])
+            .or(q.next_map_request.as_ref().map(|(v,_)|&v["id"])),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
         "route_pending":q.route_pending,"arm_clock_ns":q.receipt_ns.to_string(),
         "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,"metrics":{"owner":q.metrics,"reader":reader}}),
@@ -349,8 +373,18 @@ async fn submit(
         || q.failed_id == *id
         || q.pending.as_ref().is_some_and(|p| p["id"] == *id)
         || q.next.as_ref().is_some_and(|p| p["id"] == *id)
+        || q.next_map_request.as_ref().is_some_and(|(p,_)| p["id"] == *id)
     {
         return (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})));
+    }
+    if cmd["op"] == "next" {
+        if q.next.is_some() || q.pending.is_some() || q.next_map_request.is_some()
+            || q.actual["running"] != true || q.actual["generation"] != cmd["source_generation"]
+            || q.actual["prepared_next_version"] != cmd["next_version"] {
+            return (StatusCode::CONFLICT,Json(json!({"error":"NEXT version unavailable or already pending"})));
+        }
+        q.next_map_request = Some((cmd.clone(),clock_ns()));
+        return (StatusCode::ACCEPTED,Json(json!({"accepted_id":id})));
     }
     if cmd["op"] == "scan" && cmd["run"] == false && q.pending.is_some() && q.next.is_none() {
         q.next = Some(cmd.clone());
@@ -400,7 +434,8 @@ async fn submit(
             return (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})));
         }
     }
-    if q.next.is_some() || q.pending.is_some() {
+    if q.next.is_some() || q.pending.is_some() || (q.next_map_request.is_some()
+            && !(cmd["op"]=="scan" && cmd["run"]==false)) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error":"another hardware command is pending"})),
@@ -528,7 +563,7 @@ fn plan_positions(
     let mut sections = Vec::new();
     let mut intervals = Vec::new();
     let mut previous = Some((None, direct_antenna));
-    let [min_rf, max_rf] = scan_bounds(c, &received);
+    let [min_rf, max_rf] = scan_bounds(c, &received)?;
     for row in state["scan"]["ranges"]
         .as_array()
         .ok_or_else(|| anyhow!("scan ranges"))?
@@ -1183,6 +1218,7 @@ fn worker(
         pending["waiting"] = Value::Null;
         pending["guard_tx"] = Value::Null;
         pending["bank_apply"] = Value::Null;
+        pending["prepared_next_version"] = Value::Null;
         pending["failed_plan"] = Value::Null;
         pending["field_watch"] = Value::Null;
         let config_result = (|| {
@@ -1202,7 +1238,7 @@ fn worker(
                     pending["scan"]["run"] = json!(false);
                     pending["scan"]["antenna_bands"] = request["antenna_bands"].clone();
                     pending["scan"]["mixer"] = pending["catalog_mixer"].clone();
-                    pending["scan_bounds"] = json!(scan_bounds(&c,&parse_antenna_bands(&request["antenna_bands"])?));
+                    pending["scan_bounds"] = json!(scan_bounds(&c,&parse_antenna_bands(&request["antenna_bands"])?)?);
                     let (next, info) = calibration::Cache::catalog(&pending,&shared)?;
                     let tmp = c.output.join("antennas.json.tmp");
                     fs::write(&tmp, serde_json::to_vec(&request["antenna_bands"])?)?;
@@ -1273,7 +1309,7 @@ fn worker(
                         pending["scan_bounds"] = json!(scan_bounds(
                             &c,
                             &parse_antenna_bands(&request["antenna_bands"])?
-                        ));
+                        )?);
                     }
                     pending["mode"] = json!(op);
                     pending[op] = request;
@@ -1422,6 +1458,8 @@ fn worker(
                 });
             }
             let mut sweep = None;
+            let mut next_spectrum = None;
+            let mut next_sweep = None;
             if let Some(setup) = setup.as_mut() {
                 let mut a = actual.borrow_mut();
                 if a["spectrum"]["sweep_wire_version"] == 1 {
@@ -1431,6 +1469,14 @@ fn worker(
                     sweep = crate::system_reader::SweepSpec::from_descriptor(&a["spectrum"],&delivery)
                         .map_err(|e|anyhow!(e))?;
                     a["spectrum"]["view_delivery"] = json!(delivery);
+                    if let Some(mut second) = a["spectrum"].as_object_mut().unwrap().remove("prepared_next") {
+                        ensure!(c.field_preview.is_none(),"NEXT cannot replace an active FIELD watch");
+                        next_sweep = crate::system_reader::SweepSpec::from_descriptor(&second,&delivery)
+                            .map_err(|e|anyhow!(e))?;
+                        second["view_delivery"] = json!(delivery);
+                        a["prepared_next_version"] = second["version"].clone();
+                        next_spectrum = Some(second);
+                    }
                 }
                 drop(a);
                 managed_tx = word(setup, setup.len() - 4) & 1 != 0;
@@ -1576,10 +1622,52 @@ fn worker(
                 receipt(&shared, &a, id, None);
                 applied.set(true);
             };
+            let stage_sent = std::cell::Cell::new(false);
+            let next_epoch = std::cell::Cell::new(None);
+            let next_gen = generation + 1;
+            let next_version = next_spectrum.as_ref().and_then(|s|s["version"].as_u64()).map(|v|v as u32);
+            let map_epoch = || u64::from(regs.read(0x238)) | (u64::from(regs.read(0x23c))<<32);
+            let next_anchor = || {
+                if !stage_sent.get() { return None; }
+                if let Some(epoch) = next_epoch.get() { return Some(epoch); }
+                if Some(regs.read(0x22c)) != next_version {return None;}
+                let epoch = map_epoch();
+                if epoch == 0 || Some(regs.read(0x22c)) != next_version || map_epoch()!=epoch {return None;}
+                next_epoch.set(Some(epoch));
+                Some(epoch)
+            };
+            let next_started = |h: crate::system_reader::Header, anchor: u64| {
+                let request = shared.inbox.lock().unwrap().next_map_request.take();
+                let Some((cmd,received)) = request else {return};
+                let mut a = actual.borrow_mut();
+                let mut s = next_spectrum.as_ref().unwrap().clone();
+                for (key,value) in [("generation",json!(next_gen)),("map_epoch",json!(anchor)),
+                    ("k",k.clone()),("scan",json!(true)),("fs_hz",json!(FS)),("flags",json!(h.flags)),
+                    ("fft_bins",json!(4096)),("view_bins",json!(512)),("TX_OFF",Value::Null)] {
+                    s[key]=value;
+                }
+                a["generation"]=json!(next_gen);
+                a["map_version"]=s["version"].clone();
+                a["epoch"]=json!(anchor);
+                a["scan"]["ranges"]=s["requested_ranges"].clone();
+                a["scan"].as_object_mut().unwrap().remove("next_ranges");
+                a["spectrum"]=s;
+                a["prepared_next_version"]=Value::Null;
+                a["tx"]["on"]=Value::Null;
+                a["tx"]["visit"]=Value::Null;
+                shared.inbox.lock().unwrap().received_ns=received;
+                receipt(&shared,&a,&cmd["id"],None);
+                trace_control("next_first_view",||json!({"id":cmd["id"],"generation":next_gen,
+                    "version":next_version,"anchor":anchor,"epoch":h.epoch,"fft_tick":h.first_tick,"ordinal":h.ordinal}));
+            };
             let route = RefCell::new(None);
             let route_fn = |id, epoch, version, position, antenna| {
-                let anchor = u64::from(regs.read(0x238)) | (u64::from(regs.read(0x23c)) << 32);
-                let count = actual.borrow()["spectrum"]["positions"]
+                let anchor = map_epoch();
+                let a = actual.borrow();
+                let (desc, context) = if stage_sent.get() && next_version == Some(version) {
+                    (next_spectrum.as_ref().unwrap(),next_gen)
+                } else { (&a["spectrum"],generation) };
+                let count = desc["positions"]
                     .as_array()
                     .map_or(0, Vec::len);
                 let marker_position = if count > 0 && epoch >= anchor {
@@ -1587,8 +1675,7 @@ fn worker(
                 } else {
                     position
                 };
-                let a = actual.borrow();
-                let marker = &a["spectrum"]["positions"][marker_position as usize];
+                let marker = &desc["positions"][marker_position as usize];
                 let source = match marker["marker_path"].as_str() {
                     Some("mixer") => "visit_mixer",
                     Some("direct") => "visit_direct",
@@ -1599,7 +1686,7 @@ fn worker(
                     &mut route.borrow_mut(),
                     &c,
                     &shared,
-                    generation,
+                    context,
                     id,
                     epoch,
                     version,
@@ -1616,6 +1703,9 @@ fn worker(
                 trace: &|stage| trace_control(stage, ||json!({"id":id,"generation":generation})),
                 route: &route_fn,
                 sweep: sweep.as_ref(),
+                next: next_sweep.as_ref().map(|s|crate::system_reader::NextView {
+                    generation:next_gen,sweep:s,anchor:&next_anchor,started:&next_started,
+                }),
                 check: &|| {
                     if let Some(note) = watch
                         .borrow_mut()
@@ -1652,6 +1742,24 @@ fn worker(
                             || tx::readback(FS / 64).map_err(|e| e.to_string())?["on"] != true
                         {
                             return Err("manual TX lease or carrier lost".into());
+                        }
+                    }
+                    if next_version.is_some() && !stage_sent.get()
+                        && !shared.switch.load(Ordering::Acquire) {
+                        let request=shared.inbox.lock().unwrap().next_map_request.clone();
+                        if let Some((cmd,_))=request {
+                            match guard_cmd(&guard_fd,0x4603) {
+                                Ok(_) => {
+                                    stage_sent.set(true);
+                                    trace_control("next_staged",||json!({"id":cmd["id"],"generation":next_gen,"version":next_version}));
+                                }
+                                Err(err) => {
+                                    let mut inbox=shared.inbox.lock().unwrap();
+                                    inbox.next_map_request=None;
+                                    inbox.failed_id=cmd["id"].clone();
+                                    inbox.error=json!(err.to_string());
+                                }
+                            }
                         }
                     }
                     if let Some(mixer) = &c.external_mixer {
@@ -1701,7 +1809,14 @@ fn worker(
         } else {
             result
         };
-        shared.inbox.lock().unwrap().route_pending = Value::Null;
+        {
+            let mut inbox=shared.inbox.lock().unwrap();
+            inbox.route_pending=Value::Null;
+            if let Some((request,_))=inbox.next_map_request.take() {
+                inbox.failed_id=request["id"].clone();
+                inbox.error=json!("NEXT stopped before its first observation");
+            }
+        }
         match result {
             Ok(()) => {
                 state = actual.into_inner();
@@ -1769,7 +1884,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     }
     validate(&c.scan)?;
     let initial_antenna_bands = parse_antenna_bands(&c.scan["antenna_bands"])?;
-    let bounds = scan_bounds(&c, &initial_antenna_bands);
+    let bounds = scan_bounds(&c, &initial_antenna_bands)?;
     validate(&c.analysis)?;
     ensure!(
         c.scan["op"] == "scan" && c.analysis["op"] == "analysis",
@@ -1923,12 +2038,14 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         })
         .collect::<Vec<_>>();
     let (threshold, mult) = generated::environment()?;
+    let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
     let capabilities = json!({"tx_on":manual,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
-        "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"tx_model_pll_hz":[2250000000u64,2490000000u64]}}); 
+        "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"scan_rf_bounds_hz":rf_bounds,
+        "tx_model_pll_hz":[2250000000u64,2490000000u64]}});
     let listener = tokio::net::TcpListener::bind(listen).await?;
     unsafe {
         libc::signal(
