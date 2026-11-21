@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
 use std::{
     fs,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
     path::{Path, PathBuf},
@@ -17,6 +18,20 @@ const OFF: &str = "/usr/sbin/goofy_tx_off";
 const DEVICE: &str = "cf-ad9361-dds-core-lpc";
 const OFFSET: u64 = FS / 64;
 const SAMPLE_COUNT: usize = 65536;
+
+pub fn lock_radio(cancel: &AtomicBool) -> Result<File> {
+    let file = OpenOptions::new().write(true).create(true).truncate(false)
+        .open("/run/goofy/radio.lock")?;
+    loop {
+        ensure!(!cancel.load(Ordering::Acquire),"preparation cancelled while waiting for radio");
+        if unsafe { libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB) }==0 {
+            return Ok(file);
+        }
+        let err=std::io::Error::last_os_error();
+        if err.kind()!=ErrorKind::WouldBlock {return Err(err.into());}
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 pub fn available() -> bool {
     [
@@ -145,14 +160,27 @@ impl Carrier {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        self.close_buffer(false)?;
+        ensure!(gate?.success(), "TX gate did not confirm");
+        self.muted_readback()
+    }
+
+    pub fn after_guard(&mut self) -> Result<Value> {
+        // The guard already confirmed the physical mute and returned PS SPI.
+        // Closing this owned cyclic buffer needs no second PS gate sequence.
+        self.close_buffer(true)?;
+        self.muted_readback()
+    }
+
+    fn close_buffer(&mut self, guard_muted: bool) -> Result<()> {
         if let Some(mut child) = self.child.take() {
-            // libiio disables the cyclic device buffer in its signal cleanup.
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while child.try_wait()?.is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
+            if !guard_muted {
+                // Give the manual carrier its usual libiio signal cleanup.
+                unsafe { libc::kill(child.id() as i32, libc::SIGTERM); }
+                let deadline = Instant::now() + Duration::from_millis(500);
+                while child.try_wait()?.is_none() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             if child.try_wait()?.is_none() {
                 child.kill()?;
@@ -178,7 +206,10 @@ impl Carrier {
             }
         }
         self.device = None;
-        ensure!(gate?.success(), "TX gate did not confirm");
+        Ok(())
+    }
+
+    fn muted_readback(&self) -> Result<Value> {
         let result = readback(if self.frequency_hz == 0 { 0 } else { OFFSET })?;
         ensure!(
             result["powerdown"] == 1 && result["attenuation_mdb"] == 89750,
@@ -235,9 +266,10 @@ impl Carrier {
     }
 
     fn start(&mut self, requested: u64, attenuation: u64, guarded: bool) -> Result<Value> {
+        let sample_rate=attr("out_voltage_sampling_frequency")?;
         ensure!(
-            attr("out_voltage_sampling_frequency")? == FS.to_string(),
-            "TX sample rate differs"
+            sample_rate == FS.to_string(),
+            "TX sample rate {sample_rate:?}, expected {FS}"
         );
         let pll =
             set_attr("out_altvoltage1_TX_LO_frequency", requested - OFFSET)?.parse::<u64>()?;

@@ -168,6 +168,8 @@ radio_tick() {
 	fi
 	(
 		exec 3<&- 4<&-
+		exec 5>"$RUN/radio.lock"
+		flock -n 5 || { trace_lease radio_busy; exit 0; }
 		if [ ! -e "$OK_FILE" ] && [ -e "$FLAG" ]; then
 			enforce_tx
 			[ -e "$OK_FILE" ] || enforce_video

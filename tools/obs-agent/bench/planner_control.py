@@ -66,6 +66,21 @@ def receive_after_pause(receiver,status,folder,last):
     return dict(laps.result(),**sweep.result(),paused_ms=(resume-start)/1e6)
 
 
+def soak(receiver,status,folder,seconds):
+    assert 60 <= seconds <= 120
+    laps=Laps(status["actual"])
+    sweeps=Sweeps(status["actual"],folder/"soak-passes.json")
+    began=time.perf_counter()
+    while time.perf_counter()-began<seconds:
+        data,_=receiver.recvfrom(65535)
+        sweeps.accept(data)
+        if data[:8]==b"GVIEW4\0\0":laps.accept(data)
+    result=dict(laps.result(),**sweeps.result(),elapsed_s=time.perf_counter()-began)
+    result["view_payload_bytes"]=result["records"]*512
+    result["gview4_bytes"]=result["records"]*576
+    return result
+
+
 def start_sig0_replay(api, remote, index):
     # Fixed cadence in the device's own monotonic clock. If a job overruns,
     # skip deadlines so the load never becomes a catch-up burst.
@@ -462,6 +477,9 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     a.write_json(log/"commands.json",calls)
                     if cmd.get("next_ranges") is not None:
                         verify_next(a,url,path,log,receiver,status,sinks,len(calls))
+                    if os.environ.get("PLANNER_BENCH_SOAK_CASE")==str(len(calls)):
+                        calls[-1]["soak"]=soak(receiver,status,log,float(os.environ.get("PLANNER_BENCH_SOAK_SECONDS","60")))
+                        a.write_json(log/"commands.json",calls)
                     if os.environ.get("PLANNER_BENCH_MISSING_ACK4") and len(calls)==1:
                         sinks.missing=True
                         withheld=time.perf_counter_ns()

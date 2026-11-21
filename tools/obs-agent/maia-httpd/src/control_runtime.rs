@@ -1221,7 +1221,16 @@ fn worker(
         pending["prepared_next_version"] = Value::Null;
         pending["failed_plan"] = Value::Null;
         pending["field_watch"] = Value::Null;
+        let (radio_lock, lock_error) = if manual && pending["xtg1_wait_ticks"].is_number()
+            && (matches!(op,"antennas"|"scan"|"alternative"|"cancel_alternative")
+                || op == "return" && pending["return_mode"] == "scan") {
+            match tx::lock_radio(&shared.switch) {
+                Ok(file) => (Some(file), None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {(None,None)};
         let config_result = (|| {
+            if let Some(error) = lock_error {return Err(error);}
             if pending["pl_timing_only"] == true {
                 ensure!(op == "antennas" || op == "scan" && cmd["planner_version"] == 2,
                         "PL timing fixture accepts v2 scan commands only");
@@ -1786,11 +1795,11 @@ fn worker(
                 };
                 trace_control("guard_return", ||json!({"id":id,"generation":generation,"state":s[1],"powerdown":s[112]}));
                 ensure!(
-                    s[1] == 3 && s[9] == 0 && s[112] == 1,
+                    s[1] == 3 && s[9] == 0 && s[112] == 1 && (!guard_rf || s[113] == 89750),
                     "guard return credential"
                 );
                 if guard_rf {
-                    actual.borrow_mut()["tx"] = carrier.off()?;
+                    actual.borrow_mut()["tx"] = carrier.after_guard()?;
                     trace_control("carrier_closed", ||json!({"id":id,"generation":generation}));
                 }
                 Ok::<(), anyhow::Error>(())
@@ -1856,6 +1865,7 @@ fn worker(
                 receipt(&shared, &state, id, Some(e.to_string()));
             }
         }
+        drop(radio_lock);
     }
     Ok(())
 }
