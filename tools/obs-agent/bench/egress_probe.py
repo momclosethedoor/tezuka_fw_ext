@@ -47,7 +47,8 @@ def row(lo, hi):
 
 
 class Receiver(Sinks):
-    def __init__(self, folder):
+    def __init__(self, folder, capture_pal=False):
+        self.capture_pal = capture_pal
         self.acks = 0
         self.pause_video = threading.Event()
         self.video_established = threading.Event()
@@ -166,7 +167,9 @@ class Receiver(Sinks):
                     raw = stream.read(n)
                     now = time.perf_counter_ns()
                     if len(raw) != n:
-                        raise ValueError("short real8 packet")
+                        self.protocol_errors.append(dict(error="short real8 packet", magic=magic.decode("ascii"),
+                            generation=meta.get("generation"), seq=meta.get("seq"), bytes=n, received=len(raw)))
+                        return
                     if magic == b"R8P2":
                         kind = meta["kind"]
                         self.field_stats[kind] += 1
@@ -179,7 +182,7 @@ class Receiver(Sinks):
                             outcomes = self.field_stats["outcomes"]
                             outcomes[outcome] = outcomes.get(outcome, 0) + 1
                             self.field_stats["last_end"] = meta
-                        if result and not (self.folder/"field.real8").exists():
+                        if self.capture_pal and result and not (self.folder/"field.real8").exists():
                             info, payload = result
                             (self.folder/"field.real8").write_bytes(payload)
                             (self.folder/"field.json").write_text(json.dumps(info))
@@ -201,19 +204,21 @@ class Receiver(Sinks):
                     v["packets"] += 1
                     v["bytes"] += n
                     v["wire_bytes"] += n + m + HEADER.size
-                    if gen not in clips and not (self.folder/f"real8-{gen}.bin").exists():
-                        clips[gen] = bytearray()
-                        (self.folder/f"real8-{gen}.json").write_text(json.dumps(meta))
-                    if gen in clips:
-                        clips[gen].extend(raw)
-                        if len(clips[gen]) >= CLIP:
-                            (self.folder/f"real8-{gen}.bin").write_bytes(clips.pop(gen))
+                    if self.capture_pal:
+                        if not clips:
+                            clips[gen] = meta, bytearray()
+                        if gen in clips:
+                            _, clip = clips[gen]
+                            remain = CLIP-len(clip)
+                            if remain:
+                                clip.extend(raw[:remain])
             except (ValueError, KeyError, struct.error) as exc:
                 self.protocol_errors.append(str(exc))
             finally:
-                for gen, clip in clips.items():
+                for gen, (meta, clip) in clips.items():
                     if clip:
                         (self.folder/f"real8-{gen}.bin").write_bytes(clip)
+                        (self.folder/f"real8-{gen}.json").write_text(json.dumps(meta))
 
     def close(self):
         super().close()
@@ -297,6 +302,7 @@ def main():
     cli.add_argument("--video-only", action="store_true")
     cli.add_argument("--scan-only", action="store_true")
     cli.add_argument("--field-only", action="store_true")
+    cli.add_argument("--pal-check", action="store_true", help="capture continuous real8 before the FIELD watch")
     cli.add_argument("--field-hz", type=int, default=5864800000)
     cli.add_argument("--candidate", action="store_true")
     cli.add_argument("--native-usb", action="store_true")
@@ -304,6 +310,8 @@ def main():
     args = cli.parse_args()
     if sum((args.video_only, args.field_only, args.scan_only)) > 1 or (args.native_usb and (args.field_only or args.scan_only)):
         cli.error("choose one data subset; native USB requires the video comparison")
+    if args.pal_check and not args.field_only:
+        cli.error("--pal-check requires --field-only")
     board = bench.accepted
     reference = Path("C:/proj/pluto_ag/evidence")
     modules = reference/"ARM-SCAN-CONTROL-003/build-ee339de/modules"
@@ -334,7 +342,7 @@ def main():
         cfg = folder/"egress-config.json"
         board.write_json(cfg, config)
         board.upload(cfg, remote, cfg.name)
-        receiver = Receiver(folder)
+        receiver = Receiver(folder, args.pal_check)
         lease_stop, lease_ready, silence = threading.Event(), threading.Event(), threading.Event()
         lease = threading.Thread(target=lease_loop, args=(lease_stop, lease_ready, folder, silence), daemon=True)
         lease.start()
@@ -347,6 +355,12 @@ def main():
             board.write_json(folder/"initial-arm.json", startup)
             board.write_json(folder/"counters-initial.json", probe.counters())
             if args.field_only:
+                if args.pal_check:
+                    probe.command("analysis for PAL", analysis)
+                    probe.command("continuous PAL real8", video)
+                    time.sleep(2)
+                    returned = probe.command("RETURN from PAL", dict(op="return"))
+                    probe.checks["return_before_field"] = returned["mode"] == "analysis" and returned["running"]
                 probe.command("finite FIELD", scan)
                 time.sleep(args.seconds)
                 probe.command("STOP after FIELD", stop)
@@ -421,11 +435,13 @@ def main():
                     receiver.missing = False
                     probe.command("analysis after cancelled route", analysis)
                     probe.command("STOP analysis", stop)
-            if args.candidate and not (args.native_usb or args.scan_only):
+            if args.candidate and not args.scan_only:
                 for i in range(2):
                     probe.command(f"analysis cycle {i}", analysis)
                     probe.command(f"video cycle {i}", video)
                     probe.command(f"STOP video cycle {i}", stop)
+                    metrics = probe.cases[-1]["status"]["metrics"]["owner"]
+                    probe.checks[f"nominal_stop_video_{i}"] = bool(metrics) and not metrics["error"] and not metrics["cleanup_error"]
                     board.write_json(folder/f"counters-cycle-{i}.json", probe.counters())
                 probe.command("analysis before consumer pause", analysis)
                 receiver.pause_video.set()
@@ -441,6 +457,9 @@ def main():
                 probe.command("video after consumer resume", video)
                 time.sleep(2)
             probe.command("last STOP", stop)
+            if args.candidate and not args.scan_only:
+                metrics = probe.cases[-1]["status"]["metrics"]["owner"]
+                probe.checks["fresh_after_paused_consumer"] = bool(metrics) and not metrics["error"] and not metrics["cleanup_error"] and metrics["video_bytes"] > 0
             board.write_json(folder/"counters-final.json", probe.counters())
             if args.native_usb:
                 from egress_usb import measure
