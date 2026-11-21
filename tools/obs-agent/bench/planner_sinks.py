@@ -63,7 +63,7 @@ class Sinks:
         if event.get("event") == "prepare_path":
             from planner_row99 import bench
             assert event["ack_version"] == 3 and event["source"] == "ARM"
-            start=time.monotonic_ns()
+            start=time.perf_counter_ns()
             boot,gen,version,antenna,path=(event[k] for k in ("boot_id","generation","version","route","required_path"))
             conn.sendall(f"ACK3 {boot} {gen-1} {version} {antenna} {path}\n".encode())
             time.sleep(.08)
@@ -73,7 +73,7 @@ class Sinks:
             assert status["phase"]=="waiting_path_ack" and not status["actual"]["running"] and gate.strip()=="1"
             withheld=os.environ.get("PLANNER_BENCH_PATH_TIMEOUT")=="1"
             with (self.folder/"path-events.ndjson").open("a") as out:
-                print(json.dumps(dict(event=event,host_received_ns=start,host_before_ack_ns=time.monotonic_ns(),
+                print(json.dumps(dict(event=event,host_received_ns=start,host_before_ack_ns=time.perf_counter_ns(),
                     phase=status["phase"],prior_running=status["actual"]["running"],gate=int(gate),
                     correct_ack=not withheld,physical_switch=False)),file=out)
             if withheld:
@@ -88,7 +88,7 @@ class Sinks:
                 return ("ACK4 "+" ".join(map(str,[event["boot_id"],*f,event["required_path"]]))+"\n").encode()
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
         if os.environ.get("PLANNER_BENCH_SWEEP"):
-            received=time.monotonic_ns()
+            received=time.perf_counter_ns()
             if self.missing:
                 with (self.folder/"antenna.ndjson").open("a") as out:
                     print(json.dumps(dict(event=event,host_ns=received,correct_ack=False,
@@ -103,9 +103,10 @@ class Sinks:
                 conn.sendall(ack(fields))
                 event["required_path"]=expected
                 self.stop.wait(.025)
-            conn.sendall(ack(fields))
+            reply=ack(fields)
+            conn.sendall(reply*2 if os.environ.get("PLANNER_BENCH_WRONG_PATH_ACK") else reply)
             with (self.folder/"antenna.ndjson").open("a") as out:
-                print(json.dumps(dict(event=event,host_ns=received,host_ack_ns=time.monotonic_ns(),
+                print(json.dumps(dict(event=event,host_ns=received,host_ack_ns=time.perf_counter_ns(),
                                       correct_ack=True,physical_switch=False)),file=out)
             return
         old=fields.copy()
@@ -113,7 +114,7 @@ class Sinks:
         wrong=fields.copy()
         wrong[4]+=1
         conn.sendall(ack(old)+ack(wrong))
-        received=time.monotonic_ns()
+        received=time.perf_counter_ns()
         time.sleep(.025)
         if not self.missing:
             conn.sendall(ack(fields)*2)

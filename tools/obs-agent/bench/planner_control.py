@@ -304,14 +304,14 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                 if cmd["op"]=="cancel_alternative":
                     cmd["request_id"]=calls[-1]["status"]["applied_id"]
                 ident = uuid.uuid4().hex
-                start = time.monotonic_ns()
+                start = time.perf_counter_ns()
                 accepted = a.request(url,"POST",path,dict(cmd,id=ident),timeout=2)
                 assert accepted["accepted_id"] == ident
-                while time.monotonic_ns()-start < (75 if sweep else 35)*1_000_000_000:
+                while time.perf_counter_ns()-start < (75 if sweep else 35)*1_000_000_000:
                     status = a.request(url,"GET",path,timeout=5 if sweep else 1)
                     if ident in (status["applied_id"],status["failed_id"]): break
                     time.sleep(.02)
-                calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.monotonic_ns()-start))
+                calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.perf_counter_ns()-start))
                 a.write_json(log/"commands.json",calls)
                 if sweep and status["failed_id"]==ident:
                     print("Sweep rejected:",status["error"],flush=True)
@@ -356,7 +356,7 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     else:
                         raise RuntimeError("no UDP observation of applied generation")
                     (log/f"view-{len(calls)}.bin").write_bytes(data)
-                    calls[-1].update(stale_datagrams_discarded=discarded,fresh_host_ns=time.monotonic_ns()-start)
+                    calls[-1].update(stale_datagrams_discarded=discarded,fresh_host_ns=time.perf_counter_ns()-start)
                     if replay_window and cmd.get("test_sig0_replay"):
                         start_sig0_replay(a,remote,len(calls))
                     if status["actual"]["mode"]=="scan" and not os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
@@ -366,14 +366,32 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     if os.environ.get("PLANNER_BENCH_RECORD_GATE") and status["actual"]["guard_tx"].get("per_visit"):
                         receipts = []
                         for _ in range(36):
-                            t0=time.monotonic_ns()
+                            t0=time.perf_counter_ns()
                             readback=a.request(url,"GET",path,timeout=1)
                             tx=readback["actual"]["tx"]
-                            receipts.append(dict(tx=tx,rtt_ns=time.monotonic_ns()-t0,
+                            receipts.append(dict(tx=tx,rtt_ns=time.perf_counter_ns()-t0,
                                 generation=readback["actual"]["generation"],error=readback["error"]))
                             time.sleep(.021)
                         a.write_json(log/f"gate-{len(calls)}.json",receipts)
                     a.write_json(log/"commands.json",calls)
+                    if os.environ.get("PLANNER_BENCH_MISSING_ACK4") and len(calls)==1:
+                        sinks.missing=True
+                        withheld=time.perf_counter_ns()
+                        while time.perf_counter_ns()-withheld<4_000_000_000:
+                            failed=a.request(url,"GET",path,timeout=1)
+                            if failed["failed_id"]==ident:
+                                break
+                            time.sleep(.02)
+                        else:
+                            raise AssertionError("no failure after missing ACK4")
+                        elapsed=time.perf_counter_ns()-withheld
+                        returned=json.loads(a.ssh(f"cd {remote} && ./obs-fl-ctl status"))
+                        a.write_json(log/"missing-ack4.json",dict(status=failed,guard=returned,
+                            host_upper_bound_ns=elapsed))
+                        assert "route ACK timeout after retry" in failed["error"]
+                        assert not failed["actual"]["running"]
+                        assert returned["fld_control"]==0 and returned["tx_powerdown_readback"]==1
+                        sinks.missing=False
                     if os.environ.get("PLANNER_BENCH_STOP_WHILE_ROUTE") and len(calls)==1:
                         sinks.missing=True
                         end=time.monotonic()+1.5
@@ -400,19 +418,19 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                         a.write_json(log/"edge-start.json",readback)
                         assert pos["mixer"] and readback["guard"]["powerdown"]==0
                         assert readback["generation"]==readback["fresh_generation"]
-                    if os.environ.get("PLANNER_BENCH_LEASE_LOSS") and len(calls)==1:
+                    if os.environ.get("PLANNER_BENCH_LEASE_LOSS") == str(len(calls)):
                         time.sleep(6)
                         healthy=a.request(url,"GET",path,timeout=1)
                         assert healthy["actual"]["running"] and healthy["phase"]=="running", healthy["error"]
                         silence.set()
-                        start_loss=time.monotonic_ns()
-                        while time.monotonic_ns()-start_loss < 8_000_000_000:
+                        start_loss=time.perf_counter_ns()
+                        while time.perf_counter_ns()-start_loss < 8_000_000_000:
                             expired=a.request(url,"GET",path,timeout=1)
                             if expired["failed_id"]==ident:break
                             time.sleep(.05)
                         assert expired["failed_id"]==ident and not expired["actual"]["running"]
                         gate=a.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain")
-                        api_elapsed=time.monotonic_ns()-start_loss
+                        api_elapsed=time.perf_counter_ns()-start_loss
                         a.write_json(log/"host-lease-loss.json",dict(status=expired,physical=gate,
                             host_upper_bound_ns=api_elapsed))
                         assert gate.splitlines()[0]=="1" and float(gate.splitlines()[1].split()[0])==-89.75
@@ -476,6 +494,10 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                 a.write_json(log/"handback.json",dict(guard=returned,radio=radio))
                 assert returned["fld_control"] == 0
                 assert radio[0] == "1" and float(radio[1].split()[0]) == -89.75
+                if os.environ.get("PLANNER_BENCH_TPC2_DIAGNOSTIC"):
+                    ident, word = a.ssh("devmem 0x7c46033c 32; devmem 0x7c460344 32").splitlines()
+                    assert int(ident,16)==0x32435054
+                    a.write_json(log/"tpc2-handback.json",dict(id=ident,word=word))
         finally:
             stop.set()
             if thread: thread.join(3)

@@ -25,6 +25,9 @@ def stage_executables(*args, **kwargs):
             "07399ea386ed080b49e130d0d58db32627abf3f406c1b6d036c38370004ae94b": (
                 1_083_552, b'test "$(devmem 0x7c46033c)" = 0x00000000\necho XTG1_CONTROL=1\n'
             ),
+            "65e8ffa41926026fb14a3aaf6bf4c052136775403b0d8c1027bbf2cbc729b17a": (
+                1_124_480, b'test "$(devmem 0x7c46033c)" = 0x32435054\necho TPC2_ID=0x32435054\n'
+            ),
         }
         expected = api.digest(image)
         if expected not in variants or image.stat().st_size != variants[expected][0]:
