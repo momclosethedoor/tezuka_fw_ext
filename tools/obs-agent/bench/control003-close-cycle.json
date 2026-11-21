@@ -1,0 +1,6 @@
+[
+  {"ranges":[{"enabled":true,"lo_hz":70000000,"hi_hz":12000000000}],"view_delivery":"stream"},
+  {"ranges":[{"enabled":true,"lo_hz":6748000000,"hi_hz":6752000000}],
+   "next_ranges":[{"enabled":true,"lo_hz":6760000000,"hi_hz":6764000000}],"view_delivery":"stream"},
+  {"run":false,"ranges":[{"enabled":true,"lo_hz":6748000000,"hi_hz":6752000000}]}
+]

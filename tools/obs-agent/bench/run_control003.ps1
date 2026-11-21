@@ -1,11 +1,12 @@
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','ack4-stop','ack4-exhaust','take','take-stop','progress')][string]$Case,
+    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','ack4-stop','ack4-exhaust','take','take-stop','progress','close-baseline','close-next','close-next-fault','close-cycle')][string]$Case,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Run,
     [Parameter(Mandatory=$true)][string]$Agent,
     [Parameter(Mandatory=$true)][string]$Modules,
     [ValidateRange(1,5)][int]$Repeat=1,
     [string]$Fault='',
-    [switch]$NoTrace
+    [switch]$NoTrace,
+    [switch]$Close
 )
 $ErrorActionPreference='Stop'
 $fw=(Resolve-Path "$PSScriptRoot/../../..").Path
@@ -13,6 +14,7 @@ $workspace=Split-Path $fw
 $old="$workspace/evidence/ARM-SCAN-CONTROL-002"
 $previous="$workspace/evidence/ARM-SCAN-027-ACCEPT-001"
 $root="$workspace/evidence/ARM-SCAN-CONTROL-003"
+if ($Close -or $Case.StartsWith('close-')) { $root += '-CLOSE' }
 $Agent=(Resolve-Path $Agent).Path
 $Modules=(Resolve-Path $Modules).Path
 $py=Join-Path (Split-Path $workspace) 'goofy_scan/.venv/Scripts/python.exe'
@@ -37,6 +39,32 @@ $fixture=@{
 }
 if (!$NoTrace) { $fixture.PLANNER_BENCH_CONTROL_TRACE='1'; $fixture.PLANNER_BENCH_PHASE_TIMING='1' }
 switch ($Case) {
+    {$_ -in 'close-baseline','close-next','close-next-fault','close-cycle'} {
+        $fixture.PLANNER_BENCH_ACK3_FAST='1'
+        if ($Case -eq 'close-next-fault' -or $Case -eq 'close-cycle') {
+            $fixture.PLANNER_BENCH_SWEEP="$PSScriptRoot/control003-close-cycle.json"
+        } else {
+            $fixture.PLANNER_BENCH_SWEEP="$PSScriptRoot/control003-maps.json"
+            $fixture.PLANNER_BENCH_CASE_INDEX='8'
+        }
+        if ($Case -eq 'close-baseline') {
+            $fixture.PLANNER_BENCH_NEXT_BASELINE='1'
+        } else {
+            $fixture.PLANNER_BENCH_CLOSE_CLOCK='1'
+            $fixture.PLANNER_BENCH_NEXT_CLOSE='hold'
+        }
+        if ($Case -eq 'close-next-fault') {
+            $fixture.PLANNER_BENCH_CASE_INDEX='2'
+            $fixture.PLANNER_BENCH_NEXT_CLOSE='fault'
+        }
+        if ($Case -eq 'close-cycle') {
+            $fixture.PLANNER_BENCH_CATALOG='1'
+            $fixture.PLANNER_BENCH_CLOSE_CYCLE='1'
+            $fixture.PLANNER_BENCH_CLOSE_BANK='1'
+            $fixture.PLANNER_BENCH_NEXT_CLOSE='check'
+            $fixture.PLANNER_BENCH_MIN_SECONDS='3'
+        }
+    }
     'repeat' { $fixture.PLANNER_BENCH_SWEEP="$previous/tpc2-rf.json"; $fixture.PLANNER_BENCH_MIN_SECONDS='1' }
     'maps' {
         $fixture.PLANNER_BENCH_SWEEP="$PSScriptRoot/control003-maps.json"

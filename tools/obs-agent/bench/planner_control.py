@@ -198,15 +198,35 @@ def verify_recovery(api, url, path, scan, log):
         failure=failure, ordered=ordered_state, mixed=mixed, reconnected=connected, stale_http=409))
 
 
+def validate_clock(status):
+    assert status["boot_id"]==status["actual"]["boot"] and status["clock_session"]
+    now,receipt=(status[k] for k in ("arm_now_ns","arm_clock_ns"))
+    assert all(isinstance(t,str) and t.isdecimal() for t in (now,receipt))
+    assert int(now)>=int(receipt)
+    for sample in (status["progress"],status["last_progress"]):
+        if sample:
+            assert isinstance(sample["arm_ns"],str) and 0<=int(sample["arm_ns"])<=int(now)
+    if (p:=status["progress"]):
+        a=status["actual"]
+        c=status["last_confirmed"]
+        assert a["running"]
+        assert (p["generation"],p["version"],p["map_epoch"],p["run"])==(
+            a["generation"],a["map_version"],a["epoch"],a["dma_run"])
+        assert all(p[k]==c[k] for k in ("generation","version","map_epoch","run"))
+        assert p["epoch"]>=p["map_epoch"] and p["state"]!="stalled"
+
+
 def verify_next(api, url, path, log, receiver, previous, sinks, index):
     active = previous["actual"]
     ident = uuid.uuid4().hex
     command = dict(op="next", id=ident, source_generation=active["generation"],
                    next_version=active["prepared_next_version"])
     cancel = os.environ.get("PLANNER_BENCH_CANCEL_NEXT") == str(index)
+    close = os.environ.get("PLANNER_BENCH_NEXT_CLOSE", "")
+    hold = close == "hold"
     cookie = "devmem 0x7c460150 32"
     initial = api.ssh(cookie).strip()
-    if cancel:
+    if cancel or hold:
         sinks.missing = True
         until = time.perf_counter() + .8
         while time.perf_counter() < until:
@@ -225,6 +245,13 @@ def verify_next(api, url, path, log, receiver, previous, sinks, index):
         assert error.code==409
     else:
         raise AssertionError("conflicting NEXT accepted")
+    if hold:
+        pending=api.request(url,"GET",path,timeout=1)
+        validate_clock(pending)
+        assert pending["pending_id"]==ident and pending["actual"]["generation"]==active["generation"]
+        sinks.missing=False
+    else:
+        pending=None
     if cancel:
         until=time.perf_counter()+.7
         while time.perf_counter()<until:
@@ -236,6 +263,7 @@ def verify_next(api, url, path, log, receiver, previous, sinks, index):
     deadline=time.perf_counter()+5
     while time.perf_counter()<deadline:
         changed=api.request(url,"GET",path,timeout=1)
+        if close: validate_clock(changed)
         assert changed["failed_id"]!=ident,changed["error"]
         if changed["applied_id"]==ident:
             break
@@ -252,6 +280,9 @@ def verify_next(api, url, path, log, receiver, previous, sinks, index):
         generations={struct.unpack_from("<Q",data,offset+56)[0] for offset in range(0,len(data),576)}
         assert len(generations)==1,"mixed generations in one datagram"
         if now["generation"] in generations:break
+        if close:
+            assert generations=={active["generation"]}
+            assert all(struct.unpack_from("<Q",data,i+24)[0]<now["epoch"] for i in range(0,len(data),576))
         old+=1
     else:
         raise AssertionError("missing fresh GVIEW4 after NEXT")
@@ -274,7 +305,61 @@ def verify_next(api, url, path, log, receiver, previous, sinks, index):
     else:
         raise AssertionError("no bound TX receipt on new map")
     api.write_json(log/f"next-{index}.json",dict(cmd=command,before=previous,after=changed,
-        run=initial,old_datagrams=old,first_fresh_ns=elapsed,laps=laps,visit=visit))
+        run=initial,old_datagrams=old,first_fresh_ns=elapsed,laps=laps,visit=visit,pending=pending))
+    if close:
+        def observe():
+            s=api.request(url,"GET",path,timeout=1)
+            validate_clock(s)
+            return s
+        first=observe()
+        if close == "fault":
+            wait=time.monotonic()+3
+            while time.monotonic()<wait:
+                failed=observe()
+                if failed["failed_id"]==ident: break
+                time.sleep(.02)
+            else:
+                raise AssertionError("NEXT did not report the injected progress failure")
+            second=observe()
+            fault=failed["progress_failure"]
+            assert failed["phase"]=="failed" and not failed["actual"]["running"]
+            assert failed["progress"] is None and second["last_progress"]==failed["last_progress"]
+            assert fault["id"]==ident and fault["generation"]==now["generation"]
+            assert fault["last_sample"]["test_injected"] and fault["last_sample"]["run"]==int(initial,16)
+            assert fault["last_sample"]["version"]==now["map_version"] and fault["last_sample"]["map_epoch"]==now["epoch"]
+            assert fault["recovery"]=="exhausted_or_cancelled" and fault["handback"]["error"] is None
+            assert second["last_confirmed"]["generation"]==now["generation"]
+            api.write_json(log/"next-progress-failure.json",dict(failure=fault,confirmed=second["last_confirmed"],
+                last_progress=failed["last_progress"],now=second["arm_now_ns"]))
+        else:
+            wait=time.monotonic()+1
+            while not first["progress"] and time.monotonic()<wait:
+                time.sleep(.02)
+                first=observe()
+            time.sleep(.23)
+            second=observe()
+            assert first["progress"] and second["progress"]
+            assert first["arm_clock_ns"]==second["arm_clock_ns"]
+            assert int(second["arm_now_ns"])>int(first["arm_now_ns"])
+            assert int(second["progress"]["arm_ns"])>int(first["progress"]["arm_ns"])
+            assert second["progress"]["run"]==int(initial,16)
+            assert second["clock_session"]==first["clock_session"]
+            api.write_json(log/f"next-progress-{index}.json",dict(first=first["progress"],second=second["progress"],
+                boot_id=second["boot_id"],clock_session=second["clock_session"],receipt=second["arm_clock_ns"],
+                now=[first["arm_now_ns"],second["arm_now_ns"]],last_confirmed=second["last_confirmed"]))
+    if os.environ.get("PLANNER_BENCH_NEXT_BASELINE") == "1":
+        def sample():
+            s=api.request(url,"GET",path,timeout=1)
+            return dict(actual_generation=s["actual"]["generation"],actual_version=s["actual"]["map_version"],
+                        receipt=s["arm_clock_ns"],progress=s["progress"],last_confirmed=s["last_confirmed"])
+        first=sample()
+        time.sleep(.3)
+        second=sample()
+        api.write_json(log/"next-baseline.json",dict(first=first,second=second))
+        assert second["progress"]["version"]==second["actual_version"]
+        assert second["progress"]["generation"]!=second["actual_generation"]
+        assert int(second["progress"]["arm_ns"])>int(first["progress"]["arm_ns"])
+        assert second["receipt"]==first["receipt"]
 
 
 def verify_prepare_cancel(api, url, path, log, scan):
@@ -339,11 +424,24 @@ done
     (log/f"board-{label}.txt").write_text(f"host_ns {time.perf_counter_ns()}\n"+sample,encoding="utf-8")
 
 
+def owner_sample(api):
+    lines=api.ssh("p=$(pidof maia-delivery); cat /proc/uptime /proc/$p/stat /proc/$p/status; ls /proc/$p/fd",3).splitlines()
+    fields=lines[1].rsplit(")",1)[1].split()
+    status=dict(line.split(":",1) for line in lines[2:] if ":" in line)
+    return dict(uptime_s=float(lines[0].split()[0]),cpu_ticks=int(fields[11])+int(fields[12]),
+                rss_kib=int(status["VmRSS"].split()[0]),threads=int(status["Threads"]),
+                fds=sum(line.strip().isdigit() for line in lines[2:]))
+
+
 def control(log, profiles, boot):
     a = bench.accepted
     board_sample(a,log,"before")
     v2 = os.environ.get("PLANNER_BENCH_VERSION", "2") == "2"
     remote = a.REMOTE
+    if os.environ.get("PLANNER_BENCH_CLOSE_BANK") == "1":
+        bank=json.loads(a.ssh(f"cd {remote}; ./maia-delivery --check-scan-tx-bank",6))
+        assert bank["eight_slots"]==list(range(8)) and "9 TX" in bank["nine_error"] and not bank["installed"]
+        a.write_json(log/"tx-bank.json",bank)
     url = "http://192.168.2.1:18080"
     path = "/api/system/control"
     if source := os.environ.get("PLANNER_BENCH_LEASE_SCRIPT"):
@@ -425,6 +523,8 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
     trace = "OBS_CONTROL_TRACE=1 " if os.environ.get("PLANNER_BENCH_CONTROL_TRACE") else ""
     if os.environ.get("PLANNER_BENCH_PROGRESS") == "1":
         trace += "OBS_CONTROL_TEST_PROGRESS=1 "
+    if os.environ.get("PLANNER_BENCH_NEXT_CLOSE") == "fault":
+        trace += "OBS_CONTROL_TEST_NEXT_PROGRESS=1 "
     a.ssh(f"cd {remote} && ({trace}OBS_PHASE_TIMING={phase_timing} timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
     calls = []
     stop,ready,silence=threading.Event(),threading.Event(),threading.Event()
@@ -488,6 +588,7 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     raise ValueError("each RAM series supports 1..5 repetitions")
                 cases *= repeats
                 cmds = [case if case.get("op")=="antennas" else dict(scan, **case) for case in cases] + [dict(scan,run=False)]
+            stats=[]
             for cmd in cmds:
                 if cmd["op"]=="alternative":
                     prev=calls[-1]["status"]["actual"]
@@ -526,6 +627,23 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     time.sleep(.02)
                 calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.perf_counter_ns()-start))
                 a.write_json(log/"commands.json",calls)
+                if os.environ.get("PLANNER_BENCH_CLOSE_CLOCK") == "1" and not cmd.get("run") and cmd["op"]=="scan":
+                    validate_clock(status)
+                    assert status["phase"]=="stopped" and status["progress"] is None
+                    time.sleep(.12)
+                    later=a.request(url,"GET",path,timeout=1)
+                    validate_clock(later)
+                    assert int(later["arm_now_ns"])>int(status["arm_now_ns"])
+                    assert later["arm_clock_ns"]==status["arm_clock_ns"] and later["last_progress"]==status["last_progress"]
+                    a.write_json(log/"stop-clock.json",dict(now=[status["arm_now_ns"],later["arm_now_ns"]],
+                        receipt=later["arm_clock_ns"],last_progress=later["last_progress"],active=later["progress"],
+                        boot_id=later["boot_id"],clock_session=later["clock_session"]))
+                    if os.environ.get("PLANNER_BENCH_CLOSE_CYCLE") == "1":
+                        stats.append(dict(owner_sample(a),commands=len(calls),
+                            failures=sum(c["status"]["phase"]=="failed" for c in calls),
+                            take_retries=sum(max(0,len((c["status"].get("operation") or {}).get("attempts",[]))-1)
+                                for c in calls if c["command"].get("run"))))
+                        a.write_json(log/"owner-cycles.json",stats)
                 if stop_id:
                     assert status["applied_id"] == stop_id,"STOP did not finish after pending TAKE"
                     continue
