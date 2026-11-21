@@ -1,5 +1,6 @@
 """RAM-only TPC2 egress comparison with continuously reading benchmark sockets."""
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,23 @@ HEADER = struct.Struct("<4sII")
 CLIP = 2 * 1024 * 1024
 
 
+def host_sample():
+    values = dict(clock_ns=time.perf_counter_ns(), cpu_s=time.process_time(), python_threads=threading.active_count())
+    if os.name == "nt":
+        from ctypes import wintypes
+        class Memory(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD)] + [
+                (field, ctypes.c_size_t) for field in ("peak_working_set", "working_set", "quota_peak_paged",
+                "quota_paged", "quota_peak_nonpaged", "quota_nonpaged", "pagefile", "peak_pagefile")]
+        memory = Memory()
+        memory.cb = ctypes.sizeof(memory)
+        query = ctypes.WinDLL("psapi").GetProcessMemoryInfo
+        query.argtypes = (wintypes.HANDLE, ctypes.POINTER(Memory), wintypes.DWORD)
+        if query(wintypes.HANDLE(-1), ctypes.byref(memory), memory.cb):
+            values.update(rss_kib=memory.working_set // 1024, peak_rss_kib=memory.peak_working_set // 1024)
+    return values
+
+
 def row(lo, hi):
     return dict(lo_hz=lo, hi_hz=hi, enabled=True)
 
@@ -31,14 +49,15 @@ def row(lo, hi):
 class Receiver(Sinks):
     def __init__(self, folder):
         self.acks = 0
+        self.pause_video = threading.Event()
+        self.video_established = threading.Event()
         self.video_stats = {}
         self.field_stats = dict(begin=0, data=0, end=0, bytes=0, qualified=0, error=0)
         self.protocol_errors = []
         self.views = {}
         self.malformed_udp = 0
         super().__init__(HOST, folder)
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as dummy:
-            self.udp = dummy.dup()
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
         self.udp.bind((HOST, 18010))
         self.udp.settimeout(.2)
@@ -122,6 +141,10 @@ class Receiver(Sinks):
         with conn.makefile("rb") as stream:
             try:
                 while not self.stop.is_set():
+                    if self.pause_video.is_set():
+                        self.video_established.set()
+                        while self.pause_video.is_set() and not self.stop.wait(.02):
+                            pass
                     hdr = stream.read(HEADER.size)
                     if not hdr:
                         return
@@ -200,6 +223,7 @@ class Probe:
         self.sink = receiver
         self.folder = folder
         self.cases = []
+        self.checks = {}
 
     def request(self, cmd=None):
         return self.board.request(URL, "POST" if cmd else "GET", PATH, cmd, timeout=3) if cmd else (
@@ -227,20 +251,25 @@ class Probe:
                        error=json.load(error), elapsed_ns=time.perf_counter_ns()-start, status=self.request())
         else:
             assert result["accepted_id"] == ident
+            accepted = time.perf_counter_ns()
             status = self.until(lambda s: ident in (s["applied_id"], s["failed_id"]), seconds)
             row = dict(label=label, command=cmd, id=ident, http=202, status=status,
-                       elapsed_ns=time.perf_counter_ns()-start)
+                       host_post_ns=start, accepted_ns=accepted-start, elapsed_ns=time.perf_counter_ns()-start)
         self.cases.append(row)
         self.save()
         print(label, row["http"], row["status"]["phase"], row["status"].get("error"), flush=True)
         return row["status"]["actual"]
 
     def save(self):
-        self.board.write_json(self.folder/"egress.json", dict(commands=self.cases, **self.sink.summary()))
+        self.board.write_json(self.folder/"egress.json", dict(commands=self.cases, checks=self.checks, **self.sink.summary()))
 
     def counters(self):
-        return dict(owner=owner_sample(self.board),
-                    network=self.board.ssh("cat /proc/net/snmp /proc/net/dev", 5))
+        system = self.board.ssh(
+            "for name in maia-delivery iio_readdev iiod obs-field1; do "
+            "for p in $(pidof $name); do for t in /proc/$p/task/*; do cat $t/stat; done; "
+            "grep -E 'VmRSS|Threads' /proc/$p/status; ls /proc/$p/fd | wc -l; done; done; "
+            "cat /proc/net/snmp /proc/net/dev", 5)
+        return dict(host=host_sample(), owner=owner_sample(self.board), processes_and_network=system)
 
 
 def main():
@@ -250,6 +279,10 @@ def main():
     cli.add_argument("--video-hz", type=int, default=5865000000)
     cli.add_argument("--seconds", type=int, default=30, choices=range(5, 121))
     cli.add_argument("--video-only", action="store_true")
+    cli.add_argument("--field-only", action="store_true")
+    cli.add_argument("--field-hz", type=int, default=5864800000)
+    cli.add_argument("--candidate", action="store_true")
+    cli.add_argument("--native-usb", action="store_true")
     args = cli.parse_args()
     board = bench.accepted
     reference = Path("C:/proj/pluto_ag/evidence")
@@ -267,15 +300,17 @@ def main():
         board.upload(field, remote, field.name)
         board.ssh(f"chmod 700 {remote}/{field.name}")
         scan = dict(op="scan", planner_version=2, path_ack_version=1, sweep_geometry="27/9", xtg1_wait_ticks=256,
-                    catalog_on_boot=not args.video_only, k=2, run=True,
+                    catalog_on_boot=not (args.video_only or args.field_only), k=2, run=True,
                     ranges=[row(args.video_hz-1_500_000, args.video_hz+1_500_000)])
         analysis = dict(op="analysis", center_hz=args.video_hz, width_hz=24_000_000, k=700,
                         gain_db=35, agc="manual")
         video = dict(op="video", center_hz=args.video_hz, width_hz=8_000_000)
         stop = dict(scan, run=False)
         config = dict(boot_id=boot, output=remote+"/control", view=HOST+":18010",
-                    video=HOST+":18009", route=HOST+":18008", scan=stop, analysis=analysis,
-                    field_preview=dict(collector=remote+"/obs-field1", target_hz=args.video_hz, timeout_ms=90))
+                    video=HOST+":18009", route=HOST+":18008", scan=stop, analysis=analysis)
+        if args.field_only or not args.candidate:
+            config["field_preview"] = dict(collector=remote+"/obs-field1",
+                target_hz=args.field_hz if args.field_only else args.video_hz, timeout_ms=90)
         cfg = folder/"egress-config.json"
         board.write_json(cfg, config)
         board.upload(cfg, remote, cfg.name)
@@ -290,32 +325,96 @@ def main():
             startup = probe.until(lambda s: s["phase"] == "stopped", 95)
             board.write_json(folder/"initial-arm.json", startup)
             board.write_json(folder/"counters-initial.json", probe.counters())
-            probe.command("analysis", analysis)
+            if args.field_only:
+                probe.command("finite FIELD", scan)
+                time.sleep(args.seconds)
+                probe.command("STOP after FIELD", stop)
+                return
+            analysis_actual = probe.command("analysis", analysis)
+            board.write_json(folder/"counters-video-before.json", probe.counters())
             probe.command("continuous real8", video)
-            time.sleep(12 if args.video_only else args.seconds)
+            time.sleep(args.seconds)
             board.write_json(folder/"counters-video.json", probe.counters())
             probe.command("RETURN", dict(op="return"))
-            probe.command("finite FIELD", scan)
-            time.sleep(8)
-            probe.command("STOP after FIELD", stop)
+            if args.candidate:
+                probe.command("video for scan transition", video)
+                probe.command("video to scan", scan)
+                time.sleep(2)
+                probe.command("STOP after video to scan", stop)
+            else:
+                probe.command("finite FIELD", scan)
+                time.sleep(8)
+                probe.command("STOP after FIELD", stop)
             if not args.video_only:
                 for k in (1, 1023):
                     probe.command(f"narrow K{k}", dict(scan, k=k))
-                    time.sleep(2)
+                    time.sleep(3)
+                    board.write_json(folder/f"narrow-K{k}.json", dict(status=probe.request(), sink=receiver.summary()))
+                    probe.command(f"STOP K{k}", stop)
+                    (folder/f"reader-K{k}.txt").write_text(board.ssh(f"cat {remote}/control/reader/result.json || true"))
                 mixed = dict(scan, ranges=[row(5_996_000_000,6_004_000_000),row(2_428_480_000,2_428_560_000)])
                 probe.command("mixed seam narrow DC", mixed)
                 time.sleep(3)
-                probe.command("wide stream", dict(scan, ranges=[row(70_000_000,12_000_000_000)]))
+                wide = probe.command("wide stream", dict(scan, ranges=[row(70_000_000,12_000_000_000)]))
                 before = dict(status=probe.request(), sink=receiver.summary(), system=probe.counters())
                 board.write_json(folder/"wide-before.json", before)
                 time.sleep(args.seconds)
                 after = dict(status=probe.request(), sink=receiver.summary(), system=probe.counters())
                 board.write_json(folder/"wide-after.json", after)
-                probe.command("TX conflict during scan", dict(op="tx", on=False, frequency_hz=2_450_000_000, attenuation_mdb=89750))
+                blocked = probe.command("TX conflict during scan", dict(op="tx", on=False, frequency_hz=2_450_000_000, attenuation_mdb=89750))
+                if args.candidate:
+                    probe.checks["tx_conflict_http_409"] = probe.cases[-1]["http"] == 409
+                    probe.checks["tx_conflict_execution_unchanged"] = blocked["running"] and all(
+                        blocked[key] == wide[key] for key in ("generation", "dma_run", "map_version"))
+                    count = receiver.view_stats(wide["generation"])["received"]
+                    time.sleep(.4)
+                    probe.checks["tx_conflict_fresh_view"] = receiver.view_stats(wide["generation"])["received"] > count
                 probe.command("STOP after wide", stop)
+                (folder/"reader-wide.txt").write_text(board.ssh(f"cat {remote}/control/reader/result.json || true"))
                 probe.command("analysis retained", analysis)
                 probe.command("manual route direct", dict(op="route", kind="direct", antenna=0))
-                probe.command("last STOP", stop)
+                if args.candidate:
+                    mixer = probe.command("manual route mixer", dict(op="route", kind="mixer", antenna=1))
+                    probe.checks["manual_mixer"] = mixer["route"]["kind"] == mixer["analysis_route"]["kind"] == "mixer"
+                    restored = probe.command("manual route back to direct", dict(op="route", kind="direct", antenna=0))
+                    probe.checks["manual_direct"] = restored["route"]["kind"] == restored["analysis_route"]["kind"] == "direct"
+                    receiver.missing = True
+                    waiting_id = uuid.uuid4().hex
+                    wait_cmd = dict(op="route", kind="mixer", antenna=1, id=waiting_id)
+                    assert probe.request(wait_cmd)["accepted_id"] == waiting_id
+                    waited = probe.until(lambda st: bool(st["route_pending"]) or st["failed_id"] == waiting_id, 3)
+                    probe.checks["withheld_route_pending"] = bool(waited["route_pending"])
+                    board.write_json(folder/"withheld-route.json", waited)
+                    probe.command("STOP waiting route", stop)
+                    receiver.missing = False
+                    probe.command("analysis after cancelled route", analysis)
+                    probe.command("STOP analysis", stop)
+            if args.candidate and not args.native_usb:
+                for i in range(2):
+                    probe.command(f"analysis cycle {i}", analysis)
+                    probe.command(f"video cycle {i}", video)
+                    probe.command(f"STOP video cycle {i}", stop)
+                    board.write_json(folder/f"counters-cycle-{i}.json", probe.counters())
+                probe.command("analysis before consumer pause", analysis)
+                receiver.pause_video.set()
+                queued_id = uuid.uuid4().hex
+                assert probe.request(dict(video, id=queued_id))["accepted_id"] == queued_id
+                assert receiver.video_established.wait(6)
+                blocked = probe.until(lambda st: st["failed_id"] == queued_id or (st["metrics"]["owner"] or {}).get("send_would_block", 0), 5)
+                board.write_json(folder/"consumer-paused.json", blocked)
+                probe.command("STOP with consumer paused", stop)
+                receiver.pause_video.clear()
+                probe.command("analysis after pause", analysis)
+                probe.command("video after consumer resume", video)
+                time.sleep(2)
+            probe.command("last STOP", stop)
+            if args.native_usb:
+                from egress_usb import measure
+                board.ssh(f"cd {remote}; kill -TERM \"$(cat owner.pid)\"; i=0; while pidof maia-delivery >/dev/null && test \"$i\" -lt 40; do i=$((i+1)); usleep 50000; done; ! pidof maia-delivery")
+                try:
+                    measure(board, folder, args.seconds, analysis_actual["rx_lo_hz"], host_sample)
+                except (OSError, RuntimeError) as exc:
+                    (folder/"native-error.txt").write_text(str(exc), encoding="utf-8")
         finally:
             try:
                 board.ssh(f"cd {remote}; if test -f owner.pid; then p=$(cat owner.pid); if test \"$(cat /proc/$p/comm 2>/dev/null || :)\" = timeout; then kill -TERM \"$p\"; fi; fi; sleep 1")
