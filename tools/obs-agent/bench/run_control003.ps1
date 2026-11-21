@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','ack4-stop','ack4-exhaust','take','take-stop','progress','close-baseline','close-next','close-next-fault','close-cycle','range-capacity')][string]$Case,
+    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','ack4-stop','ack4-exhaust','take','take-stop','progress','close-baseline','close-next','close-next-fault','close-cycle','range-capacity','catalog-routes')][string]$Case,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Run,
     [Parameter(Mandatory=$true)][string]$Agent,
     [Parameter(Mandatory=$true)][string]$Modules,
@@ -81,6 +81,11 @@ switch ($Case) {
         $fixture.PLANNER_BENCH_RANGE_CAPACITY='1'
         $fixture.PLANNER_BENCH_RX_PAUSE_MS='450'
         $fixture.PLANNER_BENCH_MIN_SECONDS='3'
+    }
+    'catalog-routes' {
+        $fixture.PLANNER_BENCH_SWEEP="$PSScriptRoot/control003-catalog-routes.json"
+        $fixture.PLANNER_BENCH_CATALOG='1'
+        $fixture.PLANNER_BENCH_ACK3_FAST='1'
     }
     'tx-map' {
         $fixture.PLANNER_BENCH_SWEEP="$PSScriptRoot/control003-maps.json"

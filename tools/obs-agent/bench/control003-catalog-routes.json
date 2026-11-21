@@ -1,0 +1,35 @@
+[
+  {"ranges":[
+    {"enabled":true,"lo_hz":6100000000,"hi_hz":6116000000},
+    {"enabled":true,"lo_hz":10800000000,"hi_hz":10816000000},
+    {"enabled":true,"lo_hz":7332000000,"hi_hz":7348000000}
+  ]},
+  {"ranges":[
+    {"enabled":true,"lo_hz":6100000000,"hi_hz":6116000000,"path":"mixer"},
+    {"enabled":true,"lo_hz":10800000000,"hi_hz":10816000000,"path":"mixer"},
+    {"enabled":true,"lo_hz":7332000000,"hi_hz":7348000000,"path":"mixer"}
+  ]},
+  {"antenna_bands":{"0":[[4000000000,13000000000]]},"ranges":[
+    {"enabled":true,"lo_hz":6100000000,"hi_hz":6116000000},
+    {"enabled":true,"lo_hz":10800000000,"hi_hz":10816000000},
+    {"enabled":true,"lo_hz":7332000000,"hi_hz":7348000000}
+  ]},
+  {"antenna_bands":{"0":[[4000000000,13000000000]]},"ranges":[
+    {"enabled":true,"lo_hz":6100000000,"hi_hz":6116000000,"path":"mixer"},
+    {"enabled":true,"lo_hz":10800000000,"hi_hz":10816000000,"path":"mixer"},
+    {"enabled":true,"lo_hz":7332000000,"hi_hz":7348000000,"path":"mixer"}
+  ]},
+  {"antenna_bands":{"0":[[4000000000,13000000000]]},"ranges":[
+    {"enabled":true,"lo_hz":6000000000,"hi_hz":6000000001},
+    {"enabled":true,"lo_hz":5999999999,"hi_hz":6000000000},
+    {"enabled":true,"lo_hz":5996000000,"hi_hz":6004000000}
+  ]},
+  {"ranges":[
+    {"enabled":true,"lo_hz":5996000000,"hi_hz":6004000000,"path":"direct"}
+  ]},
+  {"ranges":[
+    {"enabled":true,"lo_hz":5858000000,"hi_hz":5872000000,"path":"mixer"},
+    {"enabled":true,"lo_hz":2420000000,"hi_hz":2430000000,"path":"direct"},
+    {"enabled":true,"lo_hz":8100000000,"hi_hz":8120000000,"path":"mixer"}
+  ]}
+]
