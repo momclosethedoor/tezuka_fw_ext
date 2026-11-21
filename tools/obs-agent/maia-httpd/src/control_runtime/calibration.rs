@@ -136,10 +136,16 @@ impl Cache {
         let ranges = scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?;
         ensure!(ranges.iter().filter(|r| r["enabled"]==true).all(|r| r["tx_slot"].is_null()),
                 "v2 selects TX from RF");
-        let select = !self.core.is_empty() && pending["alternative"].is_null()
-            && self.bands == scan["antenna_bands"] && self.mixer == scan["mixer"]
+        let same_routes = self.bands == scan["antenna_bands"] && self.mixer == scan["mixer"]
             && ranges.iter().all(|r| r["path"].is_null() || r["path"]=="auto");
-        if select {
+        let catalog = !self.core.is_empty() && pending["alternative"].is_null();
+        let warm = catalog && !self.grid.is_empty() && pending["grid_27"] == true
+            && scan["bench_overlap_hz"].is_null() && scan["recalibrate"] != true
+            && snapshot()? == self.snapshot;
+        if warm && !same_routes {
+            return generated::retarget_catalog(pending, &self.bands, &self.grid, &self.rx, &self.tx);
+        }
+        if catalog && same_routes {
             let mut subset = Vec::new();
             for (row,r) in ranges.iter().enumerate().filter(|(_,r)|r["enabled"]==true) {
                 let lo = r["lo_hz"].as_u64().ok_or_else(||anyhow!("range start"))?;
@@ -158,9 +164,7 @@ impl Cache {
                 }
                 ensure!(cursor == hi,"uncovered RF [{cursor},{hi})");
             }
-            if !self.grid.is_empty() && pending["grid_27"] == true
-                && scan["bench_overlap_hz"].is_null() && scan["recalibrate"] != true
-                && snapshot()? == self.snapshot {
+            if warm {
                 return generated::catalog_subset(pending, &subset, &self.grid, &self.rx, &self.tx);
             }
             generated::executable_tiles(pending,&subset)

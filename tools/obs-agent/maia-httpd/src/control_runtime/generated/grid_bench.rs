@@ -97,13 +97,12 @@ fn position(template: &Tile, bounds: [u64;2], center: u64, phase: &'static str) 
     Ok(v)
 }
 
-pub(super) fn select(
+pub(super) fn choices(
     grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
     bounds: [u64; 2], row: usize, mult: i64,
-) -> Option<Vec<Tile>> {
+    route: impl Fn(&Tile, [u64; 2], i64) -> Option<([u64; 2], u64)>,
+) -> Vec<Vec<Tile>> {
     let mut visits = Vec::new();
-    let mut coverage = Vec::new();
-    let mut phases = [false; 2];
     for tile in grid {
         let Some((phase, segment)) = tile.grid else { continue };
         let Some(clip) = intersection(segment, bounds) else { continue };
@@ -116,6 +115,7 @@ pub(super) fn select(
             None => (None, 1),
         };
         let offset = tone.map_or(0, |f| f * mult);
+        let Some((clip, antenna)) = route(tile, clip, offset) else { continue };
         let center = offset + side * rx_hz as i64;
         let clean = lobes(clip, center, offset, side, tone);
         let witness = [
@@ -127,20 +127,40 @@ pub(super) fn select(
         let Some(rf) = intersection(tile.rf, clip).or_else(|| clean.iter()
             .filter_map(|&r| intersection(r, witness)).max_by_key(|r| r[1] - r[0]))
             else { continue };
-        if clean.is_empty() { continue; }
-        phases[usize::from(phase == "offset")] = true;
-        coverage.extend(clean);
         let mut visit = tile.clone();
         visit.rf = rf;
         visit.rf_row = row;
+        visit.antenna = antenna;
         visit.grid = Some((phase, clip));
-        visits.push(visit);
+        if !clean.is_empty() { visits.push((visit, clean)); }
     }
+    let mut options = Vec::new();
+    let all = visits.iter().collect::<Vec<_>>();
+    if let Some(map) = covered_map(bounds, &all) { options.push(map); }
+    let plls = visits.iter().filter_map(|(p, _)| p.tx.map(|t| t.pll))
+        .collect::<std::collections::BTreeSet<_>>();
+    if plls.len() > 1 {
+        for pll in plls {
+            let candidates = all.iter().copied()
+                .filter(|(v, _)| v.tx.is_none_or(|t| t.pll == pll)).collect::<Vec<_>>();
+            if let Some(map) = covered_map(bounds, &candidates) { options.push(map); }
+        }
+    }
+    options
+}
+
+fn covered_map(bounds: [u64; 2], visits: &[&(Tile, Vec<[u64; 2]>)]) -> Option<Vec<Tile>> {
+    let mut phases = [false; 2];
+    let coverage = visits.iter().flat_map(|(v, clean)| {
+        phases[usize::from(v.grid.is_some_and(|(phase, _)| phase == "offset"))] = true;
+        clean.iter().copied()
+    }).collect::<Vec<_>>();
     let channel = 8_000_000;
     let covers_channels = bounds[1] - bounds[0] < channel
         || covers([bounds[0], bounds[1] - channel], coverage.iter()
             .filter(|[lo, hi]| hi - lo >= channel).map(|&[lo, hi]| [lo, hi - channel]));
-    (phases == [true, true] && covers(bounds, coverage) && covers_channels).then_some(visits)
+    (phases == [true, true] && covers(bounds, coverage) && covers_channels)
+        .then(|| visits.iter().map(|(v, _)| v.clone()).collect())
 }
 
 fn intersection(a: [u64; 2], b: [u64; 2]) -> Option<[u64; 2]> {

@@ -46,4 +46,5 @@ fn mock()->Mock{Mock{full:hex("tools/obs-agent/maia-httpd/tests/view/mode1/ordin
 
 #[path="maia-httpd/src/system_reader/view_batch.rs"] mod view_batch;
 #[path="maia-httpd/src/control_runtime/mixer_math.rs"] mod mixer_math;
+#[path="maia-httpd/src/control_runtime/generated/tx_schedule.rs"] mod tx_schedule;
 #[path="maia-httpd/src/system_reader/progress.rs"] mod progress;

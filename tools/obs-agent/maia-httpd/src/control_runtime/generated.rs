@@ -1,6 +1,7 @@
 use super::*;
 use mixer_math::{OFFSET, Tuning, choose};
 mod grid_bench;
+mod tx_schedule;
 
 pub(super) fn scan_rf_bounds() -> Result<[u64; 2]> {
     let lo = option_env!("GOOFY_SCAN_MIN_RF_HZ").unwrap_or("70000000").parse()?;
@@ -103,33 +104,100 @@ pub(super) fn catalog_subset(
     state: &Value, core: &[Tile], grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
 ) -> Result<Vec<Tile>> {
     let mult = environment()?.1;
-    let mut first = Vec::new();
-    let mut second = Vec::new();
+    let mut rows = Vec::new();
     for row in core.chunk_by(|a, b| a.rf_row == b.rf_row) {
         let bounds = [row[0].rf[0], row.last().unwrap().rf[1]];
         let row_id = row[0].rf_row;
-        let visits = match grid_bench::select(grid, rx, tx, bounds, row_id, mult) {
-            Some(visits) => visits,
-            None => working_grid(state, row)?,
-        };
-        for tile in visits {
-            match tile.grid {
-                Some(("main", _)) => first.push(tile),
-                _ => second.push(tile),
+        let mut choices = grid_bench::choices(grid, rx, tx, bounds, row_id, mult,
+            |tile, clip, _| Some((clip, tile.antenna)));
+        if choices.is_empty() { choices.push(working_grid(state, row)?); }
+        rows.push(choices);
+    }
+    catalog_map(state, rows)
+}
+
+pub(super) fn retarget_catalog(
+    state: &Value, catalog_bands: &Value, grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
+) -> Result<Vec<Tile>> {
+    let (threshold, mult) = environment()?;
+    let scan = &state["scan"];
+    let requested_bands = parse_antenna_bands(&scan["antenna_bands"])?;
+    let catalog_bands = parse_antenna_bands(catalog_bands)?;
+    let pll_limits = mixer_limits(scan)?;
+    let mut cold = None;
+    let mut rows = Vec::new();
+    for (row, range) in scan["ranges"].as_array().unwrap().iter().enumerate()
+        .filter(|(_, range)| range["enabled"] == true) {
+        let bounds = [range["lo_hz"].as_u64().unwrap(), range["hi_hz"].as_u64().unwrap()];
+        let path = range["path"].as_str().unwrap_or("auto");
+        ensure!(matches!(path, "auto" | "direct" | "mixer"), "invalid RF path");
+        ensure!(path != "direct" || bounds[1] <= 6_000_000_000,
+            "direct path cannot cover [{},{})", bounds[0], bounds[1]);
+        let mut choices = grid_bench::choices(grid, rx, tx, bounds, row, mult, |tile, mut clip, offset| {
+            let mixer = tile.tx.is_some();
+            if tile.tx.is_some_and(|t| t.pll < pll_limits[0] || t.pll > pll_limits[1])
+                || path == "direct" && mixer || path == "mixer" && !mixer {
+                return None;
             }
+            // The existing B bridge can supply a whole channel across the
+            // seam when the request itself straddles the threshold.
+            if path == "auto" && !(tile.channel_bridge && bounds[0] < threshold && threshold < bounds[1]
+                && clip[0] < threshold && threshold < clip[1]) {
+                if mixer { clip[0] = clip[0].max(threshold); }
+                else { clip[1] = clip[1].min(threshold); }
+            }
+            if clip[0] >= clip[1] { return None; }
+            let compatible = |antenna: u64| {
+                let Some(bands) = requested_bands.get(&antenna) else { return false };
+                let admits = bands.iter().any(|&[a, b]| a <= clip[0] && clip[1] <= b);
+                let same_response = catalog_bands.get(&tile.antenna) == Some(bands);
+                let mirror = [2 * offset - clip[1] as i64 - mixer_math::READBACK_MARGIN,
+                              2 * offset - clip[0] as i64 + mixer_math::READBACK_MARGIN];
+                admits && (!mixer || same_response || bands.iter().all(|&[a, b]|
+                    b as i64 <= mirror[0] || a as i64 >= mirror[1]))
+            };
+            std::iter::once(tile.antenna).chain(requested_bands.keys().copied())
+                .find(|&antenna| compatible(antenna)).map(|antenna| (clip, antenna))
+        });
+        if choices.is_empty() {
+            if cold.is_none() { cold = Some(core_tiles(state)?); }
+            let core = cold.as_ref().unwrap();
+            let start = core.partition_point(|tile| tile.rf_row < row);
+            let end = core.partition_point(|tile| tile.rf_row <= row);
+            choices.push(working_grid(state, &core[start..end])?);
+        }
+        rows.push(choices);
+    }
+    let map = catalog_map(state, rows)?;
+    if map.iter().filter_map(|t| t.tx.map(|t| t.pll))
+        .collect::<std::collections::BTreeSet<_>>().len() > 8 {
+        return tiles(state);
+    }
+    Ok(map)
+}
+
+fn catalog_map(state: &Value, rows: Vec<Vec<Vec<Tile>>>) -> Result<Vec<Tile>> {
+    let phase = |p: &Tile| usize::from(p.grid.is_some_and(|(label, _)| label != "main"));
+    let costs = rows.iter().map(|options| options.iter().map(|map|
+        tx_schedule::Span::of(map.iter().map(|v| (phase(v), v.tx.map(|t| t.pll)))))
+        .collect()).collect::<Vec<_>>();
+    let chosen = tx_schedule::minimum_cycle(&costs);
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for (options, index) in rows.into_iter().zip(chosen) {
+        let visits = options.into_iter().nth(index).unwrap();
+        for visit in visits {
+            if phase(&visit) == 0 { first.push(visit); }
+            else { second.push(visit); }
         }
     }
     first.extend(second);
     transitions(state, &first)
 }
 
-pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
-    let (threshold, mult) = environment()?;
-    let [scan_min, scan_max] = scan_rf_bounds()?;
-    let scan = &state["scan"];
-    let bands = parse_antenna_bands(&scan["antenna_bands"])?;
-    let pll_bounds = if scan["mixer"]["pll_range_hz"].is_null() {
-        [2_250_000_000, 2_490_000_000]
+fn mixer_limits(scan: &Value) -> Result<[i64; 2]> {
+    if scan["mixer"]["pll_range_hz"].is_null() {
+        Ok([2_250_000_000, 2_490_000_000])
     } else {
         let limits: [i64; 2] = serde_json::from_value(scan["mixer"]["pll_range_hz"].clone())?;
         ensure!(
@@ -138,8 +206,16 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 && limits[1] <= 6_000_000_000 - OFFSET,
             "invalid TX PLL interval"
         );
-        limits
-    };
+        Ok(limits)
+    }
+}
+
+pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
+    let (threshold, mult) = environment()?;
+    let [scan_min, scan_max] = scan_rf_bounds()?;
+    let scan = &state["scan"];
+    let bands = parse_antenna_bands(&scan["antenna_bands"])?;
+    let pll_bounds = mixer_limits(scan)?;
     let mut tiles = Vec::new();
     let mut previous = None;
     let mut selected = Vec::new();
