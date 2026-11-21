@@ -110,6 +110,7 @@ impl Hardware{
   if (q.route)(id,epoch,version,self.r(0x234),self.r(0x244))?==Some(id)
      && self.r(0x240)==id && self.r(0x228)&8!=0 && self.r(0x22c)==version && self.live64(0x24c)==epoch{
    self.w(0x218,id);self.w(0x220,2);
+   (q.route_released)(id,epoch,version);
   }
   Ok(())
  }
@@ -281,6 +282,7 @@ pub(crate) struct RunControl<'a>{
  pub started:&'a dyn Fn(Header,Execution),
  pub trace:&'a dyn Fn(&'static str),
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
+ pub route_released:&'a dyn Fn(u32,u64,u32),
  pub check:&'a dyn Fn()->R<()>,
  pub progress:&'a dyn Fn(Value),
  pub stalled:&'a dyn Fn(Value),
@@ -334,10 +336,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut sampled_execution=None;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(q)=control {
-   if draining.get(){return Ok(())}
+   if draining.get(){network.borrow_mut().suppressed+=1;return Ok(())}
    if execution.get().is_none(){
     let e=Execution{generation:q.generation,version:q.version,anchor:if c.scan{initial_anchor}else{h.epoch},run:initial.cookie};
-    if h.epoch<e.anchor{return Ok(())}
+    if h.epoch<e.anchor{network.borrow_mut().suppressed+=1;return Ok(())}
     execution.set(Some(e));
     (q.started)(h,e);
    }
@@ -354,7 +356,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     execution.set(Some(e));
     (next.started)(h,e);
    }
-   if execution.get().is_some_and(|e|h.epoch<e.anchor){return Ok(())}
+   if execution.get().is_some_and(|e|h.epoch<e.anchor){net.suppressed+=1;return Ok(())}
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
     if overview.len()!=512{return Err("sweep delivery requires VIEW512".into())}
     sweep.accept(h,overview,&mut net,sock);
@@ -378,7 +380,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     if sampled_execution!=execution.get(){progress.reset();sampled_execution=execution.get();}
     if let Err(e)=io.check_progress(&mut progress,start,&s,q,execution.get(),map){route_failure=Some(e);break;}
    }
-   if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();
+   if let Ok(mut v)=mark(&mut io,&reader,start){
+    v["network"]=network.borrow().counts();
+    *STATUS.lock().unwrap()=v;
+   }status_due=Instant::now();
   }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
   let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
@@ -400,6 +405,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
+ if let Ok(mut v)=mark(&mut io,&reader,start){
+  v["network"]=network.borrow().counts();
+  *STATUS.lock().unwrap()=v;
+ }
  if let Some(q)=control{(q.trace)("reader_drained");}
  if let Some(err)=route_failure{return Err(err);}
  drop(sink);
@@ -424,5 +433,12 @@ pub fn run_json(data:&[u8])->R<()>{STOP.store(false,Ordering::Release);let c:Con
 pub(crate) fn run_controlled(data:&[u8],q:&RunControl<'_>)->R<()>{let c:Config=serde_json::from_slice(data).map_err(|e|e.to_string())?;execute(&c,Some(q))}
 
 impl UdpBatch {
- fn counts(&self)->Value{json!({"sent":self.sent,"dropped":self.dropped,"datagrams":self.datagrams,"send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,"max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string()})}
+ fn counts(&self)->Value{json!({"sent":self.sent,"sent_bytes":self.sent_bytes,"dropped":self.dropped,
+  "datagrams":self.datagrams,"pending":self.pending,"pending_bytes":self.bytes.len(),"queue_high_records":self.high_records.max(self.pending),
+  "send_errors":self.send_errors,"send_would_block":self.would_block,"last_socket_errno":self.last_errno,
+  "admitted_records":self.sent+self.dropped+self.pending-self.rejected_before_queue,
+  "rejected_before_queue":self.rejected_before_queue,"transition_records":self.transition,"suppressed_records":self.suppressed,
+  "completion_sent":self.notes_sent,"completion_send_drop":self.notes_lost,
+  "send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,
+  "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string()})}
 }

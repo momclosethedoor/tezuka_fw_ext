@@ -272,7 +272,8 @@ static int capture(int argc,char **argv){
  if(watch_active&&!rc)rc=watch_check();
  if(!rc){wr(0x170,(uint32_t)target);wr(0x174,target>>32);wr(0x290,1);armed=now();}
  fprintf(trace,"{\"event\":\"arm_attempt\",\"time\":%.9f,\"target_epoch\":%llu,\"tag\":%u,\"timeout_ticks\":%u}\n",armed,(unsigned long long)target,tag,rd(0x28c));
- size_t pending_bytes=0,received_bytes=0,held_bytes=0;unsigned send_wait_polls=0,received_blocks=0;
+ size_t pending_bytes=0,received_bytes=0,held_bytes=0,transport_rejected_bytes=0;
+ unsigned send_wait_polls=0,received_blocks=0;
  double refill_s=0,copy_s=0,copy_cpu_s=0,queue_wait_s=0,iio_hold_max_s=0,held_since=0,return_due=0;int input_closed=0;
  double loop_due=now(),loop_gap_max_s=0;unsigned copied_refills=0,send_with_iio_owned=0;int fault_seen=0;
  double ready_wait_s=0,ready_wait_max_s=0;unsigned ready_wait_calls=0,progress_turns=0;
@@ -302,6 +303,11 @@ static int capture(int argc,char **argv){
     if(!held_bytes||!(transport_depth>1||!queue.count))break;
     uint8_t *p=iio_buffer_start(buf);size_t span=(uint8_t*)iio_buffer_end(buf)-p;
     if(held_bytes>span||received_bytes+held_bytes>capture_limit){rc=4;break;}
+    /* Managed FIELD must end with an explicit error if its bounded transport
+       saturates. Keep the already accepted blocks and never evict a prefix. */
+    if(watch_active&&!no_delivery&&queue.count==queue.capacity){
+     transport_rejected_bytes=held_bytes;rc=14;break;
+    }
     double t0=now(),cpu0=cpu_phases?thread_cpu():0;int pushed=no_delivery&&!copy_only?0:tq_push(&queue,p,held_bytes,received_bytes);copy_s+=now()-t0;
     if(cpu_phases)copy_cpu_s+=thread_cpu()-cpu0;
     if(pushed){rc=4;break;}
@@ -413,7 +419,7 @@ static int capture(int argc,char **argv){
     END qualifies the provisional byte stream; no ARM frame ACK is returned. */
  if(!outcome&&!rc)rc=7;
  if(!no_delivery&&video_sock>=0){
-  char meta[1024];snprintf(meta,sizeof(meta),"{\"kind\":\"end\",\"stream_tag\":%u,\"epoch\":%llu,\"target_hz\":%llu,\"watch_revision\":%llu,\"watch_generation\":%llu,\"target_position\":%u,\"map_version\":%u,\"serial\":%u,\"first\":%u,\"end\":%u,\"generation_bytes\":%zu,\"pl_outcome\":%d,\"error\":%d,\"qualified_field\":%s,\"a9_send_monotonic_s\":%.9f}",tag,(unsigned long long)target,(unsigned long long)target_hz,(unsigned long long)(watch_active?watch_revision:0),(unsigned long long)(watch_active?watch_selected.generation:0),target_position,map_version,serial,first,end,bytes,outcome,rc,outcome==1&&!rc&&bytes>=end?"true":"false",now());
+  char meta[1024];snprintf(meta,sizeof(meta),"{\"kind\":\"end\",\"stream_tag\":%u,\"epoch\":%llu,\"target_hz\":%llu,\"watch_revision\":%llu,\"watch_generation\":%llu,\"target_position\":%u,\"map_version\":%u,\"serial\":%u,\"first\":%u,\"end\":%u,\"generation_bytes\":%zu,\"pl_outcome\":%d,\"error\":%d,\"qualified_field\":%s,\"a9_send_monotonic_s\":%.9f,\"iio_read_bytes\":%zu,\"tcp_data_bytes\":%zu,\"queue_high_blocks\":%u,\"queue_pending_blocks\":%u,\"queue_rejected_bytes\":%zu,\"refill_s\":%.9f,\"copy_s\":%.9f,\"send_service_s\":%.9f}",tag,(unsigned long long)target,(unsigned long long)target_hz,(unsigned long long)(watch_active?watch_revision:0),(unsigned long long)(watch_active?watch_selected.generation:0),target_position,map_version,serial,first,end,bytes,outcome,rc,outcome==1&&!rc&&bytes>=end?"true":"false",now(),received_bytes+transport_rejected_bytes,bytes,queue.high,queue.count,transport_rejected_bytes,refill_s,copy_s,queue_wait_s);
   if(packet(meta,NULL,0))rc=9;
  }
  fprintf(trace,"{\"event\":\"stream_delivery\",\"time\":%.9f,\"wire_bytes\":%llu,\"messages\":%llu,\"send_s\":%.9f,\"payload_bytes\":%zu,\"error\":%d}\n",now(),(unsigned long long)(wire_bytes-sent_before),(unsigned long long)(wire_chunks-chunks_before),wire_send_s-send_before,bytes,rc);

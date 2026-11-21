@@ -7,6 +7,7 @@ mod guard_take;
 mod mixer_math;
 mod plan_math;
 mod tx;
+mod video_egress;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -185,6 +186,7 @@ struct Inbox {
     command_timing: Value,
     capabilities: Value,
     route_pending: Value,
+    route_last: Value,
     metrics: Value,
     operation: Value,
     progress: Value,
@@ -384,7 +386,7 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
         "pending_id":q.next.as_ref().or(q.pending.as_ref()).map(|v|&v["id"])
             .or(q.next_map_request.as_ref().map(|(v,_)|&v["id"])),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
-        "route_pending":q.route_pending,"arm_clock_ns":q.receipt_ns.to_string(),
+        "route_pending":q.route_pending,"route_last":q.route_last,"arm_clock_ns":q.receipt_ns.to_string(),
         "arm_now_ns":clock_ns().to_string(),"boot_id":q.actual["boot"],"clock_session":shared.clock_session,
         "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,
         "operation":q.operation,"progress":q.progress,"last_progress":q.last_progress,"progress_failure":q.progress_failure,
@@ -492,6 +494,9 @@ async fn submit(
             Json(json!({"error":"another hardware command is pending"})),
         );
     }
+    if let Some(reason) = tx_conflict(&cmd, &q.actual, q.capabilities["tx_on"] == true) {
+        return (StatusCode::CONFLICT, Json(json!({"id":id,"error":reason})));
+    }
     let id = id.clone();
     q.next = Some(cmd);
     q.phase = "accepted";
@@ -499,6 +504,19 @@ async fn submit(
     shared.switch.store(true, Ordering::Release);
     shared.wake.notify_one();
     (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})))
+}
+
+fn tx_conflict(cmd: &Value, state: &Value, available: bool) -> Option<&'static str> {
+    if cmd["op"] != "tx" {
+        return None;
+    }
+    if state["mode"] == "scan" {
+        return Some("manual TX locked while scanner owns profiles");
+    }
+    if !available {
+        return Some("TX owned by external adapter or unavailable");
+    }
+    None
 }
 
 fn progress_matches(sample: &Value, state: &Value) -> bool {
@@ -892,6 +910,9 @@ struct Route {
     input: Vec<u8>,
     since: Instant,
     attempt: u8,
+    detected_ns: u64,
+    send_started_ns: u64,
+    sent_ns: u64,
     trace: bool,
 }
 fn acknowledge(
@@ -912,14 +933,21 @@ fn acknowledge(
     let key = (generation, id, epoch, version, position, antenna);
     let initial_path = source.strip_prefix("startup_");
     let visit_path = source.strip_prefix("visit_");
+    let manual_path = source.strip_prefix("manual_");
     if route.as_ref().is_none_or(|r| r.key != key) {
         static SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let trace = initial_path.is_some() || SAMPLES.fetch_add(1, Ordering::Relaxed) < 256;
         if trace {
             trace_control("route_detected", ||json!([generation,version,epoch,position,id,source]));
         }
+        let detected_ns = clock_ns();
         let mut v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
+            "boot_id":c.boot_id,"clock_session":shared.clock_session,
             "source":if source=="PLv2" {"PL"} else {source},"ack_version":if source=="PLv2" {2}else{1}});
+        if let Some(path) = manual_path {
+            v["source"] = json!("manual");
+            v["required_path"] = json!(path);
+        }
         if let Some(path) = initial_path {
             v["event"] = json!("prepare_path");
             v["source"] = json!("ARM");
@@ -936,6 +964,7 @@ fn acknowledge(
         }
         let mut out = serde_json::to_vec(&v).unwrap();
         out.push(b'\n');
+        v["detected_arm_ns"] = json!(detected_ns.to_string());
         shared.inbox.lock().unwrap().route_pending = v;
         *route = Some(Route {
             stream: None,
@@ -945,6 +974,9 @@ fn acknowledge(
             input: Vec::new(),
             since: Instant::now(),
             attempt: 0,
+            detected_ns,
+            send_started_ns: 0,
+            sent_ns: 0,
             trace,
         });
     }
@@ -956,21 +988,34 @@ fn acknowledge(
         r.attempt += 1;
         r.since = Instant::now();
         r.written = 0;
+        r.send_started_ns = 0;
+        r.sent_ns = 0;
         r.input.clear();
         r.stream = TcpStream::connect_timeout(&c.route, Duration::from_millis(50)).ok();
         if let Some(stream) = &r.stream {
             stream.set_nonblocking(true).map_err(|e| e.to_string())?;
         }
-        shared.inbox.lock().unwrap().route_pending["attempt"] = json!(r.attempt);
+        let mut q = shared.inbox.lock().unwrap();
+        q.route_pending["attempt"] = json!(r.attempt);
+        q.route_pending["send_started_arm_ns"] = Value::Null;
+        q.route_pending["sent_arm_ns"] = Value::Null;
     }
     let Some(stream) = &mut r.stream else { return Ok(None) };
     if r.written < r.out.len() {
+        if r.send_started_ns == 0 {
+            r.send_started_ns = clock_ns();
+            shared.inbox.lock().unwrap().route_pending["send_started_arm_ns"] = json!(r.send_started_ns.to_string());
+        }
         match stream.write(&r.out[r.written..]) {
             Ok(0) => { r.stream = None; return Ok(None); }
             Ok(n) => {
                 r.written += n;
-                if r.trace && r.written == r.out.len() {
-                    trace_control("route_sent", ||json!([generation,version,epoch,position,id,r.attempt]));
+                if r.written == r.out.len() {
+                    r.sent_ns = clock_ns();
+                    shared.inbox.lock().unwrap().route_pending["sent_arm_ns"] = json!(r.sent_ns.to_string());
+                    if r.trace {
+                        trace_control("route_sent", ||json!([generation,version,epoch,position,id,r.attempt]));
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -1004,7 +1049,11 @@ fn acknowledge(
             if r.trace {
                 trace_control("route_ack", ||json!([generation,version,epoch,position,id,r.attempt]));
             }
-            shared.inbox.lock().unwrap().route_pending = Value::Null;
+            let mut q = shared.inbox.lock().unwrap();
+            let mut done = std::mem::take(&mut q.route_pending);
+            done["ack_arm_ns"] = json!(clock_ns().to_string());
+            done["detected_arm_ns"] = json!(r.detected_ns.to_string());
+            q.route_last = done;
             return Ok(Some(id));
         }
     }
@@ -1107,6 +1156,24 @@ fn apply_gain(settings: &Value) -> Result<f64> {
     read_gain(&attr("in_voltage0_hardwaregain")?)
 }
 
+fn video_counters(generation: u64, queue: &video_egress::Queue, finished: bool, error: Option<String>) -> Value {
+    let c = &queue.counts;
+    json!({"generation":generation,"video_bytes":c.bytes,"video_chunks":c.frames,
+        "wire_bytes_accepted_by_socket":c.wire_bytes,"source_bytes_read":c.source_bytes,
+        "source_reads":c.source_reads,"source_errors":c.source_errors,"iio_block_samples":8192,
+        "pipe_read_ns":c.source_read_ns.to_string(),"packed_bytes":c.packed_bytes,
+        "packed_frames":c.packed_frames,"pack_ns":c.pack_ns.to_string(),
+        "send_calls":c.send_calls,"send_errors":c.send_errors,"send_ns":c.send_ns.to_string(),
+        "send_would_block":c.would_block,"last_socket_errno":c.last_socket_errno,
+        "queue_frames":queue.frames(),"queue_payload_bytes":queue.payload_bytes(),
+        "queue_high_frames":c.high_frames,"queue_high_payload_bytes":c.high_payload_bytes,
+        "queue_overflow":c.overflow,"ready_to_send_ns":c.ready_to_send_ns.to_string(),
+        "max_ready_to_send_ns":c.max_ready_to_send_ns.to_string(),
+        "finished":finished,"error":error,
+        "source_bytes_not_packed":c.source_bytes-c.packed_bytes,
+        "payload_not_sent_at_finish":finished.then(|| queue.payload_bytes())})
+}
+
 fn continuous(
     c: &Config,
     shared: &Shared,
@@ -1120,6 +1187,21 @@ fn continuous(
         "video needs STOP/DRAINED and released DDC"
     );
     let generation = state["generation"].as_u64().unwrap();
+    let mut queue = video_egress::Queue::new();
+    shared.inbox.lock().unwrap().metrics = video_counters(generation, &queue, false, None);
+    // Connect before admitting samples. A slow or absent receiver cannot fill
+    // IIO during connection setup.
+    let socket = TcpStream::connect_timeout(&c.video, Duration::from_millis(100))
+        .and_then(|conn| { conn.set_nonblocking(true)?; Ok(conn) });
+    let mut conn = match socket {
+        Ok(conn) => conn,
+        Err(error) => {
+            queue.counts.send_errors += 1;
+            queue.counts.last_socket_errno = error.raw_os_error();
+            shared.inbox.lock().unwrap().metrics = video_counters(generation, &queue, true, Some(error.to_string()));
+            return Err(error.into());
+        }
+    };
     let saved = [regs.read(0x30), regs.read(0x38), regs.read(0x40)];
     let nco = state["ddc_hz"].as_i64().unwrap();
     let phase = ((nco * (1i64 << 28)) / FS as i64) as u32 & 0x0fff_ffff;
@@ -1154,54 +1236,67 @@ fn continuous(
                 }
                 regs.write(0x284, 1);
                 ensure!(regs.read(0x284) == 1, "stream_run readback");
-                let mut conn = TcpStream::connect_timeout(&c.video, Duration::from_millis(250))?;
-                conn.set_write_timeout(Some(Duration::from_millis(150)))?;
-                let (mut pos, mut seq) = (0u64, 0u32);
-                let mut bytes = [0u8; 65536];
+                let mut bytes = [0u8; video_egress::MAX_BLOCK_BYTES];
                 let mut have = 0;
                 let mut lo_check = Instant::now();
+                let mut status_due = Instant::now();
+                let mut last_read = Instant::now();
                 while !shared.switch.load(Ordering::Acquire) {
                     if lo_check.elapsed() >= Duration::from_millis(200) {
                         verify_tx()?;
                         lo_check = Instant::now();
                     }
-                    match stdout.read(&mut bytes[have..]) {
-                        Ok(0) => bail!("IIO real8 ended"),
-                        Ok(n) => have += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if seq == 0 {
-                                ensure!(
-                                    start.elapsed() < Duration::from_secs(3),
-                                    "first real8 timeout"
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(2));
-                            continue;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    if have < 16384 {
-                        continue;
-                    }
-                    let len = have & !3;
-                    let meta =
-                        serde_json::to_vec(&json!({"generation":generation,"pos":pos,"seq":seq,
-                        "code":24,"g":1,"reset":seq==0}))?;
-                    if seq == 0 {
+                    let previous_sent = queue.counts.frames;
+                    let sent = queue.pump(&mut conn).map_err(|e| anyhow!("real8 socket send: {e}"))?;
+                    if previous_sent == 0 && queue.counts.frames != 0 {
                         receipt(shared, state, id, None);
                     }
-                    conn.write_all(b"R8V1")?;
-                    conn.write_all(&(meta.len() as u32).to_le_bytes())?;
-                    conn.write_all(&(len as u32).to_le_bytes())?;
-                    conn.write_all(&meta)?;
-                    conn.write_all(&bytes[..len])?;
-                    bytes.copy_within(len..have, 0);
-                    have -= len;
-                    pos += len as u64;
-                    seq = seq.wrapping_add(1);
-                    if seq % 32 == 0 {
+                    let read_start = Instant::now();
+                    let input = stdout.read(&mut bytes[have..]);
+                    queue.counts.source_read_ns += read_start.elapsed().as_nanos();
+                    let n = match input {
+                        Ok(0) => {
+                            queue.counts.source_errors += 1;
+                            bail!("IIO real8 ended")
+                        }
+                        Ok(n) => {
+                            queue.counts.source_reads += 1;
+                            queue.counts.source_bytes += n as u64;
+                            last_read = Instant::now();
+                            n
+                        }
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => 0,
+                        Err(e) => {
+                            queue.counts.source_errors += 1;
+                            return Err(e.into())
+                        }
+                    };
+                    have += n;
+                    if have >= video_egress::MIN_BLOCK_BYTES {
+                        let len = have & !3;
+                        queue.push(generation, &bytes[..len], Instant::now())?;
+                        bytes.copy_within(len..have, 0);
+                        have -= len;
+                    }
+                    if status_due.elapsed() >= Duration::from_millis(200) {
                         shared.inbox.lock().unwrap().metrics =
-                            json!({"video_bytes":pos,"video_chunks":seq});
+                            video_counters(generation, &queue, false, None);
+                        status_due = Instant::now();
+                    }
+                    if !sent && n == 0 {
+                        if last_read.elapsed() >= Duration::from_secs(3) {
+                            queue.counts.source_errors += 1;
+                            bail!("IIO real8 pipe stalled");
+                        }
+                        let mut fds = [
+                            libc::pollfd {fd, events:libc::POLLIN, revents:0},
+                            libc::pollfd {fd:conn.as_raw_fd(), events:libc::POLLOUT, revents:0},
+                        ];
+                        let count = if queue.frames() == 0 {1} else {2};
+                        if unsafe { libc::poll(fds.as_mut_ptr(), count, 4) } < 0 {
+                            let e = std::io::Error::last_os_error();
+                            if e.kind() != std::io::ErrorKind::Interrupted { return Err(e.into()); }
+                        }
                     }
                 }
                 Ok(())
@@ -1217,6 +1312,13 @@ fn continuous(
     regs.write(0x30, saved[0]);
     regs.write(0x40, saved[2]);
     regs.write(0x38, saved[1]);
+    shared.inbox.lock().unwrap().metrics =
+        video_counters(generation, &queue, true, result.as_ref().err().map(ToString::to_string));
+    if capture_enabled()? {
+        let error = "IIO buffer remained enabled after real8 cleanup";
+        shared.inbox.lock().unwrap().worker_error = Some(error.into());
+        bail!("{error}");
+    }
     result
 }
 fn capture_enabled() -> Result<bool> {
@@ -1283,6 +1385,14 @@ fn worker(
             continue;
         };
         let id = &cmd["id"];
+        if let Some(reason) = tx_conflict(&cmd, &state, manual && c.external_mixer.is_none()) {
+            let mut q = shared.inbox.lock().unwrap();
+            q.pending = None;
+            q.failed_id = id.clone();
+            q.command_timing = json!({"id":id,"received_ns":q.received_ns.to_string(),
+                "completed_ns":clock_ns().to_string(),"rejected":true,"reason":reason});
+            continue;
+        }
         let before = state.clone();
         {
             let mut q = shared.inbox.lock().unwrap();
@@ -1327,7 +1437,7 @@ fn worker(
                         "PL timing fixture accepts v2 scan commands only");
             }
             ensure!(
-                previous_mode != "video" || op == "return" || op == "tx",
+                previous_mode != "video" || matches!(op, "return" | "tx" | "scan"),
                 "close video before changing mode"
             );
             match op {
@@ -1384,13 +1494,17 @@ fn worker(
                     }
                     if previous_mode != op {
                         if op == "scan" {
-                            pending["analysis_route"] = pending["route"].clone();
+                            if previous_mode == "analysis" || pending["return_mode"] == "analysis" {
+                                pending["analysis_route"] = pending["route"].clone();
+                            }
                             pending["route"] = json!({"kind":"direct","antenna":pending["scan_antenna"],"multiplier":1,"side":1});
                         } else {
                             pending["route"] = pending["analysis_route"].clone();
                         }
                     }
                     if op == "scan" {
+                        pending["video"] = Value::Null;
+                        pending["return_mode"] = Value::Null;
                         if pending["catalog_policy"] == true {
                             ensure!(request["run"] != true || !pending["catalog"].is_null(),
                                     "antenna catalog not ready");
@@ -1447,14 +1561,15 @@ fn worker(
                                 version,
                                 0,
                                 antenna,
-                                "manual",
+                                if request["kind"] == "mixer" {"manual_mixer"} else {"manual_direct"},
                             )
                             .map_err(|e| anyhow!(e))?
                             .is_some()
                             {
                                 break;
                             }
-                            ensure!(!shared.shutdown.load(Ordering::Acquire), "route cancelled");
+                            ensure!(!shared.shutdown.load(Ordering::Acquire) &&
+                                !shared.switch.load(Ordering::Acquire), "route cancelled");
                             std::thread::sleep(Duration::from_millis(2));
                         }
                     }
@@ -1466,6 +1581,12 @@ fn worker(
                     } else {
                         pending["analysis_route"] = pending["route"].clone();
                     }
+                    let q = shared.inbox.lock().unwrap();
+                    pending["route_confirmation"] = if q.route_last["generation"] == generation {
+                        q.route_last.clone()
+                    } else {
+                        Value::Null
+                    };
                 }
                 "tx" => {
                     ensure!(
@@ -1525,10 +1646,6 @@ fn worker(
                 }
                 Ok::<_, anyhow::Error>(Some(bytes))
             } else {
-                ensure!(
-                    op != "route",
-                    "antenna switch requires active scanner marker"
-                );
                 tune(&mut pending)?;
                 Ok(None)
             }
@@ -1825,6 +1942,13 @@ fn worker(
                 started: &started,
                 trace: &|stage| trace_control(stage, ||json!({"id":id,"generation":generation})),
                 route: &route_fn,
+                route_released: &|marker,epoch,version| {
+                    let mut q = shared.inbox.lock().unwrap();
+                    if q.route_last["marker_id"] == marker && q.route_last["epoch"] == epoch
+                        && q.route_last["version"] == version {
+                        q.route_last["pl_continue_arm_ns"] = json!(clock_ns().to_string());
+                    }
+                },
                 progress: &|sample| {
                     let mut q = shared.inbox.lock().unwrap();
                     if progress_matches(&sample,&q.actual) {

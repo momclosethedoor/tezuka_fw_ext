@@ -105,7 +105,7 @@ impl<'a> Delivery<'a> {
         let assigned = self.spec.route_to[position];
         let phase = assigned % 2;
         let id = 2*(relative/count)+assigned as u64;
-        if self.completed.is_some_and(|old| id<=old) {return;}
+        if self.completed.is_some_and(|old| id<=old) {net.suppressed+=1;return;}
         if self.pass.as_ref().is_some_and(|p| p.id != id) {self.finish(net,sock,true);}
         let pass = self.pass.get_or_insert(Pass{id,phase,first_epoch:h.epoch,last_epoch:h.epoch,
             last_tick:h.first_tick,observed:0,drops_before:net.dropped});
@@ -115,13 +115,14 @@ impl<'a> Delivery<'a> {
             pass.last_epoch = h.epoch;
             pass.last_tick = h.first_tick;
         }
+        if self.spec.positions[position].is_none() {net.transition+=1;}
         if net.bytes.len()+RECORD_BYTES <= MAX_BYTES {
             if net.pending==0 {net.start_record();}
             net.bytes.extend_from_slice(&self.header(h));
             net.bytes.extend_from_slice(view);
             net.pending+=1;
             self.peak_bytes=self.peak_bytes.max(net.bytes.len());
-        } else {net.dropped+=1;}
+        } else {net.rejected_before_queue+=1;net.dropped+=1;}
         if position == self.spec.last[phase] {self.finish(net,sock,true);}
     }
 
@@ -156,7 +157,7 @@ impl<'a> Delivery<'a> {
             (dropped<<1)|u64::from(executed)]) {
             word.copy_from_slice(&value.to_le_bytes());
         }
-        if sock.send(&message).is_ok_and(|n| n==message.len()) {self.notes_sent+=1;}
+        if net.completion(sock,&message) {self.notes_sent+=1;}
         else {self.notes_lost+=1;}
         self.completed = Some(pass.id);
     }
