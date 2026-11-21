@@ -312,13 +312,14 @@ pub(crate) struct NextView<'a>{
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
+ if control.is_some() && (!c.direct || c.mode==0) {return Err("managed VIEW requires direct split544 and a VIEW mode".into())}
  if c.diagnostic_sync.is_some(){return discard::execute(c)}
  if c.owned_pipeline{return Err("full-copy experiment rejected; use immediate release reader".into())}
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
- // At K1 the measured full-read delivery path saturated the
- // reader. The managed consumer only needs metadata and VIEW.
- let managed_view_only=control.is_some()&&c.scan&&c.k==1&&c.direct;
+ // The managed control sink delivers VIEW. Full FFT ownership and diagnostic
+ // captures use the separate local reader paths.
+ let managed_view_only=control.is_some();
  let mut io=Hardware::open(c,managed_view_only)?;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
