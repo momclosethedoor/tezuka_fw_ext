@@ -61,6 +61,12 @@ now_ms() {
 	NOW=$(( ${_up%.*} * 1000 + 1${_up#*.}0 - 1000 ))
 }
 
+trace_lease() {
+	[ -n "${GOOFY_LEASE_TRACE:-}" ] || return 0
+	read -r _trace_up _trace_rest </proc/uptime
+	printf '%s %s\n' "$_trace_up" "$*" >>"$GOOFY_LEASE_TRACE"
+}
+
 # Число после "key": в $LINE -> $V (true/false -> 1/0; пусто — поля нет). Без fork.
 field() {
 	V=""
@@ -97,18 +103,22 @@ heartbeat() {
 	field release
 	if [ "$V" = 1 ]; then RELEASED=1; HB_MS=0; DIRTY=1
 	else RELEASED=0; HB_MS=$NOW; fi
+	trace_lease heartbeat "$SEQ" "$RELEASED"
 }
 
 read_tx() {
+	trace_lease read_tx_begin
 	if [ -z "$PHY" ]; then goofy_find_iio || { TX_STATE=no_phy; return 1; }; goofy_tx_min_gain; fi
 	goofy_tx_read
 	if goofy_tx_is_off; then TX_STATE=off; else TX_STATE=on; fi
+	trace_lease read_tx_end "$TX_STATE" "$TX_PD"
 }
 
 enforce_tx() {
 	read_tx || return
 	[ $TX_STATE = off ] && return
 	_was="pd=$TX_PD g0=$TX_G0 g1=$TX_G1"
+	trace_lease force_begin
 	if goofy_tx_off; then
 		FORCED=$((FORCED + 1)); TX_STATE=off
 		logger -t goofy_lease "TX без аренды ($_was) -> погашен (раз $FORCED)"
@@ -116,6 +126,7 @@ enforce_tx() {
 		FAILS=$((FAILS + 1)); TX_STATE=fail
 		logger -p user.err -t goofy_lease "TX без аренды ($_was) НЕ погашен: pd=$TX_PD g0=$TX_G0 g1=$TX_G1"
 	fi
+	trace_lease force_end "$TX_STATE"
 	DIRTY=1
 }
 
@@ -159,8 +170,10 @@ tick() {
 publish() {
 	PSEQ=$((PSEQ + 1))
 	_age=-1; [ $HB_MS -gt 0 ] && _age=$(( NOW - HB_MS ))
+	trace_lease publish_begin "$PSEQ" "$LEASE" "$SEQ" "$_age"
 	echo "{\"alive\":true,\"enforce\":$EN,\"lease\":$LEASE,\"host\":\"$HOST\",\"seq\":$SEQ,\"age_ms\":$_age,\"lease_ms\":$LEASE_MS,\"released\":$RELEASED,\"heartbeats\":$HB_N,\"lost\":$LOST_N,\"tx\":\"$TX_STATE\",\"tx_lo_powerdown\":\"$TX_PD\",\"tx_gain0\":\"$TX_G0\",\"tx_gain1\":\"$TX_G1\",\"forced\":$FORCED,\"fails\":$FAILS,\"up_ms\":$NOW,\"pseq\":$PSEQ}" >&4
 	LAST_PUB=$NOW; DIRTY=0
+	trace_lease publish_end "$PSEQ"
 }
 
 now_ms

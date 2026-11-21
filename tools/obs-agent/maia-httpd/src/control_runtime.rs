@@ -443,6 +443,13 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
 fn word(b: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap())
 }
+
+fn trace_control(stage: &str, fields: impl FnOnce() -> Value) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("OBS_CONTROL_TRACE").is_some()) {
+        eprintln!("{}", json!({"control_stage":stage,"arm_ns":clock_ns(),"detail":fields()}));
+    }
+}
 fn put(b: &mut [u8], offset: usize, n: u32) {
     b[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
 }
@@ -770,6 +777,7 @@ struct Route {
     input: Vec<u8>,
     since: Instant,
     attempt: u8,
+    trace: bool,
 }
 fn acknowledge(
     route: &mut Option<Route>,
@@ -787,6 +795,11 @@ fn acknowledge(
     let initial_path = source.strip_prefix("startup_");
     let visit_path = source.strip_prefix("visit_");
     if route.as_ref().is_none_or(|r| r.key != key) {
+        static SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let trace = initial_path.is_some() || SAMPLES.fetch_add(1, Ordering::Relaxed) < 256;
+        if trace {
+            trace_control("route_detected", ||json!([generation,version,epoch,position,id,source]));
+        }
         let mut v = json!({"marker_id":id,"epoch":epoch,"version":version,"position":position,"route":antenna,"generation":generation,
             "source":if source=="PLv2" {"PL"} else {source},"ack_version":if source=="PLv2" {2}else{1}});
         if let Some(path) = initial_path {
@@ -814,6 +827,7 @@ fn acknowledge(
             input: Vec::new(),
             since: Instant::now(),
             attempt: 0,
+            trace,
         });
     }
     let r = route.as_mut().unwrap();
@@ -835,7 +849,12 @@ fn acknowledge(
     if r.written < r.out.len() {
         match stream.write(&r.out[r.written..]) {
             Ok(0) => { r.stream = None; return Ok(None); }
-            Ok(n) => r.written += n,
+            Ok(n) => {
+                r.written += n;
+                if r.trace && r.written == r.out.len() {
+                    trace_control("route_sent", ||json!([generation,version,epoch,position,id,r.attempt]));
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(_) => { r.stream = None; return Ok(None); }
         }
@@ -863,6 +882,9 @@ fn acknowledge(
         let ok = &r.input[..end] == expected.as_bytes();
         r.input.drain(..=end);
         if ok {
+            if r.trace {
+                trace_control("route_ack", ||json!([generation,version,epoch,position,id,r.attempt]));
+            }
             shared.inbox.lock().unwrap().route_pending = Value::Null;
             return Ok(Some(id));
         }
@@ -1150,6 +1172,8 @@ fn worker(
         request.as_object_mut().unwrap().remove("id");
         let generation = clock_ns() / 1000;
         pending["generation"] = json!(generation);
+        trace_control("worker_start", ||json!({"id":id,"generation":generation,"op":op,
+            "received_ns":shared.inbox.lock().unwrap().received_ns}));
         pending["spectrum"] = Value::Null;
         pending["epoch"] = json!(0);
         pending["rx_lo_hz"] = Value::Null;
@@ -1373,6 +1397,7 @@ fn worker(
                 Ok(None)
             }
         })();
+        trace_control("configured", ||json!({"id":id,"generation":generation,"ok":config_result.is_ok()}));
         let mut guard_taken = false;
         let mut guard_rf = false;
         let mut managed_tx = false;
@@ -1449,6 +1474,7 @@ fn worker(
                         .as_u64()
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
                     carrier.prepare_guarded(pll, &shared.switch)?;
+                    trace_control("carrier_ready", ||json!({"id":id,"generation":generation}));
                 }
                 shared.inbox.lock().unwrap().phase = "loading";
                 let load_start = Instant::now();
@@ -1458,6 +1484,7 @@ fn worker(
                     0x4601
                 };
                 let loaded = guard(&guard_fd, load_cmd, setup.as_mut_ptr().cast())?;
+                trace_control("map_loaded", ||json!({"id":id,"generation":generation,"version":word(setup,16)}));
                 let load_us = load_start.elapsed().as_micros() as u64;
                 shared.inbox.lock().unwrap().phase = "applying";
                 let take_start = Instant::now();
@@ -1467,6 +1494,7 @@ fn worker(
                 }
                 guard_taken = true;
                 let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })?;
+                trace_control("take_done", ||json!({"id":id,"generation":generation,"version":word(setup,16)}));
                 ensure!(
                     s[1] == 2
                         && s[9] == expected_control
@@ -1498,6 +1526,8 @@ fn worker(
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let started = |h: crate::system_reader::Header| {
+                trace_control("first_view_arm", ||json!({"id":id,"generation":generation,
+                    "epoch":h.epoch,"fft_tick":h.first_tick,"ordinal":h.ordinal}));
                 let mut a = actual.borrow_mut();
                 let version = a["map_version"].clone();
                 let epoch = if scan {
@@ -1583,6 +1613,7 @@ fn worker(
                 generation,
                 stop: &shared.switch,
                 started: &started,
+                trace: &|stage| trace_control(stage, ||json!({"id":id,"generation":generation})),
                 route: &route_fn,
                 sweep: sweep.as_ref(),
                 check: &|| {
@@ -1632,6 +1663,7 @@ fn worker(
             crate::system_reader::run_controlled(&serde_json::to_vec(&cfg)?, &q)
                 .map_err(|e| anyhow!(e))
         })();
+        trace_control("mode_exit", ||json!({"id":id,"generation":generation,"ok":result.is_ok()}));
         let field_stop = watch
             .into_inner()
             .map_or(Ok(()), |field| field.finish(&regs));
@@ -1644,12 +1676,14 @@ fn worker(
                 } else {
                     guard_cmd(&guard_fd, 0x4604)?
                 };
+                trace_control("guard_return", ||json!({"id":id,"generation":generation,"state":s[1],"powerdown":s[112]}));
                 ensure!(
                     s[1] == 3 && s[9] == 0 && s[112] == 1,
                     "guard return credential"
                 );
                 if guard_rf {
                     actual.borrow_mut()["tx"] = carrier.off()?;
+                    trace_control("carrier_closed", ||json!({"id":id,"generation":generation}));
                 }
                 Ok::<(), anyhow::Error>(())
             })();

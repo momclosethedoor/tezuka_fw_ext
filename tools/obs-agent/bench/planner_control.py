@@ -107,7 +107,8 @@ def lease_loop(stop, ready,log, silence):
                 ready.set()
             if now>=next_log:
                 with (log/"lease.ndjson").open("a") as out:
-                    print(json.dumps({"host_s":now,"lease":lease.lease,"will":will.armed,"state":lease._raw}),file=out)
+                    print(json.dumps({"host_s":now,"lease":lease.lease,"will":will.armed,"state":lease._raw,
+                                      "heartbeat_sent":lease.sent,"heartbeat_missed":lease.missed}),file=out)
                 next_log=now+.25
             stop.wait(.025)
     finally:
@@ -186,6 +187,26 @@ def control(log, profiles, boot):
     remote = a.REMOTE
     url = "http://192.168.2.1:18080"
     path = "/api/system/control"
+    if source := os.environ.get("PLANNER_BENCH_LEASE_SCRIPT"):
+        lease_script = log/"lease-overlay.sh"
+        original = Path(source).read_text(encoding="utf-8")
+        assert original.startswith("#!/bin/sh\n")
+        lease_script.write_bytes(original.replace("#!/bin/sh\n", f"#!/bin/sh\nexport GOOFY_LEASE_TRACE={remote}/lease-board.ndjson\n", 1).encode())
+        a.upload(lease_script, remote, lease_script.name)
+        a.ssh(f"""set -eu
+cd {remote}
+sha256sum /usr/sbin/goofy_lease.sh lease-overlay.sh
+chmod 755 lease-overlay.sh
+old=$(cat /run/goofy/goofy_lease.pid)
+test "$(cat /proc/$old/comm)" = goofy_lease.sh
+mount -o bind "$PWD/lease-overlay.sh" /usr/sbin/goofy_lease.sh
+kill -TERM "$old"
+for i in $(seq 1 60); do
+  new=$(cat /run/goofy/goofy_lease.pid 2>/dev/null || :)
+  if test -n "$new" && test "$new" != "$old" && kill -0 "$new"; then exit 0; fi
+  usleep 100000
+done
+exit 1""")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
         route.connect(("192.168.2.1", 18010))
         ip = route.getsockname()[0]
@@ -239,7 +260,8 @@ while :; do
   usleep 2500
 done' </dev/null >gate-probe.ndjson 2>&1 &)
 """)
-    a.ssh(f"cd {remote} && (OBS_PHASE_TIMING={phase_timing} timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
+    trace = "OBS_CONTROL_TRACE=1 " if os.environ.get("PLANNER_BENCH_CONTROL_TRACE") else ""
+    a.ssh(f"cd {remote} && ({trace}OBS_PHASE_TIMING={phase_timing} timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
     calls = []
     stop,ready,silence=threading.Event(),threading.Event(),threading.Event()
     thread=None
@@ -486,6 +508,8 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                 (log/"gate-probe.ndjson").write_text(a.ssh(f"cd {remote} && cat gate-probe.ndjson"))
             if mixer:
                 (log/"lease-board.txt").write_text(a.ssh("ls -l /run/goofy; cat /run/goofy/goofy_lease.pid; pidof goofy_lease.sh; logread | tail -60"))
+            if os.environ.get("PLANNER_BENCH_LEASE_SCRIPT"):
+                (log/"lease-board.ndjson").write_text(a.ssh(f"cat {remote}/lease-board.ndjson"))
             (log/"owner.log").write_text(a.ssh(f"cd {remote}; kill -TERM $(cat owner.pid) 2>/dev/null || :; sleep 1; cat owner.log"))
             if os.environ.get("PLANNER_BENCH_VERIFY_HANDBACK"):
                 returned = json.loads(a.ssh(f"cd {remote} && ./obs-fl-ctl status"))

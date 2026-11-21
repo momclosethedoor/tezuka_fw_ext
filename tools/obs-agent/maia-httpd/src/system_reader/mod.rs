@@ -244,6 +244,7 @@ pub(crate) struct RunControl<'a>{
  pub generation:u64,
  pub stop:&'a AtomicBool,
  pub started:&'a dyn Fn(Header),
+ pub trace:&'a dyn Fn(&'static str),
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
  pub check:&'a dyn Fn()->R<()>,
  pub sweep:Option<&'a SweepSpec>,
@@ -277,6 +278,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,io.live64(0x238),q.generation,&mut network.borrow_mut()))));
  let announced=std::cell::Cell::new(false);let draining=std::cell::Cell::new(false);
+ let mut first_view_sent=false;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(q)=control{if draining.get(){return Ok(())}if !announced.replace(true){(q.started)(h);}}
   if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
@@ -302,19 +304,21 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow().as_ref(){sweep.poll(&mut net,sock);}else{net.flush_due(sock);}
+   if let Some(q)=control && !first_view_sent && net.sent>0{first_view_sent=true;(q.trace)("first_view_sent");}
   }
   max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released{std::hint::spin_loop();} // CSR has no completion fd/IRQ; no timer delay.
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
- draining.set(control.is_some());io.stop();let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+ draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow_mut().as_mut(){sweep.finish(&mut net,sock,false);}else{net.flush(sock);}
   }
   if s.drained&&!s.dma_busy&&s.released==s.committed{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
  let s=io.snapshot()?;io.release(s.cookie,s.committed)?;
+ if let Some(q)=control{(q.trace)("reader_drained");}
  if let Some(err)=route_failure{return Err(err);}
  drop(sink);
  let after=io.counters()?;if c.trace_limit!=0{let mut f=File::create(c.output.join("records.u64le")).map_err(|e|e.to_string())?;for row in &records{for x in row{f.write_all(&x.to_le_bytes()).map_err(|e|e.to_string())?;}}}

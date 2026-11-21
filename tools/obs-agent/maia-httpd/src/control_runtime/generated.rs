@@ -299,10 +299,17 @@ pub(super) fn transitions(state: &Value, tiles: &[Tile]) -> Result<Vec<Tile>> {
 pub(super) fn catalog_profiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
     let mut representatives = BTreeMap::new();
     let mut profiles = BTreeMap::new();
+    if state["grid_27"] == true {
+        for tile in executable_tiles(state, core)? {
+            profiles.insert((tile.rx, tile.tx.map(|t| t.pll)), tile);
+        }
+    }
     for tile in core {
         let pll = tile.tx.map(|t| t.pll);
         representatives.entry((tile.antenna, pll)).or_insert(tile);
-        profiles.insert((tile.rx, pll), tile.clone());
+        if state["grid_27"] != true {
+            profiles.insert((tile.rx, pll), tile.clone());
+        }
     }
     let routes: Vec<_> = representatives.into_values().collect();
     for (i, left) in routes.iter().enumerate() {

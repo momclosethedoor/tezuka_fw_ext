@@ -180,7 +180,14 @@ impl Cache {
         .iter()
         .map(|s| attr(s))
         .collect::<Result<Vec<_>>>()?;
-        if snapshot != self.snapshot || pending["scan"]["recalibrate"] == true {
+        let invalidation = if pending["scan"]["recalibrate"] == true {
+            Some("requested")
+        } else if !self.snapshot.is_empty() && snapshot != self.snapshot {
+            Some("radio_configuration")
+        } else {
+            None
+        };
+        if self.snapshot.is_empty() || invalidation.is_some() {
             self.snapshot = snapshot;
             self.rx.clear();
             self.tx.clear();
@@ -223,7 +230,10 @@ impl Cache {
             "prepare_us":prepare_us,"worker_cpu_ns":cpu_ns()?.saturating_sub(cpu_start),
             "rss_kib":fs::read_to_string("/proc/self/status")?.lines().find_map(|l|
                 l.strip_prefix("VmRSS:")?.split_whitespace().next()?.parse::<u64>().ok()),
-            "rx_calibrated":rx_cold,"tx_calibrated":tx_cold,"rx_catalog_count":rx_count});
+            "rx_calibrated":rx_cold,"tx_calibrated":tx_cold,"rx_catalog_count":rx_count,
+            "rx_required":rx_keys.len(),"rx_cached":rx_keys.len()-rx_cold,
+            "tx_required":tx_keys.len(),"tx_cached":tx_keys.len()-tx_cold,
+            "cache_invalidation":invalidation});
         Ok((bytes, desc))
     }
 }
