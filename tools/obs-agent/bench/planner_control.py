@@ -242,7 +242,7 @@ def verify_next(api, url, path, log, receiver, previous, sinks, index):
         raise AssertionError("NEXT did not produce an applied map")
     now=changed["actual"]
     assert now["map_version"]==command["next_version"] and now["epoch"]>active["epoch"]
-    assert now["generation"]!=active["generation"] and api.ssh(cookie).strip()==initial
+    assert now["generation"]!=active["generation"]
     old=0
     while time.perf_counter()<deadline:
         data,_=receiver.recvfrom(65535)
@@ -256,8 +256,52 @@ def verify_next(api, url, path, log, receiver, previous, sinks, index):
     elapsed=time.perf_counter_ns()-began
     assert struct.unpack_from("<Q",data,24)[0]>=now["epoch"]
     laps=record_laps(receiver,data,changed,log,100+index)
+    assert api.ssh(cookie).strip()==initial,"NEXT restarted the active ring"
+    while time.perf_counter()<deadline:
+        readback=api.request(url,"GET",path,timeout=1)["actual"]
+        visit=readback["tx"].get("visit") or {}
+        if visit.get("on") is not None:
+            assert visit["version"]==now["map_version"]
+            positions=now["spectrum"]["positions"]
+            assert (visit["epoch"]-now["epoch"])%len(positions)==visit["position"]
+            point=positions[visit["position"]]
+            assert point["tx_gate_requested"]==visit["on"]
+            assert point["tx_slot"] is None or point["tx_slot"]==visit["slot"]
+            break
+        time.sleep(.01)
+    else:
+        raise AssertionError("no bound TX receipt on new map")
     api.write_json(log/f"next-{index}.json",dict(cmd=command,before=previous,after=changed,
-        run=initial,old_datagrams=old,first_fresh_ns=elapsed,laps=laps))
+        run=initial,old_datagrams=old,first_fresh_ns=elapsed,laps=laps,visit=visit))
+
+
+def verify_prepare_cancel(api, url, path, log, scan):
+    trial=dict(scan,ranges=[dict(lo_hz=100124001,hi_hz=891456789,enabled=True)])
+    def post(command):
+        ident=uuid.uuid4().hex
+        assert api.request(url,"POST",path,dict(command,id=ident),timeout=2)["accepted_id"]==ident
+        return ident
+    def wait(predicate):
+        deadline=time.perf_counter()+15
+        while time.perf_counter()<deadline:
+            status=api.request(url,"GET",path,timeout=2)
+            if predicate(status):return status
+            time.sleep(.02)
+        raise AssertionError(f"preparation recovery timed out: {status['phase']} {status['error']}")
+    aborted=post(trial)
+    active=wait(lambda s:s["pending_id"]==aborted and s["phase"]=="calibrating")
+    before=time.perf_counter_ns()
+    stop=post(dict(scan,run=False))
+    stopped=wait(lambda s:s["applied_id"]==stop)
+    stop_ns=time.perf_counter_ns()-before
+    assert stopped["failed_id"]==aborted and stopped["actual"]["running"] is False
+    retried=post(trial)
+    resumed=wait(lambda s:retried in (s["applied_id"],s["failed_id"]))
+    assert resumed["applied_id"]==retried,resumed["error"]
+    end=post(dict(scan,run=False))
+    wait(lambda s:s["applied_id"]==end)
+    api.write_json(log/"prepare-cancel.json",dict(preparing=active,stopped=stopped,
+        resumed=resumed,stop_elapsed_ns=stop_ns))
 
 
 def control(log, profiles, boot):
@@ -540,7 +584,10 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                         a.write_json(log/"host-lease-loss.json",dict(status=expired,physical=gate,
                             host_upper_bound_ns=api_elapsed))
                         assert gate.splitlines()[0]=="1" and float(gate.splitlines()[1].split()[0])==-89.75
-                        break
+                        if not os.environ.get("PLANNER_BENCH_RESTART_AFTER_LOSS"):
+                            break
+                        silence.clear()
+                        assert a.ssh("for i in $(seq 1 30); do test -f /run/goofy/lease_ok && { echo ready; exit; }; usleep 100000; done").strip()=="ready"
                     if os.environ.get("PLANNER_BENCH_FIELD") and len(calls)==1:
                         actual = status["actual"]
                         watch = actual["field_watch"]
@@ -566,22 +613,43 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                             assert failed["failed_id"]==ident and "ACK timeout" in failed["error"]
                     if os.environ.get("PLANNER_BENCH_BANK"):
                         time.sleep(.25)
-                    if os.environ.get("PLANNER_BENCH_WATCHDOG") and len(calls)==1:
+                    if os.environ.get("PLANNER_BENCH_WATCHDOG")==str(len(calls)):
                         probe=a.ssh(f"""set -eu
 cd {remote}
 p=$(pidof maia-delivery)
 test "$(readlink /proc/$p/exe)" = "{remote}/maia-delivery"
 trap 'kill -CONT $p' EXIT
+echo "suspend $(cut -d' ' -f1 /proc/uptime)"
 kill -STOP "$p"
-sleep 2
+previous=
+for i in $(seq 1 120); do
+  word=$(devmem 0x7c460334 32)
+  if test "$word" != "$previous"; then
+    echo "gate $(cut -d' ' -f1 /proc/uptime) $word"
+    previous=$word
+  fi
+  usleep 10000
+done
 ./obs-fl-ctl status
 cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown
 cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
                         (log/"watchdog.txt").write_text(probe)
                         assert probe.splitlines()[-2]=="1" and float(probe.splitlines()[-1].split()[0])==-89.75
-                        break
+                        if not os.environ.get("PLANNER_BENCH_RESTART_AFTER_LOSS"):
+                            break
+                        watchdog_deadline=time.perf_counter()+3
+                        while time.perf_counter()<watchdog_deadline:
+                            failed=a.request(url,"GET",path,timeout=1)
+                            if failed["failed_id"]==ident:
+                                a.write_json(log/"watchdog-failed.json",failed)
+                                break
+                            time.sleep(.02)
+                        else:
+                            raise AssertionError("owner did not report watchdog expiry")
             if os.environ.get("PLANNER_BENCH_RECOVERY"):
                 verify_recovery(a, url, path, scan, log)
+            if os.environ.get("PLANNER_BENCH_CANCEL_PREPARE"):
+                verify_prepare_cancel(a,url,path,log,scan)
     finally:
         try:
             if replay_window:
