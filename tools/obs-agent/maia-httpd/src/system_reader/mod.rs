@@ -322,6 +322,19 @@ fn view_idle_wait(k:u32)->Duration {
  Duration::from_micros((u64::from(k)*4096*1_000_000/(8*61_440_000)).min(64))
 }
 
+// Stand-only variant. The selected interval is immutable throughout one run.
+fn bench_idle_wait(k:u32)->R<Duration>{
+ let Some(path)=std::env::var_os("OBS_VIEW_IDLE_BENCH_FILE") else{return Ok(view_idle_wait(k))};
+ let value=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
+ let micros=value.trim().parse::<u64>().map_err(|e|e.to_string())?;
+ if !matches!(micros,0|16|33|50|66|100){return Err("idle bench interval".into())}
+ Ok(Duration::from_micros(micros))
+}
+fn count_interval(bins:&mut [u64;32],elapsed:Duration){
+ let upper=u128::BITS-elapsed.as_nanos().saturating_sub(1).leading_zeros();
+ bins[upper.min(31) as usize]+=1;
+}
+
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
@@ -334,7 +347,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  // captures use the separate local reader paths.
  let managed_view_only=control.is_some();
  let mut io=Hardware::open(c,managed_view_only)?;
- let empty_wait=if managed_view_only{view_idle_wait(c.k)}else{Duration::ZERO};
+ let empty_wait=if managed_view_only{bench_idle_wait(c.k)?}else{Duration::ZERO};
  io.idle_wait_us=empty_wait.as_micros() as u64;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
@@ -383,6 +396,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let draining=std::cell::Cell::new(false);
  let next_announced=std::cell::Cell::new(false);
  let mut first_view_sent=false;
+ let mut poll_intervals=[0u64;32];let mut sleep_intervals=[0u64;32];
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
@@ -436,7 +450,9 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     *STATUS.lock().unwrap()=v;
    }status_due=Instant::now();
   }
-  let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
+  let t=Instant::now();let interval=t.duration_since(last_poll);
+  max_poll_us=max_poll_us.max(interval.as_micros()as u64);last_poll=t;
+  if io.phase_on {count_interval(&mut poll_intervals,interval);}
   let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
@@ -447,10 +463,16 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released {
    if empty_wait.is_zero(){std::hint::spin_loop();}
-   else{std::thread::sleep(empty_wait);}
+   else{
+    let started=io.phase_on.then(Instant::now);
+    std::thread::sleep(empty_wait);
+    if let Some(t)=started{count_interval(&mut sleep_intervals,t.elapsed());}
+   }
   }
  }
- let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
+ let measured=json!({"poll_intervals_ns_pow2":io.phase_on.then_some(poll_intervals),
+    "sleep_intervals_ns_pow2":io.phase_on.then_some(sleep_intervals),
+    "high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
  if !draining.get(){draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}}
  let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
   if let Some(sock)=&socket {
