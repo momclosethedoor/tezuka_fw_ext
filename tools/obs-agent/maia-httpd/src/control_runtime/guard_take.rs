@@ -43,10 +43,10 @@ struct Report {
 }
 
 fn stage(n: u32) -> &'static str {
-    const STAGES: [&str; 21] = ["unknown", "queued", "worker", "validate", "gate", "flush_work",
+    const STAGES: [&str; 22] = ["unknown", "queued", "worker", "validate", "gate", "flush_work",
         "phy_mutex", "gpio", "mute", "fastlock", "spi_bus_lock", "spi_verify", "mux_request",
         "mux_ack", "enable", "stop_drain", "mux_return", "restore_fastlock", "restore_ccf",
-        "confirm_mute", "release"];
+        "confirm_mute", "release", "restore_tx_quad"];
     STAGES.get(n as usize).copied().unwrap_or("unknown")
 }
 
@@ -69,6 +69,13 @@ fn read(fd: &File, cookie: u32) -> Result<Report> {
     ensure!(report.id == cookie && matches!(report.state, PENDING | CLEANUP | DONE),
         "TAKE_RF operation lost (expected {cookie}, received {})", report.id);
     Ok(report)
+}
+
+pub(super) fn return_trace(fd: &File, operation: &Value) -> Value {
+    operation["current"]["cookie"].as_u64()
+        .and_then(|cookie|read(fd,cookie as u32).ok())
+        .map(|report|report.snapshot(true)["trace"].clone())
+        .unwrap_or(Value::Null)
 }
 
 impl Report {

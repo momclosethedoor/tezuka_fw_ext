@@ -37,6 +37,10 @@
 
 #include "ad9361.h"
 #include "obs_guard_api.h"
+static bool obs_is_worker(void);
+static bool obs_cal_work_enter(void);
+static void obs_cal_work_exit(void);
+static bool obs_deferred_tx_quad;
 #include "ad9361_private.h"
 
 static const struct SynthLUT SynthLUT_FDD[LUT_FTDD_ENT][SYNTH_LUT_SIZE] = {
@@ -2784,6 +2788,11 @@ static int ad9361_tx_quad_calib(struct ad9361_rf_phy *phy,
 	u8 __rx_phase = 0, reg_inv_bits, val, decim;
 	bool phase_inversion_en;
 
+	clkrf = clk_get_rate(phy->clks[CLKRF_CLK]);
+	clktf = clk_get_rate(phy->clks[CLKTF_CLK]);
+	if (!clkrf || !clktf)
+		return -EIO;
+
 	if (st->cached_synth_pd[0] & TX_LO_POWER_DOWN) {
 		if (phy->pdata->lo_powerdown_managed_en) {
 			ad9361_spi_writef(spi, REG_TX_SYNTH_POWER_DOWN_OVERRIDE,
@@ -2802,8 +2811,6 @@ static int ad9361_tx_quad_calib(struct ad9361_rf_phy *phy,
 	 * Tx NCO = ClkTF * (txNCO <1:0> + 1) / 32
 	 */
 
-	clkrf = clk_get_rate(phy->clks[CLKRF_CLK]);
-	clktf = clk_get_rate(phy->clks[CLKTF_CLK]);
 
 	dev_dbg(&phy->spi->dev, "%s : bw_tx %lu clkrf %lu clktf %lu",
 		__func__, bw_tx, clkrf, clktf);
@@ -5707,7 +5714,12 @@ static void ad9361_work_func(struct work_struct *work)
 
 	dev_dbg(&phy->spi->dev, "%s:", __func__);
 
-	ret = ad9361_do_calib_run(phy, TX_QUAD_CAL, st->last_tx_quad_cal_phase);
+	if (obs_cal_work_enter()) {
+		ret = ad9361_do_calib_run(phy, TX_QUAD_CAL, st->last_tx_quad_cal_phase);
+		obs_cal_work_exit();
+	} else {
+		ret = -EBUSY;
+	}
 	if (ret < 0)
 		dev_err(&phy->spi->dev,
 			"%s: TX QUAD cal failed", __func__);
@@ -6522,11 +6534,15 @@ static int ad9361_tx_rfpll_rate_change_unguarded(struct notifier_block *nb,
 		if (st->auto_cal_en)
 			if (abs(st->last_tx_quad_cal_freq - new_rate) >
 				st->cal_threshold_freq) {
-
-				set_bit(0, &st->flags);
-				reinit_completion(&phy->complete);
-				schedule_work(&phy->work);
-				st->last_tx_quad_cal_freq = new_rate;
+				if (obs_is_worker()) {
+					/* Run after the CCF transaction on the thread that owns SPI. */
+					obs_deferred_tx_quad = true;
+				} else {
+					set_bit(0, &st->flags);
+					reinit_completion(&phy->complete);
+					schedule_work(&phy->work);
+					st->last_tx_quad_cal_freq = new_rate;
+				}
 			}
 		ad9361_adjust_tx_ext_band_settings(phy, new_rate);
 	}

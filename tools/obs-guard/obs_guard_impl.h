@@ -15,6 +15,7 @@
 #include "../obs-dma/obs_cap2.h"
 static DECLARE_RWSEM(obs_gate);
 static struct task_struct *obs_worker;
+static struct task_struct *obs_cal_worker;
 static atomic_t obs_denied=ATOMIC_INIT(0);
 static bool obs_block,obs_bus_locked,obs_held;
 static bool obs_phy_locked, obs_phy_dirty, obs_mux_requested, obs_execution;
@@ -46,7 +47,7 @@ enum obs_stage {
  OBS_QUEUED = 1, OBS_WORKER, OBS_VALIDATE, OBS_GATE, OBS_FLUSH, OBS_PHY_MUTEX,
  OBS_GPIO, OBS_MUTE, OBS_FASTLOCK, OBS_BUS, OBS_SPI_VERIFY, OBS_MUX_REQUEST,
  OBS_MUX_ACK, OBS_ENABLE, OBS_STOP, OBS_MUX_RETURN, OBS_RESTORE_FASTLOCK,
- OBS_RESTORE_CCF, OBS_CONFIRM_MUTE, OBS_RELEASE,
+ OBS_RESTORE_CCF, OBS_CONFIRM_MUTE, OBS_RELEASE, OBS_RESTORE_QUAD,
 };
 enum obs_take_state { OBS_PENDING = 1, OBS_CLEANUP, OBS_DONE };
 struct obs_stage_event { u32 step, resources; u64 ns; };
@@ -85,12 +86,21 @@ struct obs_setup {u32 magic,catalog_count,map_count,next_count,version,next_vers
 #define OBS_GATE_DURATION 0x338
 #define OBS_GATE_OPT BIT(0)
 static struct obs_setup *obs_cfg;
+static bool obs_is_worker(void){return current==READ_ONCE(obs_worker);}
+/* A previously queued PS calibration may finish while TAKE drains work. The
+ * gate excludes new callbacks before flush_work, and guarded CCF never queues it. */
+static bool obs_cal_work_enter(void){
+ if(READ_ONCE(obs_bus_locked))return false;
+ WRITE_ONCE(obs_cal_worker,current);return true;
+}
+static void obs_cal_work_exit(void){WRITE_ONCE(obs_cal_worker,NULL);}
+static bool obs_gate_internal(void){return obs_is_worker() || current==READ_ONCE(obs_cal_worker);}
 bool obs_gate_enter(void){
- if(current==READ_ONCE(obs_worker))return true;
+ if(obs_gate_internal())return true;
  if(READ_ONCE(obs_block)||!down_read_trylock(&obs_gate)){atomic_inc(&obs_denied);return false;}
  return true;
 }
-void obs_gate_exit(void){if(current!=READ_ONCE(obs_worker))up_read(&obs_gate);}
+void obs_gate_exit(void){if(!obs_gate_internal())up_read(&obs_gate);}
 int obs_spi_write_then_read(struct spi_device *spi,const void *tx,unsigned nt,void *rx,unsigned nr){
  struct spi_message m;struct spi_transfer t[2]={};u8 *buf;int ret;
  if(!READ_ONCE(obs_bus_locked))return spi_write_then_read(spi,tx,nt,rx,nr);
@@ -267,12 +277,25 @@ static int obs_prepare_fastlock(void){int r,i;
  return 0;
 }
 
+static int obs_acquire_gate(void){
+ int r;
+ /* Avoid queuing a writer behind PS callbacks that may nest through CCF.
+  * A failed try leaves their nested read side available to finish. */
+ for(;;){
+  r=obs_take_checkpoint();if(r)return r;
+  if(down_write_trylock(&obs_gate))break;
+  msleep(1);
+ }
+ WRITE_ONCE(obs_block,true);obs_held=true;obs_state=1;
+ return 0;
+}
+
 static int obs_take(void){int r;u32 v;unsigned long flags;
  obs_stage_record(OBS_VALIDATE,false);
  if(!obs_cfg||obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16)return -EINVAL;
  if(obs_cfg->tx_rf_on && !READ_ONCE(obs_rf_owner))return -EPERM;
  obs_stage_record(OBS_VALIDATE,true);
- OBS_TAKE_STEP(OBS_GATE, ({ WRITE_ONCE(obs_block,true); down_write(&obs_gate); obs_held=true; obs_state=1; 0; }));
+ OBS_TAKE_STEP(OBS_GATE, obs_acquire_gate());
  /* Drain work queued by callbacks that ran before the gate closed. */
  OBS_TAKE_STEP(OBS_FLUSH, ({ flush_work(&obs_phy->work); 0; }));
  OBS_TAKE_STEP(OBS_PHY_MUTEX, ({ mutex_lock(&obs_phy->lock); obs_phy_locked=true; 0; }));
@@ -334,6 +357,18 @@ static int obs_restore_ccf(void){int r;unsigned long hz;
  return 0;
 }
 
+static int obs_restore_quad(void){
+ struct ad9361_rf_phy_state *st=obs_phy->state;
+ int r;
+
+ if(!obs_deferred_tx_quad)return 0;
+ r=ad9361_do_calib_run(obs_phy,TX_QUAD_CAL,st->last_tx_quad_cal_phase);
+ if(r){obs_tx_off();return r;}
+ st->last_tx_quad_cal_freq=ad9361_from_clk(clk_get_rate(obs_phy->clks[TX_RFPLL]));
+ obs_deferred_tx_quad=false;
+ return 0;
+}
+
 static int obs_return(void){int i,r;u32 v;
  if(!obs_held)return -EINVAL;
  if(obs_mux_requested){
@@ -354,6 +389,7 @@ static int obs_return(void){int i,r;u32 v;
  if(obs_phy_dirty){
   OBS_STEP(OBS_RESTORE_FASTLOCK,obs_restore_fastlock());
   OBS_STEP(OBS_RESTORE_CCF,obs_restore_ccf());
+  OBS_STEP(OBS_RESTORE_QUAD,obs_restore_quad());
   OBS_STEP(OBS_CONFIRM_MUTE,obs_tx_off());
   obs_tx_pd=1;obs_tx_atten=89750;obs_phy_dirty=false;
  }

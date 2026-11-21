@@ -1600,9 +1600,14 @@ fn worker(
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
                     ensure!(!managed_tx || cap[125] == 1, "managed scan needs cancellable TAKE_RF guard");
                     guarded_pll = Some(pll);
+                    shared.inbox.lock().unwrap().operation = json!({"kind":"ps_preparation","command_id":id,
+                        "generation":generation,"pll_hz":pll,"started_ns":clock_ns().to_string()});
                     trace_radio(id,generation,|| carrier.prepare_guarded(pll, &shared.switch, |stage| {
                         trace_control(stage, ||json!({"id":id,"generation":generation}));
-                    }))?;
+                        shared.inbox.lock().unwrap().operation["stage"] = json!(stage);
+                    })).inspect_err(|e|{
+                        shared.inbox.lock().unwrap().operation["primary_error"]=json!(format!("{e:#}"));
+                    })?;
                     trace_control("carrier_ready", ||json!({"id":id,"generation":generation}));
                 }
                 shared.inbox.lock().unwrap().phase = "loading";
@@ -1896,16 +1901,19 @@ fn worker(
                     "guard return credential"
                 );
                 if guard_rf {
-                    actual.borrow_mut()["tx"] = carrier.after_guard()?;
+                    actual.borrow_mut()["tx"] = trace_radio(id,generation,||carrier.after_guard())?;
                     trace_control("carrier_closed", ||json!({"id":id,"generation":generation}));
                 }
                 Ok::<(), anyhow::Error>(())
             })();
             {
                 let mut q = shared.inbox.lock().unwrap();
-                let handback = json!({"us":return_start.elapsed().as_micros() as u64,
+                let mut handback = json!({"us":return_start.elapsed().as_micros() as u64,
                     "error":handback.as_ref().err().map(|e|format!("{e:#}"))});
-                if q.operation["generation"] == generation { q.operation["return"] = handback.clone(); }
+                if q.operation["generation"] == generation {
+                    if managed_tx {handback["trace"] = guard_take::return_trace(&guard_fd,&q.operation);}
+                    q.operation["return"] = handback.clone();
+                }
                 if stalled { q.progress_failure["handback"] = handback; }
             }
             match handback {
