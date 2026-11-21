@@ -52,7 +52,7 @@ class Receiver(Sinks):
         self.pause_video = threading.Event()
         self.video_established = threading.Event()
         self.video_stats = {}
-        self.field_stats = dict(begin=0, data=0, end=0, bytes=0, qualified=0, error=0)
+        self.field_stats = dict(begin=0, data=0, end=0, bytes=0, qualified=0, error=0, outcomes={})
         self.protocol_errors = []
         self.views = {}
         self.malformed_udp = 0
@@ -96,8 +96,16 @@ class Receiver(Sinks):
             now = time.perf_counter_ns()
             magic = buf[:8]
             if magic == b"GSWEEP1\x00" and size == SWEEP.size:
-                _, gen, _, _, _, phase, _, _, _, _, _, expected, observed, flags = SWEEP.unpack_from(buf)
+                _, gen, version, anchor, pass_id, phase, first, last, _, _, _, expected, observed, flags = SWEEP.unpack_from(buf)
+                if not (gen and version and first >= anchor and first <= last and phase == pass_id % 2 and 0 <= observed <= expected):
+                    self.malformed_udp += 1
+                    continue
                 stats = self.view_stats(gen)
+                previous_pass = stats["last_pass_id"]
+                if previous_pass is not None:
+                    stats["pass_note_gaps"] += max(0, pass_id - previous_pass - 1)
+                    stats["pass_note_reordered"] += int(pass_id <= previous_pass)
+                stats["last_pass_id"] = max(pass_id, previous_pass or 0)
                 stats["sweep_wire_bytes"] += size
                 stats["expected"] += expected
                 stats["observed"] += observed
@@ -111,7 +119,10 @@ class Receiver(Sinks):
                     if header[0] != b"GVIEW4\x00\x00":
                         self.malformed_udp += 1
                         continue
-                    _, ordinal, _, _, tick, _, _, gen = header
+                    _, ordinal, _, _, tick, k, flags, gen = header
+                    if not (gen and 1 <= k <= 1023 and record == 64 + (0, 512, 1024, 2048)[(flags >> 3) & 3]):
+                        self.malformed_udp += 1
+                        continue
                     stats = self.view_stats(gen)
                     previous = stats["last_ordinal"]
                     if previous is not None:
@@ -132,7 +143,7 @@ class Receiver(Sinks):
     def view_stats(self, generation):
         return self.views.setdefault(generation, dict(received=0, gaps=0, reordered=0, A=0, B=0,
             expected=0, observed=0, sender_drops=0, partial_notes=0, view_wire_bytes=0, sweep_wire_bytes=0,
-            first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None))
+            last_pass_id=None, pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None))
 
     def real8(self, conn):
         from sdr.source.field1_stream import Field1Stream
@@ -164,6 +175,9 @@ class Receiver(Sinks):
                         if kind == "end":
                             self.field_stats["qualified"] += int(meta["qualified_field"])
                             self.field_stats["error"] += int(bool(meta["error"]))
+                            outcome = f'{meta["pl_outcome"]}/{meta["error"]}'
+                            outcomes = self.field_stats["outcomes"]
+                            outcomes[outcome] = outcomes.get(outcome, 0) + 1
                             self.field_stats["last_end"] = meta
                         if result and not (self.folder/"field.real8").exists():
                             info, payload = result
@@ -171,6 +185,8 @@ class Receiver(Sinks):
                             (self.folder/"field.json").write_text(json.dumps(info))
                         continue
                     gen = meta["generation"]
+                    if n == 0 or n % 4 or meta["code"] != 24 or not gen:
+                        raise ValueError("invalid R8V1 payload/context")
                     v = self.video_stats.setdefault(gen, dict(first_ns=now, last_ns=now, packets=0,
                         bytes=0, wire_bytes=0, pos=meta["pos"], gap_bytes=0, sequence_gaps=0,
                         seq=meta["seq"], reset_count=0, intervals=[]))
@@ -283,6 +299,7 @@ def main():
     cli.add_argument("--field-hz", type=int, default=5864800000)
     cli.add_argument("--candidate", action="store_true")
     cli.add_argument("--native-usb", action="store_true")
+    cli.add_argument("--phase-timing", action="store_true")
     args = cli.parse_args()
     board = bench.accepted
     reference = Path("C:/proj/pluto_ag/evidence")
@@ -321,7 +338,8 @@ def main():
         probe = Probe(board, receiver, folder)
         try:
             assert lease_ready.wait(8), "board lease not ready"
-            board.ssh(f"cd {remote} && (timeout 240 ./maia-delivery --system-control {cfg.name} --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
+            profile = "OBS_PHASE_TIMING=1 " if args.phase_timing else ""
+            board.ssh(f"cd {remote} && ({profile}timeout 240 ./maia-delivery --system-control {cfg.name} --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
             startup = probe.until(lambda s: s["phase"] == "stopped", 95)
             board.write_json(folder/"initial-arm.json", startup)
             board.write_json(folder/"counters-initial.json", probe.counters())
@@ -332,14 +350,18 @@ def main():
                 return
             analysis_actual = probe.command("analysis", analysis)
             board.write_json(folder/"counters-video-before.json", probe.counters())
-            probe.command("continuous real8", video)
+            running_video = probe.command("continuous real8", video)
             time.sleep(args.seconds)
+            probe.checks["real8_fresh"] = receiver.video_stats.get(running_video["generation"], {}).get("packets", 0) > 0
             board.write_json(folder/"counters-video.json", probe.counters())
-            probe.command("RETURN", dict(op="return"))
+            returned = probe.command("RETURN", dict(op="return"))
+            probe.checks["return_analysis"] = returned["mode"] == "analysis" and returned["k"] == 700 and returned["rx_lo_hz"] == analysis_actual["rx_lo_hz"]
             if args.candidate:
                 probe.command("video for scan transition", video)
-                probe.command("video to scan", scan)
+                from_video = probe.command("video to scan", scan)
                 time.sleep(2)
+                probe.checks["video_to_scan"] = from_video["mode"] == "scan" and from_video["running"] and (
+                    receiver.view_stats(from_video["generation"])["received"] > 0)
                 probe.command("STOP after video to scan", stop)
             else:
                 probe.command("finite FIELD", scan)
@@ -374,13 +396,19 @@ def main():
                 probe.command("analysis retained", analysis)
                 probe.command("manual route direct", dict(op="route", kind="direct", antenna=0))
                 if args.candidate:
-                    mixer = probe.command("manual route mixer", dict(op="route", kind="mixer", antenna=1))
+                    mixer = probe.command("manual route mixer", dict(op="route", kind="mixer", antenna=1, multiplier=2, side=1))
                     probe.checks["manual_mixer"] = mixer["route"]["kind"] == mixer["analysis_route"]["kind"] == "mixer"
+                    probe.checks["manual_mixer_waits_for_lo"] = not mixer["running"] and mixer["waiting"] == "mixer LO off"
+                    tx = dict(op="tx", on=True, frequency_hz=2_500_000_000, attenuation_mdb=89750)
+                    lo = probe.command("manual mixer LO on", tx)
+                    probe.checks["manual_mixer_lo_readback"] = lo["running"] and lo["tx"]["on"] and lo["if_hz"] == args.video_hz-5_000_000_000
+                    off = probe.command("manual mixer LO off", dict(tx, on=False))
+                    probe.checks["manual_mixer_lo_off"] = not off["running"] and off["tx"]["powerdown"] == 1
                     restored = probe.command("manual route back to direct", dict(op="route", kind="direct", antenna=0))
                     probe.checks["manual_direct"] = restored["route"]["kind"] == restored["analysis_route"]["kind"] == "direct"
                     receiver.missing = True
                     waiting_id = uuid.uuid4().hex
-                    wait_cmd = dict(op="route", kind="mixer", antenna=1, id=waiting_id)
+                    wait_cmd = dict(op="route", kind="mixer", antenna=1, multiplier=2, side=1, id=waiting_id)
                     assert probe.request(wait_cmd)["accepted_id"] == waiting_id
                     waited = probe.until(lambda st: bool(st["route_pending"]) or st["failed_id"] == waiting_id, 3)
                     probe.checks["withheld_route_pending"] = bool(waited["route_pending"])
@@ -400,7 +428,8 @@ def main():
                 queued_id = uuid.uuid4().hex
                 assert probe.request(dict(video, id=queued_id))["accepted_id"] == queued_id
                 assert receiver.video_established.wait(6)
-                blocked = probe.until(lambda st: st["failed_id"] == queued_id or (st["metrics"]["owner"] or {}).get("send_would_block", 0), 5)
+                blocked = probe.until(lambda st: st["failed_id"] == queued_id or (
+                    st["applied_id"] == queued_id and (st["metrics"]["owner"] or {}).get("send_would_block", 0)), 5)
                 board.write_json(folder/"consumer-paused.json", blocked)
                 probe.command("STOP with consumer paused", stop)
                 receiver.pause_video.clear()
@@ -408,6 +437,7 @@ def main():
                 probe.command("video after consumer resume", video)
                 time.sleep(2)
             probe.command("last STOP", stop)
+            board.write_json(folder/"counters-final.json", probe.counters())
             if args.native_usb:
                 from egress_usb import measure
                 board.ssh(f"cd {remote}; kill -TERM \"$(cat owner.pid)\"; i=0; while pidof maia-delivery >/dev/null && test \"$i\" -lt 40; do i=$((i+1)); usleep 50000; done; ! pidof maia-delivery")
