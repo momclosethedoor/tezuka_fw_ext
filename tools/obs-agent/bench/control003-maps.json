@@ -13,7 +13,9 @@
     {"enabled":true,"lo_hz":11500123456,"hi_hz":11656789123}
   ]},
   {"ranges":[{"enabled":true,"lo_hz":5996000000,"hi_hz":6004000000}]},
-  {"ranges":[{"enabled":true,"lo_hz":92460000,"hi_hz":92540000}]},
-  {"ranges":[{"enabled":true,"lo_hz":2394000000,"hi_hz":2425000000}],
-   "next_ranges":[{"enabled":true,"lo_hz":6748000000,"hi_hz":6778000000}]}
+  {"ranges":[{"enabled":true,"lo_hz":2428480000,"hi_hz":2428560000}]},
+  {"ranges":[{"enabled":true,"lo_hz":8100000000,"hi_hz":8300000000},
+             {"enabled":true,"lo_hz":2400000000,"hi_hz":2500000000}],
+   "next_ranges":[{"enabled":true,"lo_hz":8110000000,"hi_hz":8180000000},
+                  {"enabled":true,"lo_hz":2410000000,"hi_hz":2460000000}]}
 ]

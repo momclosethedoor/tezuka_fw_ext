@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','protection','modes','ack-last','ack-exhaust','take')][string]$Case,
+    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','take','take-stop')][string]$Case,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Run,
     [Parameter(Mandatory=$true)][string]$Agent,
     [Parameter(Mandatory=$true)][string]$Modules,
@@ -45,6 +45,11 @@ switch ($Case) {
         $fixture.PLANNER_BENCH_SOAK_CASE='1,2'
         $fixture.PLANNER_BENCH_SOAK_SECONDS='60'
     }
+    'tx-map' {
+        $fixture.PLANNER_BENCH_SWEEP="$PSScriptRoot/control003-maps.json"
+        $fixture.PLANNER_BENCH_CASE_INDEX='4'
+        $fixture.PLANNER_BENCH_ACK3_FAST='1'
+    }
     'protection' {
         $fixture.PLANNER_BENCH_SWEEP="$old/protection-cases.json"
         $fixture.PLANNER_BENCH_LEASE_LOSS='1'
@@ -63,11 +68,15 @@ switch ($Case) {
         $fixture.PLANNER_BENCH_ACK_DROP_FIRST='5'
         $fixture.PLANNER_BENCH_ACK_DROP_KIND='3'
     }
-    'take' {
+    {$_ -in 'take','take-stop'} {
         if (!$Fault) { throw 'Specify -Fault stage,delay_ms,attempt_count,fail,cleanup_fail' }
         $fixture.PLANNER_BENCH_TAKE_FAULT=$Fault
         $fixture.PLANNER_BENCH_ACK3_FAST='1'
-        if ($Fault.EndsWith(',1')) { $fixture.PLANNER_BENCH_VERIFY_HANDBACK='' }
+        if ($Case -eq 'take-stop') { $fixture.PLANNER_BENCH_STOP_DURING_TAKE='1' }
+        if ($Fault.EndsWith(',1')) {
+            $fixture.PLANNER_BENCH_VERIFY_HANDBACK=''
+            $fixture.PLANNER_BENCH_EXPECT_UNSAFE='1'
+        }
     }
 }
 $saved=@{}

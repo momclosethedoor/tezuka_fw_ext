@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import threading
 import sys
 import time
@@ -66,10 +67,11 @@ def receive_after_pause(receiver,status,folder,last):
     return dict(laps.result(),**sweep.result(),paused_ms=(resume-start)/1e6)
 
 
-def soak(receiver,status,folder,seconds):
+def soak(receiver,status,folder,seconds,index=None):
     assert 60 <= seconds <= 120
     laps=Laps(status["actual"])
-    sweeps=Sweeps(status["actual"],folder/"soak-passes.json")
+    name="soak-passes.json" if index is None else f"soak-passes-{index}.json"
+    sweeps=Sweeps(status["actual"],folder/name)
     began=time.perf_counter()
     while time.perf_counter()-began<seconds:
         data,_=receiver.recvfrom(65535)
@@ -325,14 +327,14 @@ for p in /proc/[0-9]*; do
   case "$(cat "$p/comm" 2>/dev/null)" in
     obs_fl_guard|maia-delivery)
       for t in "$p"/task/*; do
-        printf '%s ' "$t"; cat "$t/wchan"; cat "$t/stack" 2>&1
+        printf '%s %s\\n' "$t" "$(cat "$t/wchan")"; cat "$t/stack" 2>&1
       done;;
   esac
 done
 """
     try:
         sample=api.ssh(source,5)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         sample=str(error)
     (log/f"board-{label}.txt").write_text(f"host_ns {time.perf_counter_ns()}\n"+sample,encoding="utf-8")
 
@@ -477,6 +479,8 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
             sweep = os.environ.get("PLANNER_BENCH_SWEEP")
             if sweep:
                 cases = json.loads(Path(sweep).read_text(encoding="utf-8-sig"))
+                if index := os.environ.get("PLANNER_BENCH_CASE_INDEX"):
+                    cases = [cases[int(index)-1]]
                 repeats = int(os.environ.get("PLANNER_BENCH_REPEAT", "1"))
                 if not 1 <= repeats <= 5:
                     raise ValueError("each RAM series supports 1..5 repetitions")
@@ -494,9 +498,25 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                 accepted = a.request(url,"POST",path,dict(cmd,id=ident),timeout=2)
                 assert accepted["accepted_id"] == ident
                 sampled = False
+                stop_id = None
                 while time.perf_counter_ns()-start < (75 if sweep else 35)*1_000_000_000:
                     status = a.request(url,"GET",path,timeout=5 if sweep else 1)
-                    if ident in (status["applied_id"],status["failed_id"]): break
+                    if stop_id:
+                        if status["applied_id"] == stop_id:
+                            assert status["failed_id"]==ident and not status["actual"]["running"]
+                            assert len(status["operation"]["attempts"]) == 1
+                            assert status["operation"]["attempts"][0]["primary_errno"] == 125  # Linux ECANCELED
+                            a.write_json(log/"stop-during-take.json",dict(status=status,
+                                stop_host_ns=time.perf_counter_ns()-stop_start))
+                            break
+                    elif ident in (status["applied_id"],status["failed_id"]):
+                        break
+                    elif os.environ.get("PLANNER_BENCH_STOP_DURING_TAKE") and not calls:
+                        current=(status.get("operation") or {}).get("current") or {}
+                        if current.get("state")=="pending" and current.get("started_stage")=="spi_bus_lock":
+                            stop_id=uuid.uuid4().hex
+                            stop_start=time.perf_counter_ns()
+                            a.request(url,"POST",path,dict(scan,run=False,id=stop_id),timeout=2)
                     if not sampled and (status.get("operation") or {}).get("command_id") == ident \
                             and status["operation"].get("wait_expired_ns"):
                         board_sample(a,log,f"wait-{len(calls)+1}",blocked=True)
@@ -504,9 +524,30 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     time.sleep(.02)
                 calls.append(dict(command=cmd,status=status,host_elapsed_ns=time.perf_counter_ns()-start))
                 a.write_json(log/"commands.json",calls)
+                if stop_id:
+                    assert status["applied_id"] == stop_id,"STOP did not finish after pending TAKE"
+                    continue
                 if sweep and status["failed_id"]==ident:
                     print("Sweep rejected:",status["error"],flush=True)
                     board_sample(a,log,f"failure-{len(calls)}",blocked=True)
+                    if os.environ.get("PLANNER_BENCH_EXPECT_UNSAFE"):
+                        assert status["operation"]["attempts"][0]["cleanup_errno"] != 0
+                        assert len(status["operation"]["attempts"]) == 1
+                        deadline=time.monotonic()+3
+                        while True:
+                            uncertain = a.request(url,"GET",path,timeout=2)
+                            if uncertain["worker_error"] or time.monotonic()>=deadline:
+                                break
+                            time.sleep(.05)
+                        assert uncertain["worker_error"]
+                        try:
+                            a.request(url,"POST",path,dict(cmd,id=uuid.uuid4().hex),timeout=2)
+                        except HTTPError as error:
+                            assert error.code == 503
+                            a.write_json(log/"quarantine.json",dict(status=uncertain,http=error.code))
+                        else:
+                            raise AssertionError("server accepted a new TAKE after unknown handback")
+                        break
                     if status.get("worker_error"):
                         break
                     continue
@@ -571,7 +612,11 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     if cmd.get("next_ranges") is not None:
                         verify_next(a,url,path,log,receiver,status,sinks,len(calls))
                     if str(len(calls)) in os.environ.get("PLANNER_BENCH_SOAK_CASE", "").split(","):
-                        calls[-1]["soak"]=soak(receiver,status,log,float(os.environ.get("PLANNER_BENCH_SOAK_SECONDS","60")))
+                        first=a.request(url,"GET",path,timeout=2)["metrics"]["reader"]
+                        calls[-1]["soak"]=soak(receiver,status,log,float(os.environ.get("PLANNER_BENCH_SOAK_SECONDS","60")),len(calls))
+                        last=a.request(url,"GET",path,timeout=2)["metrics"]["reader"]
+                        calls[-1]["soak"]["reader_before"]=first
+                        calls[-1]["soak"]["reader_after"]=last
                         a.write_json(log/"commands.json",calls)
                     if os.environ.get("PLANNER_BENCH_MISSING_ACK4") and len(calls)==1:
                         sinks.missing=True
@@ -732,7 +777,7 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
             try:
                 owner=a.ssh(f"cd {remote}; cat owner.log",5)
                 (log/"owner-abort.log").write_text(owner,encoding="utf-8")
-            except (OSError,RuntimeError):
+            except (OSError,RuntimeError,subprocess.TimeoutExpired):
                 pass
             raise
         finally:
