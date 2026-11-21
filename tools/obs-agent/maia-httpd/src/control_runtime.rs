@@ -275,7 +275,7 @@ fn validate(v: &Value) -> Result<()> {
     match v["op"].as_str() {
         Some("scan") => {
             if let Some(delivery) = v.get("view_delivery") {
-                ensure!(matches!(delivery.as_str(),Some("stream" | "5ms" | "10ms" | "20ms" | "pass")),
+                ensure!(matches!(delivery.as_str(),Some("stream" | "pass")),
                     "unsupported view_delivery");
             }
             if let Some(rev) = v.get("path_ack_version") {

@@ -390,6 +390,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  if control.is_some() && let Some(sock)=&socket{
   let mut net=network.borrow_mut();
+  net.coalesce_us=0;
   let mut mtu:libc::c_int=0;
   let mut len=std::mem::size_of_val(&mtu) as libc::socklen_t;
   let fd=sock.as_raw_fd();

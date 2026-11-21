@@ -1,7 +1,7 @@
 //! GVIEW4 frames retain their original encoding. GSWEEP1 is an independent
 //! UDP completion record for one executed pass.
 use super::{Header, R, UdpBatch, Value};
-use std::{net::UdpSocket,time::Instant};
+use std::net::UdpSocket;
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
@@ -16,18 +16,15 @@ pub(crate) struct SweepSpec {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode { Stream, Timed(u64), Pass }
+enum Mode { Stream, Pass }
 
 impl SweepSpec {
     pub(crate) fn from_descriptor(desc: &Value, mode: &str) -> R<Option<Self>> {
         if desc["sweep_wire_version"] != 1 {return Ok(None);}
         let mode = match mode {
             "stream" => Mode::Stream,
-            "5ms" => Mode::Timed(5000),
-            "10ms" => Mode::Timed(10000),
-            "20ms" => Mode::Timed(20000),
             "pass" => Mode::Pass,
-            _ => return Err("view delivery must be stream, 5ms, 10ms, 20ms or pass".into()),
+            _ => return Err("view delivery must be stream or pass".into()),
         };
         let rows = desc["positions"].as_array().ok_or("sweep map positions")?;
         let mut first = [usize::MAX;2];
@@ -86,7 +83,6 @@ pub(super) struct Delivery<'a> {
 
 impl<'a> Delivery<'a> {
     pub(super) fn new(spec: &'a SweepSpec, anchor:u64, generation:u64, net:&mut UdpBatch)->R<Self> {
-        net.coalesce_us = match spec.mode {Mode::Timed(us)=>us,_=>0};
         if spec.mode == Mode::Pass {
             let bytes = *spec.count.iter().max().unwrap() as usize * net.record_size();
             if bytes > MAX_BYTES {
@@ -136,7 +132,7 @@ impl<'a> Delivery<'a> {
     }
 
     pub(super) fn poll(&self,net:&mut UdpBatch,sock:&UdpSocket) {
-        if self.spec.mode == Mode::Stream || matches!(self.spec.mode,Mode::Timed(_)) && net.timer_due(Instant::now()) {
+        if self.spec.mode == Mode::Stream {
             net.flush(sock);
         }
     }
