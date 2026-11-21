@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 
-from accept_027_report import physical_passes
+from accept_027_report import percentiles, physical_passes
 from verify_catalog_reuse import check_geometry, load
 
 
@@ -23,7 +23,8 @@ def verify(folder):
         slots = [p["tx_slot"] for p in positions]
         cyclic = list(zip(slots, slots[1:] + slots[:1]))
         phases, _ = physical_passes(folder, index, spectrum, actual["generation"])
-        assert all(p["complete"] >= 12 for p in phases.values()), (index, phases)
+        # The short capture starts mid-stream and may cut one pass at each end.
+        assert all(p["complete"] >= 10 for p in phases.values()), (index, phases)
         row = dict(index=index, visits=len(positions),
             antenna_markers=sum(p["marker_route"] is not None for p in positions),
             transition_visits=sum(p["transition_only"] for p in positions),
@@ -45,7 +46,11 @@ def verify(folder):
                 row["tx_by_phase"][phase]=[a,b,c]
         if "soak" in call:
             assert call["soak"]["elapsed_s"] >= 60
-            row["soak"] = call["soak"]
+            row["soak"] = {k:v for k,v in call["soak"].items() if k!="lap_us"}
+            passes=load(folder/f"soak-passes-{index}.json")["passes"]
+            row["soak"]["span_ms"]={phase:percentiles([
+                (p["last_record_tick"]-p["first_record_tick"])/62500 for p in passes
+                if p["phase"]==phase and p["delivery_complete"]]) for phase in "AB"}
         if "next_ranges" in fixture:
             following = load(folder / f"next-{index}.json")
             before, after = following["before"]["actual"], following["after"]["actual"]

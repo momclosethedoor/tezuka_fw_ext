@@ -33,6 +33,11 @@ def stage_executables(*args, **kwargs):
                 f"obs_test_fail={fail} obs_test_cleanup={cleanup}\n").encode()
         loader.write_bytes(script.replace(original, original.rstrip()+b" "+params))
         api.upload(loader,api.REMOTE,loader.name)
+        manifest=args[0]/"staged.json"
+        staged=json.loads(manifest.read_text())
+        staged[loader.name]=hashlib.sha256(loader.read_bytes()).hexdigest()
+        staged["take_fault"]=dict(stage=stage_id,delay_ms=delay,attempts=count,fail=fail,cleanup_fail=cleanup)
+        api.write_json(manifest,staged)
     if image := os.environ.get("PLANNER_BENCH_XTG1"):
         image = Path(image)
         variants = {

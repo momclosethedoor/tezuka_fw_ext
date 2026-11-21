@@ -95,6 +95,11 @@ class Sinks:
             reply=f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode()
             if os.environ.get("PLANNER_BENCH_ACK3_FAST"):
                 finish(reply)
+                if os.environ.get("PLANNER_BENCH_ACK_LATE_FIRST") == "1" and self.drop_ack:
+                    self.stop.wait(1.05)
+                    with (self.folder/"late-ack.ndjson").open("a") as out:
+                        print(json.dumps(dict(event=event, host_ns=time.perf_counter_ns())),file=out)
+                    conn.sendall(reply)
                 return
             conn.sendall(f"ACK3 {boot} {gen-1} {version} {antenna} {path}\n".encode())
             time.sleep(.08)
