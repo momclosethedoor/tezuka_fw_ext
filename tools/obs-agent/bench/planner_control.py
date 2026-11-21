@@ -50,6 +50,7 @@ def record_laps(receiver,data,status,folder,index):
 
 def receive_after_pause(receiver,status,folder,last):
     receiver.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,32<<10)
+    buffer_bytes=receiver.getsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF)
     pause_ns=int(os.environ["PLANNER_BENCH_RX_PAUSE_MS"])*1_000_000
     start=time.perf_counter_ns()
     time.sleep(pause_ns/1e9)
@@ -64,7 +65,35 @@ def receive_after_pause(receiver,status,folder,last):
         if data[:8]==b"GVIEW4\0\0":
             laps.accept(data)
     receiver.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,4<<20)
-    return dict(laps.result(),**sweep.result(),paused_ms=(resume-start)/1e6)
+    return dict(laps.result(),**sweep.result(),paused_ms=(resume-start)/1e6,buffer_bytes=buffer_bytes)
+
+
+def verify_range_capacity(api,url,path,command,status):
+    rows=command["ranges"]
+    assert len(rows)==16
+    positions=status["actual"]["spectrum"]["positions"]
+    for phase in ("A","B"):
+        assert list(dict.fromkeys(p["rf_row"] for p in positions
+                     if p["sweep_phase"]==phase and not p["transition_only"]))==list(range(16))
+    overflow=[*rows,dict(enabled=True,lo_hz=2_495_000_000,hi_hz=2_496_000_000)]
+    rejections={}
+    for field in ("ranges","next_ranges"):
+        try:
+            api.request(url,"POST",path,dict(command,id=uuid.uuid4().hex,**{field:overflow}),timeout=2)
+        except HTTPError as error:
+            report=json.load(error)
+            assert error.code==400 and report["error"]=="ranges: 1..16",report
+            rejections[field]=dict(http=error.code,**report)
+        else:
+            raise AssertionError(f"accepted 17 rows in {field}")
+    live=api.request(url,"GET",path,timeout=2)
+    assert live["phase"]=="running" and live["applied_id"]==status["applied_id"]
+    assert live["actual"]["generation"]==status["actual"]["generation"]
+    assert live["actual"]["map_version"]==status["actual"]["map_version"]
+    assert live["progress_failure"] is None
+    return dict(rejections=rejections,generation=live["actual"]["generation"],
+                version=live["actual"]["map_version"],applied_id=live["applied_id"],
+                positions=len(positions))
 
 
 def soak(receiver,status,folder,seconds,index=None):
@@ -717,7 +746,13 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                     if status["actual"]["mode"]=="scan" and not os.environ.get("PLANNER_BENCH_ROUTE_ACK"):
                         calls[-1]["laps"]=record_laps(receiver,data,status,log,len(calls))
                     if len(calls)==1 and os.environ.get("PLANNER_BENCH_RX_PAUSE_MS"):
+                        reader_before=a.request(url,"GET",path,timeout=2)["metrics"]["reader"]
                         calls[-1]["pause"]=receive_after_pause(receiver,status,log,calls[-1]["laps"]["last_ordinal"])
+                        live=a.request(url,"GET",path,timeout=2)
+                        calls[-1]["pause"].update(reader_before=reader_before,reader_after=live["metrics"]["reader"])
+                        if os.environ.get("PLANNER_BENCH_RANGE_CAPACITY") == "1":
+                            assert calls[-1]["pause"]["records"] and live["progress_failure"] is None
+                            a.write_json(log/"range-capacity.json",verify_range_capacity(a,url,path,cmd,status))
                     if os.environ.get("PLANNER_BENCH_RECORD_GATE") and status["actual"]["guard_tx"].get("per_visit"):
                         receipts = []
                         for _ in range(36):

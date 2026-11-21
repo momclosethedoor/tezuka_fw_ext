@@ -1,0 +1,21 @@
+[
+  {"view_delivery":"stream","ranges":[
+    {"enabled":true,"lo_hz":8100000000,"hi_hz":8110000000},
+    {"enabled":true,"lo_hz":2400000000,"hi_hz":2410000000},
+    {"enabled":true,"lo_hz":11500000000,"hi_hz":11510000000},
+    {"enabled":true,"lo_hz":810000000,"hi_hz":820000000},
+    {"enabled":true,"lo_hz":6748000000,"hi_hz":6752000000},
+    {"enabled":true,"lo_hz":4500000000,"hi_hz":4510000000},
+    {"enabled":true,"lo_hz":10800000000,"hi_hz":10816000000},
+    {"enabled":true,"lo_hz":100000000,"hi_hz":112000000},
+    {"enabled":true,"lo_hz":7332000000,"hi_hz":7348000000},
+    {"enabled":true,"lo_hz":3510000000,"hi_hz":3522000000},
+    {"enabled":true,"lo_hz":9400000000,"hi_hz":9410000000},
+    {"enabled":true,"lo_hz":5010000000,"hi_hz":5022000000},
+    {"enabled":true,"lo_hz":6200000000,"hi_hz":6212000000},
+    {"enabled":true,"lo_hz":1820000000,"hi_hz":1830000000},
+    {"enabled":true,"lo_hz":11800000000,"hi_hz":11810000000},
+    {"enabled":true,"lo_hz":3000000000,"hi_hz":3010000000}
+  ]},
+  {"view_delivery":"stream","ranges":[{"enabled":true,"lo_hz":6748000000,"hi_hz":6752000000}]}
+]
