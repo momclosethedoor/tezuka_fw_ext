@@ -23,6 +23,8 @@ LEASE_MS=5000
 T_HB=goofy/lease/hb
 T_STATE=state/goofy/lease
 OK_FILE=$RUN/lease_ok
+RADIO_FILE=$RUN/lease-radio.$$
+RADIO_PID=
 V_PID=/run/pl_video/pl_video_ctl.pid
 R_ID=0x7C460000
 R_CTL=0x7C460038
@@ -46,6 +48,8 @@ PUB_PID=$!
 
 cleanup() {
 	rm -f "$OK_FILE"
+	[ -z "$RADIO_PID" ] || kill "$RADIO_PID" 2>/dev/null
+	rm -f "$RADIO_FILE" "$RADIO_FILE.tmp"
 	echo '{"alive":false}' >&4
 	sleep 1
 	kill "$SUB_PID" "$PUB_PID" 2>/dev/null
@@ -90,6 +94,7 @@ sfield() {
 HB_MS=0 HOST="" SEQ=-1 HB_N=0 RELEASED=0
 LEASE=0 EN=1 LOST_N=0 FORCED=0 FAILS=0 PSEQ=0 DIRTY=1 LAST_PUB=0
 TX_STATE=unknown TX_PD="?" TX_G0="?" TX_G1="-"
+TX_SAMPLE_MS=-1
 PHY="" MIN_MDB=""
 
 MAIA=0
@@ -110,6 +115,10 @@ read_tx() {
 	trace_lease read_tx_begin
 	if [ -z "$PHY" ]; then goofy_find_iio || { TX_STATE=no_phy; return 1; }; goofy_tx_min_gain; fi
 	goofy_tx_read
+	case "$TX_PD" in
+	0|1) ;;
+	*) TX_STATE=unknown TX_PD="?" TX_G0="?" TX_G1="-"; trace_lease read_tx_end "$TX_STATE" "$TX_PD"; return 1 ;;
+	esac
 	if goofy_tx_is_off; then TX_STATE=off; else TX_STATE=on; fi
 	trace_lease read_tx_end "$TX_STATE" "$TX_PD"
 }
@@ -117,6 +126,8 @@ read_tx() {
 enforce_tx() {
 	read_tx || return
 	[ $TX_STATE = off ] && return
+	# A fresh heartbeat may have arrived while the radio read was in flight.
+	[ ! -e "$OK_FILE" ] && [ -e "$FLAG" ] || return
 	_was="pd=$TX_PD g0=$TX_G0 g1=$TX_G1"
 	trace_lease force_begin
 	if goofy_tx_off; then
@@ -142,6 +153,34 @@ enforce_video() {
 	fi
 }
 
+radio_tick() {
+	if [ -r "$RADIO_FILE" ]; then
+		IFS='|' read -r TX_SAMPLE_MS TX_STATE TX_PD TX_G0 TX_G1 FORCED FAILS <"$RADIO_FILE"
+	fi
+	# Readbacks have their own timestamp. Old radio data cannot attest to TX
+	# state or renew the lease, and a blocked sysfs read gets no sibling jobs.
+	if [ "$TX_SAMPLE_MS" -lt 0 ] || [ $((NOW - TX_SAMPLE_MS)) -gt 2000 ]; then
+		TX_STATE=unknown TX_PD="?" TX_G0="?" TX_G1="-"
+	fi
+	if [ -n "$RADIO_PID" ]; then
+		kill -0 "$RADIO_PID" 2>/dev/null && return
+		wait "$RADIO_PID" 2>/dev/null
+	fi
+	(
+		exec 3<&- 4<&-
+		if [ ! -e "$OK_FILE" ] && [ -e "$FLAG" ]; then
+			enforce_tx
+			[ -e "$OK_FILE" ] || enforce_video
+		else
+			read_tx
+		fi
+		now_ms
+		printf '%s|%s|%s|%s|%s|%s|%s\n' "$NOW" "$TX_STATE" "$TX_PD" "$TX_G0" "$TX_G1" "$FORCED" "$FAILS" >"$RADIO_FILE.tmp"
+		mv -f "$RADIO_FILE.tmp" "$RADIO_FILE"
+	) &
+	RADIO_PID=$!
+}
+
 tick() {
 	if [ -e "$FLAG" ]; then EN=1; else EN=0; fi
 	_l=0
@@ -155,23 +194,22 @@ tick() {
 			else logger -t goofy_lease "аренда есть (host $HOST): TX и видео разрешены"; fi
 			DIRTY=1
 		fi
-		read_tx
 	else
 		if [ -e "$OK_FILE" ]; then
 			rm -f "$OK_FILE"; LOST_N=$((LOST_N + 1))
 			logger -t goofy_lease "аренды нет: TX гасится, видео mode 0 (раз $LOST_N)"
 			DIRTY=1
 		fi
-		enforce_tx
-		enforce_video
 	fi
+	radio_tick
 }
 
 publish() {
 	PSEQ=$((PSEQ + 1))
 	_age=-1; [ $HB_MS -gt 0 ] && _age=$(( NOW - HB_MS ))
+	_tx_age=-1; [ "$TX_SAMPLE_MS" -lt 0 ] || _tx_age=$((NOW - TX_SAMPLE_MS))
 	trace_lease publish_begin "$PSEQ" "$LEASE" "$SEQ" "$_age"
-	echo "{\"alive\":true,\"enforce\":$EN,\"lease\":$LEASE,\"host\":\"$HOST\",\"seq\":$SEQ,\"age_ms\":$_age,\"lease_ms\":$LEASE_MS,\"released\":$RELEASED,\"heartbeats\":$HB_N,\"lost\":$LOST_N,\"tx\":\"$TX_STATE\",\"tx_lo_powerdown\":\"$TX_PD\",\"tx_gain0\":\"$TX_G0\",\"tx_gain1\":\"$TX_G1\",\"forced\":$FORCED,\"fails\":$FAILS,\"up_ms\":$NOW,\"pseq\":$PSEQ}" >&4
+	echo "{\"alive\":true,\"enforce\":$EN,\"lease\":$LEASE,\"host\":\"$HOST\",\"seq\":$SEQ,\"age_ms\":$_age,\"lease_ms\":$LEASE_MS,\"released\":$RELEASED,\"heartbeats\":$HB_N,\"lost\":$LOST_N,\"tx\":\"$TX_STATE\",\"tx_lo_powerdown\":\"$TX_PD\",\"tx_gain0\":\"$TX_G0\",\"tx_gain1\":\"$TX_G1\",\"tx_sample_age_ms\":$_tx_age,\"forced\":$FORCED,\"fails\":$FAILS,\"up_ms\":$NOW,\"pseq\":$PSEQ}" >&4
 	LAST_PUB=$NOW; DIRTY=0
 	trace_lease publish_end "$PSEQ"
 }
