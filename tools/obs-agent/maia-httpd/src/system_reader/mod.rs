@@ -43,9 +43,9 @@ fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}f
 struct Map{ptr:*mut u8,len:usize}
 impl Map{fn new(fd:&File,len:usize,off:i64,write:bool)->R<Self>{let p=unsafe{libc::mmap(std::ptr::null_mut(),len,libc::PROT_READ|if write{libc::PROT_WRITE}else{0},libc::MAP_SHARED,fd.as_raw_fd(),off as libc::off_t)};if p==libc::MAP_FAILED{return Err(std::io::Error::last_os_error().to_string())}Ok(Self{ptr:p.cast(),len})}}
 impl Drop for Map{fn drop(&mut self){unsafe{libc::munmap(self.ptr.cast(),self.len);}}}
-struct Hardware{phase_on:bool,snapshot_ns:u128,release_ns:u128,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
+struct Hardware{managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
 impl Hardware{
- fn open(c:&Config)->R<Self>{
+ fn open(c:&Config,managed_view_only:bool)->R<Self>{
   let read=|p:&str|std::fs::read_to_string(p).map_err(|e|e.to_string());
   if read("/proc/sys/kernel/random/boot_id")?.trim()!=c.boot_id{return Err("boot lease mismatch".into())}
   if read("/tmp/pl-uart-obs-session/phase")?.trim()!="OBS_READY"{return Err("UART loader prerequisite".into())}
@@ -67,7 +67,7 @@ impl Hardware{
   for(a,n)in[(info.full,info.full_len),(info.view,info.view_len)]{for(lo,hi)in[(0x06000000,0x0e000000),(0x16000000,0x16040000)]{if a<hi&&a+n as u64>lo{return Err("DMA overlaps stock reserve".into())}}}
   let full=Map::new(&device,info.full_len as usize,0,false)?;let overview=Map::new(&device,info.view_len as usize,0x1000000,false)?;
   let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
-  let h=Self{phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
+  let h=Self{managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
   view::geometry(h.r(0xe4),h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))?;if h.r(0x50)!=continuous::ABI{return Err("OBN2 ID".into())}
   Ok(h)
  }
@@ -199,9 +199,9 @@ impl Drop for Hardware{fn drop(&mut self){if self.active{self.stop();}}}
 impl PairIo for Hardware{
  fn batch_limit(&self)->usize{self.batch_limit}
  fn phase_timing(&self)->bool{self.phase_on}
- fn full_read(&self)->bool{!self.release_only}
+ fn full_read(&self)->bool{!self.release_only&&!self.managed_view_only}
  fn prepare_prefix(&mut self,first:u64,end:u64)->R<()>{
-  self.covered.clear();if !self.batch_sync||self.release_only||first==end{return Ok(())}
+  self.covered.clear();if !self.batch_sync||self.release_only||self.managed_view_only||first==end{return Ok(())}
   let count=(end-first) as u32;let slot=(first&1023)as u32;
   if self.reuse_owned_cache && self.shift && self.previous_view!=0 && first.checked_sub(1)==self.retained_synced {
    // The split lookbehind remains physically owned until this record is read.
@@ -227,9 +227,20 @@ impl PairIo for Hardware{
   if self.direct||self.release_only{
    if !self.shift{return Err("direct/header-only requires shift544".into())}
    let pv=self.previous_view;let prev=(slot+1023)&1023;let a=prev*32768+28416+pv;let b=slot*32768;
-   self.ensure_sync(0,a as u32,if self.release_only{512}else{(4352-pv)as u32})?;
-   let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(a),if self.release_only{512}else{4352-pv})};
+   let prefix_len=if self.release_only||self.managed_view_only{512}else{4352-pv};
+   self.ensure_sync(0,a as u32,prefix_len as u32)?;
+   let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(a),prefix_len)};
    let h=continuous::header_prefix(prefix,3)?;let n=view::view_len(h);
+   if self.managed_view_only {
+    // Split544 header lives in the owned lookbehind; VIEW is in the current slot.
+    // Synchronize the exact ranges read by this delivery-only path.
+    if n!=0{self.ensure_sync(0,(b+28416)as u32,n as u32)?;}
+    let v=unsafe{std::slice::from_raw_parts(self.full.ptr.add(b+28416),n)};
+    let t=Instant::now();
+    sink(h,&[],v)?;
+    self.process_ns+=t.elapsed().as_nanos();self.view_bytes+=n as u64;self.previous_view=n;
+    return Ok(())
+   }
    if !self.release_only{self.ensure_sync(0,b as u32,28416)?;if pv!=0{self.ensure_sync(1,(prev*2048)as u32,pv as u32)?;}if n!=0{self.ensure_sync(0,(b+28416)as u32,n as u32)?;}}
    let t=Instant::now();
    if self.release_only{sink(h,&[],&[])?;}else{
@@ -273,7 +284,7 @@ fn full_read_without_sum(b:&[u8]){
  #[cfg(not(target_arch="arm"))] for x in b{unsafe{std::ptr::read_volatile(x);}}
 }
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
-fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
+fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
 pub(crate) struct RunControl<'a>{
  pub generation:u64,
@@ -305,7 +316,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.owned_pipeline{return Err("full-copy experiment rejected; use immediate release reader".into())}
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
- let mut io=Hardware::open(c)?;
+ // At K1 the measured full-read delivery path saturated the
+ // reader. The managed consumer only needs metadata and VIEW.
+ let managed_view_only=control.is_some()&&c.scan&&c.k==1&&c.direct;
+ let mut io=Hardware::open(c,managed_view_only)?;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
  if c.command=="capture"{
@@ -423,7 +437,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  if io.pressure_on{save(c,"pressure.json",&json!({"columns":["board_monotonic_ns","reserved","committed","physical_released"],"period_min_ms":2,"omitted":io.pressure_omitted,"samples":io.pressure}))?;}
  let sweep_network=sweeps.borrow().as_ref().map(|s|json!({"completion_datagrams":s.notes_sent,"completion_send_drop":s.notes_lost,"peak_payload_bytes":s.peak_bytes}));
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum","network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":if managed_view_only{"owned metadata and VIEW, release, then VIEW send"}else{"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
