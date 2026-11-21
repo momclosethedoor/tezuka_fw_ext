@@ -116,7 +116,7 @@ impl Hardware{
  }
  fn cold_split(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
   let initial=self.snapshot()?;
-  if !self.shift||control.is_none()&&initial.cookie!=1||initial.released!=0{return Ok(Value::Null)}
+  if !self.shift||control.is_none()&&(initial.cookie!=1||initial.released!=0){return Ok(Value::Null)}
   let start=Instant::now();
   let mut sampled=start;
   let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{self.r(0x330)}else{0});
@@ -127,20 +127,20 @@ impl Hardware{
    }
    let map=self.map_stamp();
    let s=self.snapshot()?;
-   if !s.running||s.fault||s.cookie!=initial.cookie||s.released!=0||s.reserved>=view::SLOTS as u64{
+   if !s.running||s.fault||s.cookie!=initial.cookie||s.released!=initial.released||s.reserved-s.released>=view::SLOTS as u64{
     return Err("cold split lost initial ownership".into())
    }
-   if control.is_some() && s.committed!=0 {
-    if let Some((width,h))=self.start_view_prefix(c)?{
+   if control.is_some() && s.committed>initial.released {
+    if let Some((width,h))=self.start_view_prefix(c,initial.released)?{
      self.previous_view=width;
      return Ok(json!({"run":initial.cookie,"prefix_view_bytes":width,
                      "ordinal":h.ordinal,"epoch":h.epoch,"first_tick":h.first_tick}))
     }
-    if s.committed>=2 && initial.cookie!=1 {
-     return Err("split544 cannot identify ordinal 0 in the committed START prefix".into())
+    if s.committed-initial.released>=2 && (initial.cookie!=1||initial.released!=0) {
+     return Err("split544 cannot identify the first ordinal in the committed START prefix".into())
     }
    }
-   if s.committed>=2{break}
+   if initial.cookie==1 && initial.released==0 && s.committed>=2{break}
    if STOP.load(Ordering::Relaxed){return Err("cold split cancelled".into())}
    if let Some(q)=control.filter(|_|c.scan) {
     if sampled.elapsed()>=progress::POLL {self.check_progress(&mut progress,start,&s,q,None,Some(map))?;sampled=Instant::now();}
@@ -162,23 +162,19 @@ impl Hardware{
   Ok(json!({"discarded":1,"run":1,"ordinal":0,"first_epoch":first_epoch,
             "next_epoch":next.epoch,"physical_released":self.r64(0x110)}))
  }
- fn start_view_prefix(&mut self,c:&Config)->R<Option<(usize,Header)>>{
-  // On restart the first header may follow a VIEW of the preceding width.
-  // Commit of ordinal zero protects the split544 lookbehind until release.
-  // Consider only valid ordinal-zero headers for this run's K/mode/first epoch.
-  // If a short earlier run left another valid prefix, prefer the newest PL tick.
-  let first_epoch=self.live64(0x198);
-  let mut newest:Option<(usize,Header)>=None;
+ fn start_view_prefix(&mut self,c:&Config,ordinal:u64)->R<Option<(usize,Header)>>{
+  // START advances the cookie but keeps the cumulative ordinal and physical
+  // write slot. Commit of the first record protects its split lookbehind.
+  let prev=ordinal.wrapping_sub(1) as usize & (view::SLOTS-1);
   for width in [0,512,1024,2048]{
-   let offset=(view::SLOTS-1)*32768+28416+width;
+   let offset=prev*32768+28416+width;
    self.ensure_sync(0,offset as u32,512)?;
    let bytes=unsafe{std::slice::from_raw_parts(self.full.ptr.add(offset),512)};
    if let Ok(h)=continuous::header_prefix(bytes,3)
-      && h.ordinal==0 && h.k==c.k && (h.flags>>3)&3==c.mode && h.epoch==first_epoch
-      && newest.as_ref().is_none_or(|(_,old)|old.first_tick<h.first_tick)
-   {newest=Some((width,h));}
+      && h.ordinal==ordinal && h.k==c.k && (h.flags>>3)&3==c.mode
+   {return Ok(Some((width,h)))}
   }
-  Ok(newest)
+  Ok(None)
  }
  fn map_stamp(&self)->(u32,u64){(self.r(0x22c),self.live64(0x238))}
  fn check_progress(&self,progress:&mut progress::Progress,start:Instant,s:&Snapshot,q:&RunControl,
