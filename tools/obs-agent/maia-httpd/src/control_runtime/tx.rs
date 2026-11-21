@@ -176,6 +176,10 @@ impl Carrier {
         self.child.is_some()
     }
 
+    pub fn process_owned(&self) -> bool {
+        self.process_owner.is_some()
+    }
+
     pub fn radio_lock(&self, cancel: &AtomicBool) -> Result<File> {
         match &self.process_owner {
             Some(owner) => Ok(owner.radio.try_clone()?),

@@ -2019,10 +2019,11 @@ fn worker(
                         }
                         last_renew.set(Instant::now());
                     } else if !guard_rf && tx_active && c.external_mixer.is_none() {
-                        if !tx::lease_is_live()
+                        if (!carrier.process_owned() && !tx::lease_is_live())
+                            || !carrier.buffer_live()
                             || tx::readback(FS / 64).map_err(|e| e.to_string())?["on"] != true
                         {
-                            return Err("manual TX lease or carrier lost".into());
+                            return Err("manual TX owner or carrier lost".into());
                         }
                     }
                     if next_version.is_some() && !stage_sent.get()
