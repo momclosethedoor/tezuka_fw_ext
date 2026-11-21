@@ -116,24 +116,33 @@ impl Hardware{
  }
  fn cold_split(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
   let initial=self.snapshot()?;
-  if !self.shift||initial.cookie!=1||initial.released!=0{return Ok(Value::Null)}
+  if !self.shift||control.is_none()&&initial.cookie!=1||initial.released!=0{return Ok(Value::Null)}
   let start=Instant::now();
   let mut sampled=start;
   let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{self.r(0x330)}else{0});
   loop{
    if let Some(q)=control{
     if q.stop.load(Ordering::Acquire){return Err("scan cancelled during first visit".into())}
-    self.service_route(q)?;
-    (q.check)()?;
+    if c.scan{self.service_route(q)?;(q.check)()?;}
    }
    let map=self.map_stamp();
    let s=self.snapshot()?;
-   if !s.running||s.fault||s.cookie!=1||s.released!=0||s.reserved>=view::SLOTS as u64{
+   if !s.running||s.fault||s.cookie!=initial.cookie||s.released!=0||s.reserved>=view::SLOTS as u64{
     return Err("cold split lost initial ownership".into())
+   }
+   if control.is_some() && s.committed!=0 {
+    if let Some((width,h))=self.start_view_prefix(c)?{
+     self.previous_view=width;
+     return Ok(json!({"run":initial.cookie,"prefix_view_bytes":width,
+                     "ordinal":h.ordinal,"epoch":h.epoch,"first_tick":h.first_tick}))
+    }
+    if s.committed>=2 && initial.cookie!=1 {
+     return Err("split544 cannot identify ordinal 0 in the committed START prefix".into())
+    }
    }
    if s.committed>=2{break}
    if STOP.load(Ordering::Relaxed){return Err("cold split cancelled".into())}
-   if let Some(q)=control {
+   if let Some(q)=control.filter(|_|c.scan) {
     if sampled.elapsed()>=progress::POLL {self.check_progress(&mut progress,start,&s,q,None,Some(map))?;sampled=Instant::now();}
    }else if start.elapsed()>=Duration::from_secs(1){return Err("cold split header deadline".into())}
    std::thread::sleep(Duration::from_micros(40));
@@ -152,6 +161,24 @@ impl Hardware{
   self.release(1,1)?;
   Ok(json!({"discarded":1,"run":1,"ordinal":0,"first_epoch":first_epoch,
             "next_epoch":next.epoch,"physical_released":self.r64(0x110)}))
+ }
+ fn start_view_prefix(&mut self,c:&Config)->R<Option<(usize,Header)>>{
+  // On restart the first header may follow a VIEW of the preceding width.
+  // Commit of ordinal zero protects the split544 lookbehind until release.
+  // Consider only valid ordinal-zero headers for this run's K/mode/first epoch.
+  // If a short earlier run left another valid prefix, prefer the newest PL tick.
+  let first_epoch=self.live64(0x198);
+  let mut newest:Option<(usize,Header)>=None;
+  for width in [0,512,1024,2048]{
+   let offset=(view::SLOTS-1)*32768+28416+width;
+   self.ensure_sync(0,offset as u32,512)?;
+   let bytes=unsafe{std::slice::from_raw_parts(self.full.ptr.add(offset),512)};
+   if let Ok(h)=continuous::header_prefix(bytes,3)
+      && h.ordinal==0 && h.k==c.k && (h.flags>>3)&3==c.mode && h.epoch==first_epoch
+      && newest.as_ref().is_none_or(|(_,old)|old.first_tick<h.first_tick)
+   {newest=Some((width,h));}
+  }
+  Ok(newest)
  }
  fn map_stamp(&self)->(u32,u64){(self.r(0x22c),self.live64(0x238))}
  fn check_progress(&self,progress:&mut progress::Progress,start:Instant,s:&Snapshot,q:&RunControl,
@@ -338,7 +365,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  if c.command!="rate"&&c.command!="drain"{return Err("command must be capture, drain, rate".into())}
  if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
- let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split(control.filter(|_|c.scan),c)?}else{Value::Null};
+ let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split(control,c)?}else{Value::Null};
  save(c,"cold-start.json",&cold)?;
  let initial=io.snapshot()?;
  let mut reader=view::PairReader::attach(initial)?;
