@@ -1,0 +1,19 @@
+[
+  {"ranges": [{"lo_hz": 70000000, "hi_hz": 12000000000, "enabled": true}]},
+  {"ranges": [{"lo_hz": 70000000, "hi_hz": 9800000000, "enabled": true}]},
+  {"ranges": [{"lo_hz": 7301111000, "hi_hz": 9802333000, "enabled": true}]},
+  {"ranges": [
+    {"lo_hz": 8100000000, "hi_hz": 8300000000, "enabled": true},
+    {"lo_hz": 2400000000, "hi_hz": 2500000000, "enabled": true},
+    {"lo_hz": 11500123456, "hi_hz": 11656789123, "enabled": true}
+  ]},
+  {"ranges": [{"lo_hz": 5996000000, "hi_hz": 6004000000, "enabled": true}]},
+  {"ranges": [{"lo_hz": 2428480000, "hi_hz": 2428560000, "enabled": true}]},
+  {"ranges": [
+    {"lo_hz": 8100000000, "hi_hz": 8300000000, "enabled": true},
+    {"lo_hz": 2400000000, "hi_hz": 2500000000, "enabled": true}
+  ], "next_ranges": [
+    {"lo_hz": 8110000000, "hi_hz": 8180000000, "enabled": true},
+    {"lo_hz": 2410000000, "hi_hz": 2460000000, "enabled": true}
+  ]}
+]
