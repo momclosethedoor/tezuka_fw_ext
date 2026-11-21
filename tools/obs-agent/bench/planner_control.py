@@ -663,6 +663,8 @@ cat /sys/bus/iio/devices/iio:device0/out_voltage0_hardwaregain""")
             if os.environ.get("PLANNER_BENCH_LEASE_SCRIPT"):
                 (log/"lease-board.ndjson").write_text(a.ssh(f"cat {remote}/lease-board.ndjson"))
             (log/"owner.log").write_text(a.ssh(f"cd {remote}; kill -TERM $(cat owner.pid) 2>/dev/null || :; sleep 1; cat owner.log"))
+            if os.environ.get("PLANNER_BENCH_CONTROL_TRACE"):
+                (log/"dmesg.txt").write_text(a.ssh("dmesg"))
             if os.environ.get("PLANNER_BENCH_VERIFY_HANDBACK"):
                 returned = json.loads(a.ssh(f"cd {remote} && ./obs-fl-ctl status"))
                 radio = a.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown "
