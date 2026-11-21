@@ -1,7 +1,7 @@
 name: OBS007F1 CAP2 RAM modules
 on:
   push:
-    branches: [build/obs007f1-cap2-a9, build/arm-planner-001]
+    branches: [build/obs007f1-cap2-a9, build/arm-planner-001, build/arm-scan-control-003]
     paths: ['tools/obs-dma/**', 'tools/obs-guard/**', '.github/workflows/obs007f1-cap2.yml']
   workflow_dispatch:
 permissions:

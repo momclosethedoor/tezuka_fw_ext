@@ -11,11 +11,13 @@
 #include <linux/gpio/machine.h>
 #include <linux/iopoll.h>
 #include <linux/fs.h>
+#include <linux/ktime.h>
 #include "../obs-dma/obs_cap2.h"
 static DECLARE_RWSEM(obs_gate);
 static struct task_struct *obs_worker;
 static atomic_t obs_denied=ATOMIC_INIT(0);
 static bool obs_block,obs_bus_locked,obs_held;
+static bool obs_phy_locked, obs_phy_dirty, obs_mux_requested, obs_execution;
 static struct ad9361_rf_phy *obs_phy;
 static void __iomem *obs_csr;
 static struct device *obs_dma_dev;
@@ -32,6 +34,42 @@ static int obs_command,obs_error,obs_state;
 static struct file *obs_rf_owner;
 static bool obs_rf_closed;
 static unsigned long obs_rf_deadline;
+#define OBS_TAKE_ASYNC 0x4609
+#define OBS_TAKE_CANCEL 0x460a
+#define OBS_TAKE_GET 0x460b
+#define OBS_TAKE_MS 1000
+#define OBS_OWNER_LEASE_MS 750
+#define OBS_TRACE_LEN 64
+#define OBS_TPC2 0x32435054
+
+enum obs_stage {
+ OBS_QUEUED = 1, OBS_WORKER, OBS_VALIDATE, OBS_GATE, OBS_FLUSH, OBS_PHY_MUTEX,
+ OBS_GPIO, OBS_MUTE, OBS_FASTLOCK, OBS_BUS, OBS_SPI_VERIFY, OBS_MUX_REQUEST,
+ OBS_MUX_ACK, OBS_ENABLE, OBS_STOP, OBS_MUX_RETURN, OBS_RESTORE_FASTLOCK,
+ OBS_RESTORE_CCF, OBS_CONFIRM_MUTE, OBS_RELEASE,
+};
+enum obs_take_state { OBS_PENDING = 1, OBS_CLEANUP, OBS_DONE };
+struct obs_stage_event { u32 step, resources; u64 ns; };
+struct obs_take_report {
+ u32 id, state, entered, completed;
+ s32 primary, recovery;
+ u32 resources, events;
+ u32 fld_control, mux_status, dma_status, gate_status, capability, tpc2;
+ u64 queued_ns, deadline_ns, fault_ns, done_ns;
+ struct obs_stage_event trace[OBS_TRACE_LEN];
+};
+static DEFINE_SPINLOCK(obs_operation_lock);
+static struct obs_take_report obs_operation;
+static bool obs_cancelled;
+/* RAM acceptance fixture. Set at module insertion, disabled by default. */
+static unsigned int obs_test_stage,obs_test_delay_ms,obs_test_attempts;
+static bool obs_test_fail,obs_test_cleanup;
+module_param(obs_test_stage,uint,0400);
+module_param(obs_test_delay_ms,uint,0400);
+module_param(obs_test_attempts,uint,0400);
+module_param(obs_test_fail,bool,0400);
+module_param(obs_test_cleanup,bool,0400);
+static bool obs_test_injected;
 static u32 obs_readback_status,obs_readback_pos,obs_readback_version;
 static u8 obs_readback[128],obs_tx_readback[128];
 static u32 obs_tx_pd,obs_tx_atten;
@@ -64,7 +102,111 @@ int obs_spi_write_then_read(struct spi_device *spi,const void *tx,unsigned nt,vo
 }
 static u32 obs_r(unsigned o){return readl(obs_csr+o);}
 static void obs_w(unsigned o,u32 v){writel(v,obs_csr+o);}
-static void obs_pins(unsigned slot){int i;for(i=0;i<3;i++)gpiod_set_value_cansleep(obs_gpio[i],(slot>>i)&1);}
+static void obs_pins(unsigned slot){int i;for(i=0;i<3;i++)if(obs_gpio[i])gpiod_set_value_cansleep(obs_gpio[i],(slot>>i)&1);}
+static u32 obs_resources(void)
+{
+ return (READ_ONCE(obs_block) ? BIT(0) : 0) |
+        (READ_ONCE(obs_held) ? BIT(1) : 0) |
+        (READ_ONCE(obs_phy_locked) ? BIT(2) : 0) |
+        (READ_ONCE(obs_phy_dirty) ? BIT(3) : 0) |
+        (READ_ONCE(obs_bus_locked) ? BIT(4) : 0) |
+        (READ_ONCE(obs_mux_requested) ? BIT(5) : 0) |
+        (READ_ONCE(obs_execution) ? BIT(6) : 0) |
+        (READ_ONCE(obs_gpio[0]) ? BIT(7) : 0) |
+        (READ_ONCE(obs_gpio[1]) ? BIT(8) : 0) |
+        (READ_ONCE(obs_gpio[2]) ? BIT(9) : 0);
+}
+
+static void obs_stage_record(enum obs_stage stage, bool completed)
+{
+ struct obs_take_report *p = &obs_operation;
+ unsigned long flags;
+
+ spin_lock_irqsave(&obs_operation_lock, flags);
+ if (p->state == OBS_PENDING || p->state == OBS_CLEANUP ||
+     (p->id && stage >= OBS_STOP)) {
+  u32 resources = obs_resources();
+  if (p->state == OBS_PENDING) {
+   if (completed)
+    p->completed = stage;
+   else
+    p->entered = stage;
+  }
+  if (p->events < OBS_TRACE_LEN)
+   p->trace[p->events++] = (struct obs_stage_event){stage | (completed ? BIT(31) : 0), resources, ktime_get_ns()};
+ }
+ spin_unlock_irqrestore(&obs_operation_lock, flags);
+}
+
+static int obs_take_limit(void)
+{
+ lockdep_assert_held(&obs_operation_lock);
+ if (obs_operation.state != OBS_PENDING)
+  return 0;
+ if (obs_cancelled)
+  return -ECANCELED;
+ if (ktime_get_ns() >= obs_operation.deadline_ns)
+  return -ETIMEDOUT;
+ return 0;
+}
+
+static int obs_take_checkpoint(void)
+{
+ unsigned long flags;
+ int r;
+
+ spin_lock_irqsave(&obs_operation_lock, flags);
+ r = obs_take_limit();
+ spin_unlock_irqrestore(&obs_operation_lock, flags);
+ return r;
+}
+
+static int obs_test_after_stage(enum obs_stage stage)
+{
+ if (obs_operation.state != OBS_PENDING || stage != obs_test_stage || !obs_test_attempts)
+  return 0;
+ obs_test_attempts--;
+ obs_test_injected=true;
+ if (obs_test_delay_ms)
+  msleep(min(obs_test_delay_ms, 5000U));
+ return obs_test_fail ? -ETIMEDOUT : obs_take_checkpoint();
+}
+
+/* Blocking SPI/CCF calls retain their actual result. Check the deadline before
+ * entering the next stage, and under the activation lock before granting RF. */
+#define OBS_STEP(stage, expr) do { \
+ obs_stage_record(stage, false); \
+ r = (expr); \
+ if (r) return r; \
+ obs_stage_record(stage, true); \
+} while (0)
+#define OBS_TAKE_STEP(stage, expr) do { \
+ r = obs_take_checkpoint(); \
+ if (r) return r; \
+ OBS_STEP(stage, ({ int ret=(expr); ret ?: obs_test_after_stage(stage); })); \
+} while (0)
+
+static void obs_take_fault(int error)
+{
+ struct obs_take_report *p = &obs_operation;
+ unsigned long flags;
+
+ spin_lock_irqsave(&obs_operation_lock, flags);
+ if (p->state == OBS_PENDING && !p->primary) {
+  p->primary = error;
+  p->fault_ns = ktime_get_ns();
+  p->resources = obs_resources();
+  p->fld_control = obs_r(0x1e0);
+  p->mux_status = obs_r(0x228);
+  p->dma_status = obs_r(0x64);
+  p->gate_status = obs_r(OBS_GATE_STATUS);
+  p->capability = obs_r(0x33c);
+  if (p->capability == OBS_TPC2)
+   p->tpc2 = obs_r(0x344);
+  p->state = OBS_CLEANUP;
+ }
+ spin_unlock_irqrestore(&obs_operation_lock, flags);
+}
 static int obs_tx_off(void){
  int pd;
  int r=ad9361_synth_lo_powerdown(obs_phy,LO_DONTCARE,LO_OFF);
@@ -86,20 +228,17 @@ static int obs_tx_canonical(void){int i,r;u8 b[16];
   r=ad9361_fastlock_save(obs_phy,true,i,b);if(r||memcmp(b,obs_cfg->tx_profiles+16*i,16))return -EIO;}
  return 0;
 }
-static int obs_take(void){int i,r;u32 v;struct gpio_chip *chip;
- if(!obs_cfg||obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16)return -EINVAL;
- if(obs_cfg->tx_rf_on && !READ_ONCE(obs_rf_owner))return -EPERM;
- WRITE_ONCE(obs_block,true);down_write(&obs_gate);obs_held=true;obs_state=1;
- /* All callback families are quiesced. A callback that queued calibration has
-  * returned before down_write; flush drains its physical SPI before bus lock. */
- flush_work(&obs_phy->work);mutex_lock(&obs_phy->lock);
+static int obs_request_pins(void){int i,r;struct gpio_chip *chip;
  chip=gpiod_to_chip(gpio_to_desc(obs_cfg->gpio_base+63));
  if(!chip||strcmp(chip->label,"zynq_gpio")||chip->base!=obs_cfg->gpio_base||chip->ngpio<66)return -ENODEV;
  for(i=0;i<3;i++){
   obs_gpio[i]=gpiochip_request_own_desc(chip,63+i,"obs006d-guard",GPIO_LOOKUP_FLAGS_DEFAULT,GPIOD_OUT_LOW);
   if(IS_ERR(obs_gpio[i])){r=PTR_ERR(obs_gpio[i]);obs_gpio[i]=NULL;return r;}
  }
- obs_pins(0);r=obs_tx_off();if(r)return r;
+ return 0;
+}
+
+static int obs_prepare_fastlock(void){int r,i;
  ad9361_fastlock_prepare(obs_phy,false,0,false);ad9361_fastlock_prepare(obs_phy,true,0,false);
  memset(&obs_phy->state->fastlock,0,sizeof(obs_phy->state->fastlock));
  obs_phy->pdata->trx_fastlock_pinctrl_en[0]=true;obs_phy->pdata->trx_fastlock_pinctrl_en[1]=false;
@@ -125,33 +264,64 @@ static int obs_take(void){int i,r;u32 v;struct gpio_chip *chip;
   obs_w(OBS_GATE_SEEDS,pd|(tpc<<8)|((obs_cfg->tx_atten_mdb/250)<<16));
   obs_w(OBS_GATE_WAIT,obs_cfg->extra_reserved>>16);
  }else if(obs_tx_pd!=!obs_cfg->tx_rf_on||obs_tx_atten!=(obs_cfg->tx_rf_on?obs_cfg->tx_atten_mdb:89750))return -EIO;
- r=spi_bus_lock(obs_phy->spi->controller);if(r)return r;WRITE_ONCE(obs_bus_locked,true);
- /* This synchronous locked transaction is behind any already-queued PS work. */
- if(ad9361_spi_read(obs_phy->spi,REG_PRODUCT_ID)<0)return -EIO;
+ return 0;
+}
+
+static int obs_take(void){int r;u32 v;unsigned long flags;
+ obs_stage_record(OBS_VALIDATE,false);
+ if(!obs_cfg||obs_held||obs_r(0x1e0)||obs_r(0x228)&7||obs_r(0x64)!=16)return -EINVAL;
+ if(obs_cfg->tx_rf_on && !READ_ONCE(obs_rf_owner))return -EPERM;
+ obs_stage_record(OBS_VALIDATE,true);
+ OBS_TAKE_STEP(OBS_GATE, ({ WRITE_ONCE(obs_block,true); down_write(&obs_gate); obs_held=true; obs_state=1; 0; }));
+ /* Drain work queued by callbacks that ran before the gate closed. */
+ OBS_TAKE_STEP(OBS_FLUSH, ({ flush_work(&obs_phy->work); 0; }));
+ OBS_TAKE_STEP(OBS_PHY_MUTEX, ({ mutex_lock(&obs_phy->lock); obs_phy_locked=true; 0; }));
+ OBS_TAKE_STEP(OBS_GPIO, obs_request_pins());
+ OBS_TAKE_STEP(OBS_MUTE, ({ obs_pins(0); obs_phy_dirty=true; obs_tx_off(); }));
+ OBS_TAKE_STEP(OBS_FASTLOCK, obs_prepare_fastlock());
+ OBS_TAKE_STEP(OBS_BUS, ({ int ret=spi_bus_lock(obs_phy->spi->controller); if(!ret) WRITE_ONCE(obs_bus_locked,true); ret; }));
+ /* A synchronous locked transaction is behind any queued PS messages. */
+ OBS_TAKE_STEP(OBS_SPI_VERIFY, ({ int ret=ad9361_spi_read(obs_phy->spi,REG_PRODUCT_ID); ret<0?ret:0; }));
+ obs_stage_record(OBS_MUX_REQUEST,false);
+ spin_lock_irqsave(&obs_operation_lock, flags);
+ r=obs_take_limit();
+ if(r){spin_unlock_irqrestore(&obs_operation_lock, flags);return r;}
  dma_wmb();obs_w(0x1e4,obs_dma[1]);obs_w(0x1e8,obs_cfg->map_count);obs_w(0x1ec,obs_cfg->version);
  obs_w(0x1f0,obs_dma[0]);obs_w(0x1f4,obs_cfg->catalog_count);obs_w(0x204,obs_phy->state->fastlock.entry[0][0].alc_written|(obs_cfg->tx_start_slot<<8));
- obs_w(0x21c,obs_cfg->dwell);obs_w(0x1e0,2);
- r=readl_poll_timeout(obs_csr+0x228,v,v&2,10,1000000);if(r)return r;
+ obs_w(0x21c,obs_cfg->dwell);obs_mux_requested=true;obs_w(0x1e0,2);
+ spin_unlock_irqrestore(&obs_operation_lock, flags);
+ obs_stage_record(OBS_MUX_REQUEST,true);
+ OBS_TAKE_STEP(OBS_MUX_ACK, ({
+  int cancelled=0;
+  int ret=read_poll_timeout(obs_r,v,(v&2) || (cancelled=obs_take_checkpoint()),10,1000000,false,0x228);
+  cancelled ?: ret;
+ }));
+ obs_stage_record(OBS_ENABLE,false);
+ spin_lock_irqsave(&obs_operation_lock, flags);
+ r=obs_take_limit();
+ if(r){spin_unlock_irqrestore(&obs_operation_lock, flags);return r;}
  if(obs_cfg->extra_reserved & OBS_GATE_OPT){
   obs_w(0x1e0,31);
   obs_w(0x220,4);
  }else obs_w(0x1e0,3|(obs_cfg->tx_enable?4:0));
- obs_state=2;return 0;
+ obs_execution=true;obs_state=2;
+ if(obs_rf_owner)WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(OBS_OWNER_LEASE_MS));
+ spin_unlock_irqrestore(&obs_operation_lock, flags);
+ obs_stage_record(OBS_ENABLE,true);
+ return 0;
 }
-static int obs_return(void){int i,r;u32 v;unsigned long hz;
- if(!obs_held||!obs_bus_locked)return -EINVAL;
- if(obs_cfg->extra_reserved & OBS_GATE_OPT)
-  obs_w(0x1e0,15); /* Revoke before attempting STOP/drain or taking PS SPI. */
- obs_w(0x54,4);r=readl_poll_timeout(obs_csr+0x64,v,(v&19)==16,10,2000000);if(r)return r;
- v=obs_r(0x228);obs_readback_status=v;obs_readback_pos=obs_r(0x234);obs_readback_version=obs_r(0x22c);
- obs_pins((v>>16)&7);obs_w(0x1e0,0);
- r=readl_poll_timeout(obs_csr+0x228,v,!(v&2),10,2000000);if(r)return r;
+
+static int obs_restore_fastlock(void){int i,r;
  for(i=0;i<8;i++){ad9361_fastlock_save(obs_phy,false,i,obs_readback+16*i);if(obs_cfg->tx_enable)ad9361_fastlock_save(obs_phy,true,i,obs_tx_readback+16*i);}
  r=obs_tx_off();if(r)return r;
  ad9361_fastlock_prepare(obs_phy,false,0,false);ad9361_fastlock_prepare(obs_phy,true,0,false);
  memset(&obs_phy->state->fastlock,0,sizeof(obs_phy->state->fastlock));
  r=obs_canonical();if(r)return r;r=obs_tx_canonical();if(r)return r;
  obs_phy->pdata->trx_fastlock_pinctrl_en[0]=false;obs_phy->pdata->trx_fastlock_pinctrl_en[1]=false;obs_pins(0);
+ return 0;
+}
+
+static int obs_restore_ccf(void){int r;unsigned long hz;
  /* Force a genuine normal-mode PLL set even if CCF cached the desired rate. */
  hz=ad9361_to_clk(obs_cfg->restore_lo);
  r=clk_set_rate(obs_phy->clks[RX_RFPLL],hz+500000);if(r)return r;
@@ -161,13 +331,42 @@ static int obs_return(void){int i,r;u32 v;unsigned long hz;
   r=clk_set_rate(obs_phy->clks[TX_RFPLL],hz+500000);if(r)return r;
   r=clk_set_rate(obs_phy->clks[TX_RFPLL],hz);if(r)return r;
   if(abs((long)clk_get_rate(obs_phy->clks[TX_RFPLL])-(long)hz)>10)return -EIO;}
- r=obs_tx_off();if(r)return r;
- obs_tx_pd=!!(ad9361_spi_read(obs_phy->spi,REG_TX_SYNTH_POWER_DOWN_OVERRIDE)&TX_LO_POWER_DOWN);obs_tx_atten=ad9361_get_tx_atten(obs_phy,1);
- WRITE_ONCE(obs_bus_locked,false);spi_bus_unlock(obs_phy->spi->controller);
- for(i=0;i<3;i++){gpiochip_free_own_desc(obs_gpio[i]);obs_gpio[i]=NULL;}
- mutex_unlock(&obs_phy->lock);obs_held=false;obs_state=3;up_write(&obs_gate);WRITE_ONCE(obs_block,false);return 0;
+ return 0;
 }
-static int obs_thread(void *arg){int cmd,r;
+
+static int obs_return(void){int i,r;u32 v;
+ if(!obs_held)return -EINVAL;
+ if(obs_mux_requested){
+  if(obs_execution){
+   if(obs_cfg->extra_reserved & OBS_GATE_OPT)
+    obs_w(0x1e0,15); /* Revoke RF grant before STOP or taking PS SPI. */
+   obs_w(0x54,4);
+   OBS_STEP(OBS_STOP,readl_poll_timeout(obs_csr+0x64,v,(v&19)==16,10,2000000));
+   v=obs_r(0x228);obs_readback_status=v;obs_readback_pos=obs_r(0x234);obs_readback_version=obs_r(0x22c);
+   obs_pins((v>>16)&7);
+  }
+  obs_stage_record(OBS_MUX_RETURN,false);
+  obs_w(0x1e0,0);
+  r=readl_poll_timeout(obs_csr+0x228,v,!(v&2),10,2000000);if(r)return r;
+  obs_mux_requested=false;obs_execution=false;
+  obs_stage_record(OBS_MUX_RETURN,true);
+ }
+ if(obs_phy_dirty){
+  OBS_STEP(OBS_RESTORE_FASTLOCK,obs_restore_fastlock());
+  OBS_STEP(OBS_RESTORE_CCF,obs_restore_ccf());
+  OBS_STEP(OBS_CONFIRM_MUTE,obs_tx_off());
+  obs_tx_pd=1;obs_tx_atten=89750;obs_phy_dirty=false;
+ }
+ obs_stage_record(OBS_RELEASE,false);
+ if(obs_test_injected && obs_test_cleanup){obs_test_injected=false;return -EIO;}
+ if(obs_bus_locked){WRITE_ONCE(obs_bus_locked,false);spi_bus_unlock(obs_phy->spi->controller);}
+ for(i=0;i<3;i++)if(obs_gpio[i]){gpiochip_free_own_desc(obs_gpio[i]);obs_gpio[i]=NULL;}
+ if(obs_phy_locked){obs_phy_locked=false;mutex_unlock(&obs_phy->lock);}
+ obs_held=false;obs_state=3;up_write(&obs_gate);WRITE_ONCE(obs_block,false);
+ obs_stage_record(OBS_RELEASE,true);
+ return 0;
+}
+static int obs_thread(void *arg){int cmd,r,recovery;unsigned long flags;
  for(;;){
   if(READ_ONCE(obs_rf_owner) && READ_ONCE(obs_state)==2){
    wait_event_timeout(obs_wait,READ_ONCE(obs_command)!=0,msecs_to_jiffies(100));
@@ -181,17 +380,30 @@ static int obs_thread(void *arg){int cmd,r;
     }
    }
   }else wait_event(obs_wait,READ_ONCE(obs_command)!=0);
-  cmd=READ_ONCE(obs_command);if(!cmd)continue;r=0;
-  if(cmd==2){
+  cmd=READ_ONCE(obs_command);if(!cmd)continue;r=0;recovery=0;
+  if(cmd==2 || cmd==5){
+   obs_test_injected=false;
+   obs_stage_record(OBS_WORKER,true);
    r=obs_take();
-   if(r && obs_rf_owner && obs_held){
-    /* obs_take can fail while PS owns SPI or while waiting for mux ACK. */
-    if(obs_bus_locked)obs_return();else obs_tx_off();
+   if(r){
+    obs_take_fault(r);
+    if(obs_held)recovery=obs_return();
+    if(!recovery)WRITE_ONCE(obs_rf_owner,NULL);
    }
   }
   else if(cmd==3){if(obs_state!=2||obs_r(0x228)&16)r=-EBUSY;else{dma_wmb();obs_w(0x1f8,obs_dma[2]);obs_w(0x1fc,obs_cfg->next_count);obs_w(0x200,obs_cfg->next_version);obs_w(0x220,1);}}
   else if(cmd==4)r=obs_return();else r=-EINVAL;
-  obs_error=r;if(r)obs_state=4;WRITE_ONCE(obs_command,0);complete(&obs_done);
+  spin_lock_irqsave(&obs_operation_lock, flags);
+  if(cmd==5){
+   obs_operation.recovery=recovery;
+   obs_operation.done_ns=ktime_get_ns();
+   obs_operation.state=OBS_DONE;
+  }
+  obs_error=cmd==5?recovery:r;
+  if(recovery || (r && cmd!=5 && obs_state!=3))obs_state=4;
+  WRITE_ONCE(obs_command,0);
+  if(cmd!=5)complete(&obs_done);
+  spin_unlock_irqrestore(&obs_operation_lock, flags);
  }return 0;
 }
 static int obs_validate(struct obs_setup *c,u8 *tables,size_t stride){u32 i,j;
@@ -274,12 +486,47 @@ static void obs_gate_snapshot(u32 *words)
  if(before!=words[118] || epoch!=obs_r(0x180) || (before & BIT(7)))
   words[118]&=~BIT(6);
 }
-static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u32 words[128]={};
+static int obs_get_take(void __user *arg)
+{
+ struct obs_take_report *report=kmalloc(sizeof(*report),GFP_KERNEL);
+ unsigned long flags;
+ int r;
+
+ if(!report)return -ENOMEM;
+ spin_lock_irqsave(&obs_operation_lock,flags);
+ *report=obs_operation;
+ if(report->state==OBS_PENDING){
+  report->resources=obs_resources();
+  report->fld_control=obs_r(0x1e0);
+  report->mux_status=obs_r(0x228);
+  report->dma_status=obs_r(0x64);
+  report->gate_status=obs_r(OBS_GATE_STATUS);
+  report->capability=obs_r(0x33c);
+  if(report->capability==OBS_TPC2)report->tpc2=obs_r(0x344);
+ }
+ spin_unlock_irqrestore(&obs_operation_lock,flags);
+ r=copy_to_user(arg,report,sizeof(*report))?-EFAULT:0;
+ kfree(report);
+ return r;
+}
+
+static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u32 words[128]={},id=0;unsigned long flags;
  if(!capable(CAP_SYS_RAWIO))return -EPERM;
+ if(cmd==OBS_TAKE_GET)return obs_get_take((void __user *)arg);
+ if((cmd==OBS_TAKE_ASYNC || cmd==OBS_TAKE_CANCEL) && get_user(id,(u32 __user *)arg))return -EFAULT;
+ if(cmd==OBS_TAKE_CANCEL){
+  spin_lock_irqsave(&obs_operation_lock,flags);
+  if(!id || id!=obs_operation.id || READ_ONCE(obs_rf_owner)!=f)r=-ESTALE;
+  else if(obs_operation.state!=OBS_PENDING || obs_execution)r=-EALREADY;
+  else obs_cancelled=true;
+  spin_unlock_irqrestore(&obs_operation_lock,flags);
+  return r;
+ }
  if(cmd==0x4605){
   words[0]=2;words[1]=READ_ONCE(obs_state);words[2]=READ_ONCE(obs_error);words[3]=atomic_read(&obs_denied);
   for(i=0;i<3;i++)words[4+i]=obs_dma[i];words[7]=obs_alloc_bytes?:4096;words[115]=65535;words[116]=1;
   words[117]=obs_r(OBS_GATE_ID_REG);
+  words[125]=1;
   if(words[117]==OBS_GATE_ID)obs_gate_snapshot(words);
   words[8]=obs_r(0x64);words[9]=obs_r(0x1e0);words[114]=1;
   for(i=0;i<18;i++)words[16+i]=obs_r(0x224+4*i);
@@ -287,6 +534,26 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
   return copy_to_user((void __user *)arg,words,sizeof(words))?-EFAULT:0;
  }
  if(mutex_lock_interruptible(&obs_command_lock))return -EINTR;
+ /* The previous worker owns the command slot until it has completed every
+  * cleanup step, even when a synchronous caller has returned on timeout. */
+ if(READ_ONCE(obs_command)){r=-EBUSY;goto out;}
+ if(cmd==OBS_TAKE_ASYNC){
+  if(!id || !obs_cfg || !obs_cfg->tx_rf_on || !(obs_cfg->extra_reserved & OBS_GATE_OPT)){r=-EINVAL;goto out;}
+  if(obs_rf_owner || obs_held || obs_r(0x1e0) || obs_r(0x228)&7 || obs_r(0x64)!=16){r=-EBUSY;goto out;}
+  spin_lock_irqsave(&obs_operation_lock,flags);
+  memset(&obs_operation,0,sizeof(obs_operation));
+  obs_operation.id=id;obs_operation.state=OBS_PENDING;
+  obs_operation.entered=OBS_QUEUED;obs_operation.completed=OBS_QUEUED;
+  obs_operation.queued_ns=ktime_get_ns();
+  obs_operation.deadline_ns=obs_operation.queued_ns+(u64)OBS_TAKE_MS*NSEC_PER_MSEC;
+  obs_operation.trace[0]=(struct obs_stage_event){OBS_QUEUED|BIT(31),0,obs_operation.queued_ns};
+  obs_operation.events=1;
+  obs_error=0;obs_cancelled=false;obs_rf_closed=false;WRITE_ONCE(obs_rf_owner,f);
+  WRITE_ONCE(obs_command,5);
+  spin_unlock_irqrestore(&obs_operation_lock,flags);
+  wake_up(&obs_wait);
+  goto out;
+ }
  if(cmd==0x4606){
   if(obs_rf_closed || obs_rf_owner!=f || obs_state!=2){r=-ESTALE;goto out;}
   if(time_after_eq(jiffies,obs_rf_deadline)){r=-ETIMEDOUT;goto out;}
@@ -294,12 +561,12 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
    if(obs_r(OBS_GATE_STATUS)&BIT(8)){r=-ESTALE;goto out;}
    obs_w(0x220,4);
   }
-  WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));goto out;
+  WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(OBS_OWNER_LEASE_MS));goto out;
  }
  if(cmd==0x4607){
   if(obs_rf_owner || !obs_cfg || !obs_cfg->tx_rf_on || obs_held){r=-EBUSY;goto out;}
   obs_rf_closed=false;WRITE_ONCE(obs_rf_owner,f);
-  WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));cmd=0x4602;
+  WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(OBS_OWNER_LEASE_MS));cmd=0x4602;
  }else if(obs_rf_owner && obs_rf_owner!=f){r=-EBUSY;goto out;}
  else if(cmd==0x4602 && obs_cfg && obs_cfg->tx_rf_on){r=-EPERM;goto out;}
  if(cmd==0x4601||cmd==0x4608){
@@ -316,20 +583,27 @@ static long obs_ioctl(struct file *f,unsigned cmd,unsigned long arg){int r=0,i;u
     r=-EBUSY;goto out;
    }
   }
-  reinit_completion(&obs_done);WRITE_ONCE(obs_command,cmd-0x4600);wake_up(&obs_wait);
+  spin_lock_irqsave(&obs_operation_lock,flags);
+  reinit_completion(&obs_done);WRITE_ONCE(obs_command,cmd-0x4600);
+  spin_unlock_irqrestore(&obs_operation_lock,flags);
+  wake_up(&obs_wait);
   if(!wait_for_completion_timeout(&obs_done,msecs_to_jiffies(10000)))r=-ETIMEDOUT;else r=obs_error;
   if(cmd==0x4604 && !r)WRITE_ONCE(obs_rf_owner,NULL);
-  if(cmd==0x4602 && obs_rf_owner==f && !r)WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(750));
+  if(cmd==0x4602 && obs_rf_owner==f && !r)WRITE_ONCE(obs_rf_deadline,jiffies+msecs_to_jiffies(OBS_OWNER_LEASE_MS));
  }else r=-ENOTTY;
 out:mutex_unlock(&obs_command_lock);return r;
 }
 static int obs_file_release(struct inode *inode,struct file *f){
+ unsigned long flags;
  mutex_lock(&obs_command_lock);
+ spin_lock_irqsave(&obs_operation_lock,flags);
  if(obs_rf_owner==f){
-  if(obs_held && obs_cfg && (obs_cfg->extra_reserved & OBS_GATE_OPT))obs_w(0x1e0,15);
+  if(obs_operation.state==OBS_PENDING && !obs_execution)obs_cancelled=true;
+  if(obs_execution && obs_cfg && (obs_cfg->extra_reserved & OBS_GATE_OPT))obs_w(0x1e0,15);
   obs_rf_closed=true;WRITE_ONCE(obs_rf_deadline,jiffies);
-  if(!obs_held)WRITE_ONCE(obs_rf_owner,NULL);
+  if(!obs_held && !obs_command)WRITE_ONCE(obs_rf_owner,NULL);
  }
+ spin_unlock_irqrestore(&obs_operation_lock,flags);
  mutex_unlock(&obs_command_lock);return 0;
 }
 static const struct file_operations obs_fops={.owner=THIS_MODULE,.unlocked_ioctl=obs_ioctl,.release=obs_file_release};

@@ -5,6 +5,7 @@ import socket
 import struct
 import threading
 import time
+from collections import OrderedDict
 
 
 class Sinks:
@@ -16,6 +17,10 @@ class Sinks:
         self.missing=False
         self.retry_first = {}
         self.retry_done = set()
+        self.completed = OrderedDict()
+        self.drop_ack = int(os.environ.get("PLANNER_BENCH_ACK_DROP_FIRST", "0"))
+        if not 0 <= self.drop_ack <= 5:
+            raise ValueError("PLANNER_BENCH_ACK_DROP_FIRST must be in 0..5")
         self.threads=[]
         self.sockets=[]
         for port, handler in [(18008,self.route),(18009,self.real8)]:
@@ -47,6 +52,27 @@ class Sinks:
         with conn.makefile("rb") as stream:
             event=json.loads(stream.readline(1024))
         kind=event["ack_version"]
+        key=json.dumps(event, sort_keys=True)
+        received=time.perf_counter_ns()
+        log = self.folder/("path-events.ndjson" if kind == 3 else "antenna.ndjson")
+
+        def finish(reply, replay=False, attempt=1, copies=1):
+            self.completed[key] = (reply, attempt)
+            self.completed.move_to_end(key)
+            if len(self.completed) > 128:
+                self.completed.popitem(last=False)
+            sent = attempt > self.drop_ack
+            with log.open("a") as out:
+                print(json.dumps(dict(event=event, host_received_ns=received,
+                    host_ack_ns=time.perf_counter_ns() if sent else None, correct_ack=sent,
+                    cached_ack=replay, attempt=attempt, physical_switch=False)), file=out)
+            if sent:
+                conn.sendall(reply*copies)
+
+        if key in self.completed:
+            reply, attempt=self.completed[key]
+            finish(reply, replay=True, attempt=attempt+1)
+            return
         if os.environ.get("PLANNER_BENCH_RETRY")=="1" and kind not in self.retry_done:
             tick=time.perf_counter_ns()
             if kind not in self.retry_first:
@@ -65,11 +91,9 @@ class Sinks:
             assert event["ack_version"] == 3 and event["source"] == "ARM"
             start=time.perf_counter_ns()
             boot,gen,version,antenna,path=(event[k] for k in ("boot_id","generation","version","route","required_path"))
+            reply=f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode()
             if os.environ.get("PLANNER_BENCH_ACK3_FAST"):
-                conn.sendall(f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode())
-                with (self.folder/"path-events.ndjson").open("a") as out:
-                    print(json.dumps(dict(event=event,host_received_ns=start,host_ack_ns=time.perf_counter_ns(),
-                        correct_ack=True,physical_switch=False)),file=out)
+                finish(reply)
                 return
             conn.sendall(f"ACK3 {boot} {gen-1} {version} {antenna} {path}\n".encode())
             time.sleep(.08)
@@ -78,18 +102,20 @@ class Sinks:
             gate=api.ssh("cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")
             assert status["phase"]=="waiting_path_ack" and not status["actual"]["running"] and gate.strip()=="1"
             withheld=os.environ.get("PLANNER_BENCH_PATH_TIMEOUT")=="1"
-            with (self.folder/"path-events.ndjson").open("a") as out:
-                print(json.dumps(dict(event=event,host_received_ns=start,host_before_ack_ns=time.perf_counter_ns(),
-                    phase=status["phase"],prior_running=status["actual"]["running"],gate=int(gate),
-                    correct_ack=not withheld,physical_switch=False)),file=out)
             if withheld:
+                with log.open("a") as out:
+                    print(json.dumps(dict(event=event,host_received_ns=start,host_before_ack_ns=time.perf_counter_ns(),
+                        phase=status["phase"],prior_running=status["actual"]["running"],gate=int(gate),
+                        correct_ack=False,physical_switch=False)),file=out)
                 self.stop.wait(.1)
             else:
-                conn.sendall(f"ACK3 {boot} {gen} {version} {antenna} {path}\n".encode())
+                finish(reply)
             return
-        assert kind in (2,4)
+        assert kind in (1,2,4)
         fields=[event[k] for k in ("generation","version","epoch","position","marker_id","route")]
         def ack(f):
+            if kind == 1:
+                return f"ACK {f[4]}\n".encode()
             if kind == 4:
                 return ("ACK4 "+" ".join(map(str,[event["boot_id"],*f,event["required_path"]]))+"\n").encode()
             return ("ACK2 "+" ".join(map(str,f))+"\n").encode()
@@ -109,11 +135,7 @@ class Sinks:
                 conn.sendall(ack(fields))
                 event["required_path"]=expected
                 self.stop.wait(.025)
-            reply=ack(fields)
-            conn.sendall(reply*2 if os.environ.get("PLANNER_BENCH_WRONG_PATH_ACK") else reply)
-            with (self.folder/"antenna.ndjson").open("a") as out:
-                print(json.dumps(dict(event=event,host_ns=received,host_ack_ns=time.perf_counter_ns(),
-                                      correct_ack=True,physical_switch=False)),file=out)
+            finish(ack(fields), copies=2 if os.environ.get("PLANNER_BENCH_WRONG_PATH_ACK") else 1)
             return
         old=fields.copy()
         old[0]-=1
@@ -123,11 +145,11 @@ class Sinks:
         received=time.perf_counter_ns()
         time.sleep(.025)
         if not self.missing:
-            conn.sendall(ack(fields)*2)
-        with (self.folder/"antenna.ndjson").open("a") as out:
-            print(json.dumps(dict(event=event,host_ns=received,correct_ack=not self.missing,
-                                  physical_switch=False)),file=out)
-        if self.missing:
+            finish(ack(fields), copies=2)
+        else:
+            with log.open("a") as out:
+                print(json.dumps(dict(event=event,host_ns=received,correct_ack=False,
+                                      physical_switch=False)),file=out)
             self.stop.wait(.1)
 
     def real8(self,conn):

@@ -3,6 +3,7 @@
 mod calibration;
 mod field;
 mod generated;
+mod guard_take;
 mod mixer_math;
 mod plan_math;
 mod tx;
@@ -185,6 +186,12 @@ struct Inbox {
     capabilities: Value,
     route_pending: Value,
     metrics: Value,
+    operation: Value,
+    progress: Value,
+    progress_failure: Value,
+    last_confirmed: Value,
+    worker_error: Option<String>,
+    take_cancel: Option<(File, u32)>,
     next_map_request: Option<(Value, u64)>,
 }
 struct Shared {
@@ -203,11 +210,40 @@ fn text_trim(path: impl AsRef<Path>) -> Result<String> {
     Ok(fs::read_to_string(path)?.trim().into())
 }
 fn attr(name: &str) -> Result<String> {
-    text_trim(Path::new(PHY).join(name))
+    radio_access("read", name, || text_trim(Path::new(PHY).join(name)))
 }
 fn set_attr(name: &str, value: impl ToString) -> Result<String> {
-    fs::write(Path::new(PHY).join(name), value.to_string())?;
+    radio_access("write", name, || Ok(fs::write(Path::new(PHY).join(name), value.to_string())?))?;
     attr(name)
+}
+std::thread_local! {
+    static RADIO_TRACE: RefCell<Option<(Value, u64, u8)>> = const { RefCell::new(None) };
+}
+
+fn trace_radio<T>(id: &Value, generation: u64, run: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !control_trace_enabled() { return run(); }
+    RADIO_TRACE.with(|state| *state.borrow_mut() = Some((id.clone(),generation,64)));
+    let result = run();
+    RADIO_TRACE.with(|state| *state.borrow_mut() = None);
+    result
+}
+
+fn radio_access<T>(direction: &str, attribute: &str, access: impl FnOnce() -> Result<T>) -> Result<T> {
+    let stamp = RADIO_TRACE.with(|state| {
+        let mut state = state.borrow_mut();
+        let (id, generation, remaining) = state.as_mut()?;
+        *remaining = remaining.checked_sub(1)?;
+        Some(json!({"id":id,"generation":generation,"direction":direction,"attribute":attribute,
+            "start_ns":clock_ns().to_string()}))
+    });
+    if let Some(stamp) = &stamp { trace_control("sysfs_enter", || stamp.clone()); }
+    let result = access();
+    if let Some(mut stamp) = stamp {
+        stamp["errno"] = json!(result.as_ref().err().and_then(|e| e.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error));
+        trace_control("sysfs_exit", || stamp);
+    }
+    result
 }
 fn clock_ns() -> u64 {
     (crate::delivery_runtime::mono() * 1e9) as u64
@@ -347,7 +383,10 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
             .or(q.next_map_request.as_ref().map(|(v,_)|&v["id"])),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
         "route_pending":q.route_pending,"arm_clock_ns":q.receipt_ns.to_string(),
-        "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,"metrics":{"owner":q.metrics,"reader":reader}}),
+        "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,
+        "operation":q.operation,"progress":q.progress,"progress_failure":q.progress_failure,
+        "last_confirmed":q.last_confirmed,"worker_error":q.worker_error,
+        "metrics":{"owner":q.metrics,"reader":reader}}),
     )
 }
 
@@ -369,6 +408,9 @@ async fn submit(
         );
     }
     let mut q = shared.inbox.lock().unwrap();
+    if let Some(error) = &q.worker_error {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
+    }
     if q.applied_id == *id
         || q.failed_id == *id
         || q.pending.as_ref().is_some_and(|p| p["id"] == *id)
@@ -387,6 +429,9 @@ async fn submit(
         return (StatusCode::ACCEPTED,Json(json!({"accepted_id":id})));
     }
     if cmd["op"] == "scan" && cmd["run"] == false && q.pending.is_some() && q.next.is_none() {
+        if let Some((fd, cookie)) = &q.take_cancel {
+            let _ = guard_take::cancel(fd, *cookie);
+        }
         q.next = Some(cmd.clone());
         q.queued_ns = clock_ns();
         shared.switch.store(true, Ordering::Release);
@@ -427,6 +472,9 @@ async fn submit(
             );
         }
         if preparing && q.next.is_none() {
+            if let Some((fd, cookie)) = &q.take_cancel {
+                let _ = guard_take::cancel(fd, *cookie);
+            }
             q.next = Some(cmd.clone());
             q.queued_ns = clock_ns();
             shared.switch.store(true, Ordering::Release);
@@ -472,6 +520,11 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     } else {
         q.applied_id = id.clone();
         q.error = Value::Null;
+        if state["running"] == true {
+            q.last_confirmed = json!({"id":id,"generation":state["generation"],"mode":state["mode"],
+                "version":state["spectrum"]["version"],"map_epoch":state["spectrum"]["map_epoch"],
+                "path":state["spectrum"]["path_confirmation"],"confirmed_arm_ns":q.receipt_ns.to_string()});
+        }
     }
 }
 
@@ -480,10 +533,14 @@ fn word(b: &[u8], offset: usize) -> u32 {
 }
 
 fn trace_control(stage: &str, fields: impl FnOnce() -> Value) {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ENABLED.get_or_init(|| std::env::var_os("OBS_CONTROL_TRACE").is_some()) {
+    if control_trace_enabled() {
         eprintln!("{}", json!({"control_stage":stage,"arm_ns":clock_ns(),"detail":fields()}));
     }
+}
+
+fn control_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("OBS_CONTROL_TRACE").is_some())
 }
 fn put(b: &mut [u8], offset: usize, n: u32) {
     b[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
@@ -804,9 +861,12 @@ fn gate_receipt(words: &[u32; 128], spectrum: &Value) -> Value {
         "on":bound.then_some(on),"slot":bound.then_some(slot),"reason":(status>>9)&7})
 }
 
+const ACK_ATTEMPTS: u8 = 5;
+const ACK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+
 struct Route {
     stream: Option<TcpStream>,
-    key: (u32, u64, u32, u32, u32),
+    key: (u64, u32, u64, u32, u32, u32),
     out: Vec<u8>,
     written: usize,
     input: Vec<u8>,
@@ -826,7 +886,10 @@ fn acknowledge(
     antenna: u32,
     source: &str,
 ) -> std::result::Result<Option<u32>, String> {
-    let key = (id, epoch, version, position, antenna);
+    if shared.switch.load(Ordering::Acquire) || shared.shutdown.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let key = (generation, id, epoch, version, position, antenna);
     let initial_path = source.strip_prefix("startup_");
     let visit_path = source.strip_prefix("visit_");
     if route.as_ref().is_none_or(|r| r.key != key) {
@@ -866,8 +929,8 @@ fn acknowledge(
         });
     }
     let r = route.as_mut().unwrap();
-    if r.attempt == 0 || r.since.elapsed() >= Duration::from_secs(1) {
-        if r.attempt == 2 {
+    if r.attempt == 0 || r.since.elapsed() >= ACK_ATTEMPT_TIMEOUT {
+        if r.attempt == ACK_ATTEMPTS {
             return Err("route ACK timeout after retry".into());
         }
         r.attempt += 1;
@@ -916,7 +979,8 @@ fn acknowledge(
     while let Some(end) = r.input.iter().position(|b| *b == b'\n') {
         let ok = &r.input[..end] == expected.as_bytes();
         r.input.drain(..=end);
-        if ok {
+        if ok && r.since.elapsed() < ACK_ATTEMPT_TIMEOUT
+            && !shared.switch.load(Ordering::Acquire) && !shared.shutdown.load(Ordering::Acquire) {
             if r.trace {
                 trace_control("route_ack", ||json!([generation,version,epoch,position,id,r.attempt]));
             }
@@ -1165,18 +1229,22 @@ fn worker(
     let mut carrier = tx::Carrier::default();
     let mut calibration = calibration::Cache::default();
     let mut resume_scan: Option<Value> = None;
+    let mut restart: Option<Value> = None;
+    let mut retried_id = Value::Null;
     while !shared.shutdown.load(Ordering::Acquire) {
         let cmd = {
             let mut q = shared.inbox.lock().unwrap();
-            if q.next.is_none() && !shared.shutdown.load(Ordering::Acquire) {
+            if q.next.is_none() && restart.is_none() && !shared.shutdown.load(Ordering::Acquire) {
                 q = shared
                     .wake
                     .wait_timeout(q, Duration::from_millis(200))
                     .unwrap()
                     .0;
             }
-            q.next.take().map(|cmd| {
-                q.received_ns = q.queued_ns;
+            let queued = q.next.take();
+            if queued.is_some() { q.received_ns = q.queued_ns; }
+            let retry = restart.take();
+            queued.or(retry).map(|cmd| {
                 q.pending = Some(cmd.clone());
                 shared.switch.store(false, Ordering::Release);
                 cmd
@@ -1197,6 +1265,7 @@ fn worker(
         {
             let mut q = shared.inbox.lock().unwrap();
             q.phase = "calculating";
+            q.progress = Value::Null;
             q.actual["running"] = json!(false);
             q.actual["spectrum"] = Value::Null;
         }
@@ -1519,6 +1588,7 @@ fn worker(
                     }
                     actual.borrow_mut()["spectrum"]["path_confirmation"] = confirmation;
                 }
+                let mut guarded_pll = None;
                 if guard_rf {
                     let cap = guard_cmd(&guard_fd, 0x4605)?;
                     ensure!(
@@ -1528,9 +1598,11 @@ fn worker(
                     let pll = actual.borrow()["spectrum"]["first_tx_pll_hz"]
                         .as_u64()
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
-                    carrier.prepare_guarded(pll, &shared.switch, |stage| {
+                    ensure!(!managed_tx || cap[125] == 1, "managed scan needs cancellable TAKE_RF guard");
+                    guarded_pll = Some(pll);
+                    trace_radio(id,generation,|| carrier.prepare_guarded(pll, &shared.switch, |stage| {
                         trace_control(stage, ||json!({"id":id,"generation":generation}));
-                    })?;
+                    }))?;
                     trace_control("carrier_ready", ||json!({"id":id,"generation":generation}));
                 }
                 shared.inbox.lock().unwrap().phase = "loading";
@@ -1549,8 +1621,12 @@ fn worker(
                     ensure!(carrier.guarded_lease_live() && !shared.switch.load(Ordering::Acquire),
                         "lease expired or preparation cancelled before guard take");
                 }
-                guard_taken = true;
-                let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })
+                let s = if let Some(pll) = guarded_pll.filter(|_| managed_tx) {
+                    guard_take::take(&guard_fd, &shared, &mut carrier, pll, id, generation, &mut guard_taken)
+                } else {
+                    guard_taken = true;
+                    guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })
+                }
                     .inspect_err(|error| trace_control("take_failed", || {
                         let raw = guard_raw(&guard_fd);
                         json!({"id":id,"generation":generation,"error":error.to_string(),
@@ -1718,6 +1794,7 @@ fn worker(
                 started: &started,
                 trace: &|stage| trace_control(stage, ||json!({"id":id,"generation":generation})),
                 route: &route_fn,
+                progress: &|sample| shared.inbox.lock().unwrap().progress=sample,
                 sweep: sweep.as_ref(),
                 next: next_sweep.as_ref().map(|s|crate::system_reader::NextView {
                     generation:next_gen,sweep:s,anchor:&next_anchor,started:&next_started,
@@ -1792,7 +1869,20 @@ fn worker(
             .into_inner()
             .map_or(Ok(()), |field| field.finish(&regs));
         let result = result.and(field_stop);
+        let stalled = result.as_ref().is_err_and(|e| e.to_string()==crate::system_reader::PROGRESS_LOST);
+        if stalled {
+            let mut q = shared.inbox.lock().unwrap();
+            q.progress_failure = json!({"id":id,"generation":generation,"primary_error":crate::system_reader::PROGRESS_LOST,
+                "last_sample":q.progress,"recovery":"returning"});
+        }
         let result = if guard_taken {
+            let return_start = Instant::now();
+            {
+                let mut q = shared.inbox.lock().unwrap();
+                q.phase = if stalled {"recovering"} else {"returning"};
+                q.actual["running"] = json!(false);
+                q.actual["spectrum"] = Value::Null;
+            }
             let handback = (|| {
                 let s = guard_cmd(&guard_fd, 0x4605)?;
                 let s = if guard_rf && s[1] == 3 {
@@ -1811,6 +1901,13 @@ fn worker(
                 }
                 Ok::<(), anyhow::Error>(())
             })();
+            {
+                let mut q = shared.inbox.lock().unwrap();
+                let handback = json!({"us":return_start.elapsed().as_micros() as u64,
+                    "error":handback.as_ref().err().map(|e|format!("{e:#}"))});
+                if q.operation["generation"] == generation { q.operation["return"] = handback.clone(); }
+                if stalled { q.progress_failure["handback"] = handback; }
+            }
             match handback {
                 Ok(()) => result,
                 Err(e) => {
@@ -1836,6 +1933,22 @@ fn worker(
                 inbox.failed_id=request["id"].clone();
                 inbox.error=json!("NEXT stopped before its first observation");
             }
+        }
+        if stalled {
+            let may_restart = guard_taken && op=="scan" && cmd["run"]==true && *id!=retried_id
+                && actual.borrow()["generation"]==generation && actual.borrow()["prepared_next_version"].is_null()
+                && !shared.switch.load(Ordering::Acquire) && !shared.shutdown.load(Ordering::Acquire)
+                && !STOP_RUNTIME.load(Ordering::Acquire) && (!guard_rf || carrier.guarded_lease_live());
+            let mut q=shared.inbox.lock().unwrap();
+            if may_restart && q.next.is_none() && !shared.switch.load(Ordering::Acquire) {
+                q.phase="recovering";
+                q.pending=Some(cmd.clone());
+                q.progress_failure["recovery"]=json!("repreparing");
+                retried_id=id.clone();
+                restart=Some(cmd.clone());
+                continue;
+            }
+            q.progress_failure["recovery"]=json!("exhausted_or_cancelled");
         }
         match result {
             Ok(()) => {
@@ -2095,8 +2208,19 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         let shared = shared.clone();
         move || {
             let _lease = lease;
-            let result = worker(c, shared, template, guard_fd, regs);
-            STOP_RUNTIME.store(true, Ordering::Release);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                worker(c, shared.clone(), template, guard_fd, regs)))
+                .unwrap_or_else(|_| Err(anyhow!("control worker panic")));
+            if let Err(e) = &result {
+                let mut q = shared.inbox.lock().unwrap_or_else(|e| e.into_inner());
+                q.actual["running"] = json!(false);
+                q.actual["spectrum"] = Value::Null;
+                q.phase = "failed";
+                q.take_cancel = None;
+                q.route_pending = Value::Null;
+                q.worker_error = Some(format!("{e:#}"));
+                shared.inbox.clear_poison();
+            }
             result
         }
     });
