@@ -153,11 +153,13 @@ impl Hardware{
  }
  fn check_progress(&self,progress:&mut progress::Progress,start:Instant,s:&Snapshot,q:&RunControl)->R<()>{
   let mux=self.r(0x228);
-  let state=progress.observe(start.elapsed(),[s.finished,s.committed,s.dropped],s.running && !s.fault,
+  let counts=if q.bench_stall {[0;3]}else{[s.finished,s.committed,s.dropped]};
+  let state=progress.observe(start.elapsed(),counts,s.running && !s.fault,
    mux&8!=0,s.reserved.saturating_sub(s.released)>=1023);
   (q.progress)(json!({"state":state.as_str(),"generation":q.generation,"run":s.cookie,"arm_ns":((crate::delivery_runtime::mono()*1e9)as u64).to_string(),
    "budget_us":progress.budget().as_micros() as u64,"input_seq":s.input_seq,"formed":s.finished,"committed":s.committed,
-   "released":s.released,"dropped":s.dropped,"epoch":self.live64(0x180),"version":self.r(0x22c),"mux_status":mux}));
+   "released":s.released,"dropped":s.dropped,"epoch":self.live64(0x180),"version":self.r(0x22c),"mux_status":mux,
+   "test_injected":q.bench_stall}));
   if state==progress::State::Stalled && !q.stop.load(Ordering::Acquire){return Err(progress::LOST.into())}Ok(())
  }
  fn stop(&mut self){self.valid=0;self.w(0x54,4);self.active=false;}
@@ -264,6 +266,7 @@ pub(crate) struct RunControl<'a>{
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
  pub check:&'a dyn Fn()->R<()>,
  pub progress:&'a dyn Fn(Value),
+ pub bench_stall:bool,
  pub sweep:Option<&'a SweepSpec>,
  pub next:Option<NextView<'a>>,
 }

@@ -423,6 +423,8 @@ while :; do
 done' </dev/null >gate-probe.ndjson 2>&1 &)
 """)
     trace = "OBS_CONTROL_TRACE=1 " if os.environ.get("PLANNER_BENCH_CONTROL_TRACE") else ""
+    if os.environ.get("PLANNER_BENCH_PROGRESS") == "1":
+        trace += "OBS_CONTROL_TEST_PROGRESS=1 "
     a.ssh(f"cd {remote} && ({trace}OBS_PHASE_TIMING={phase_timing} timeout {owner_seconds} ./maia-delivery --system-control cli-config.json --listen 192.168.2.1:18080 </dev/null >owner.log 2>&1 & echo $! > owner.pid)")
     calls = []
     stop,ready,silence=threading.Event(),threading.Event(),threading.Event()
@@ -609,6 +611,28 @@ done' </dev/null >gate-probe.ndjson 2>&1 &)
                             time.sleep(.021)
                         a.write_json(log/f"gate-{len(calls)}.json",receipts)
                     a.write_json(log/"commands.json",calls)
+                    if os.environ.get("PLANNER_BENCH_PROGRESS") == "1" and len(calls) == 1:
+                        end=time.monotonic()+8
+                        while time.monotonic()<end:
+                            recovered=a.request(url,"GET",path,timeout=1)
+                            recovery=recovered.get("progress_failure") or {}
+                            if recovery.get("recovery")=="recovered":
+                                break
+                            time.sleep(.02)
+                        else:
+                            raise AssertionError("one local scan restart did not confirm a fresh VIEW")
+                        assert recovered["applied_id"] == ident and recovered["actual"]["running"]
+                        assert recovery["last_sample"]["test_injected"]
+                        assert recovered["actual"]["generation"] != status["actual"]["generation"]
+                        assert recovery["recovery_generation"] == recovered["actual"]["generation"]
+                        end=time.monotonic()+2
+                        while time.monotonic()<end:
+                            view,_=receiver.recvfrom(65535)
+                            if view[:8]==b"GVIEW4\0\0" and struct.unpack_from("<Q",view,56)[0]==recovery["recovery_generation"]:
+                                break
+                        else:
+                            raise AssertionError("no GVIEW4 for the restarted generation")
+                        a.write_json(log/"progress-recovery.json",recovered)
                     if cmd.get("next_ranges") is not None:
                         verify_next(a,url,path,log,receiver,status,sinks,len(calls))
                     if str(len(calls)) in os.environ.get("PLANNER_BENCH_SOAK_CASE", "").split(","):

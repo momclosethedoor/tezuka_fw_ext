@@ -516,11 +516,19 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     }
     if let Some(e) = error {
         q.failed_id = id.clone();
+        if q.progress_failure["id"] == *id && q.progress_failure["recovery"] == "repreparing" {
+            q.progress_failure["recovery"] = json!("failed");
+            q.progress_failure["recovery_error"] = json!(e);
+        }
         q.error = json!(e);
     } else {
         q.applied_id = id.clone();
         q.error = Value::Null;
         if state["running"] == true {
+            if q.progress_failure["id"] == *id && q.progress_failure["recovery"] == "repreparing" {
+                q.progress_failure["recovery"] = json!("recovered");
+                q.progress_failure["recovery_generation"] = state["generation"].clone();
+            }
             q.last_confirmed = json!({"id":id,"generation":state["generation"],"mode":state["mode"],
                 "version":state["spectrum"]["version"],"map_epoch":state["spectrum"]["map_epoch"],
                 "path":state["spectrum"]["path_confirmation"],"confirmed_arm_ns":q.receipt_ns.to_string()});
@@ -1231,6 +1239,7 @@ fn worker(
     let mut resume_scan: Option<Value> = None;
     let mut restart: Option<Value> = None;
     let mut retried_id = Value::Null;
+    let mut bench_stall = std::env::var_os("OBS_CONTROL_TEST_PROGRESS").is_some_and(|v|v=="1");
     while !shared.shutdown.load(Ordering::Acquire) {
         let cmd = {
             let mut q = shared.inbox.lock().unwrap();
@@ -1800,6 +1809,7 @@ fn worker(
                 trace: &|stage| trace_control(stage, ||json!({"id":id,"generation":generation})),
                 route: &route_fn,
                 progress: &|sample| shared.inbox.lock().unwrap().progress=sample,
+                bench_stall: scan && std::mem::take(&mut bench_stall),
                 sweep: sweep.as_ref(),
                 next: next_sweep.as_ref().map(|s|crate::system_reader::NextView {
                     generation:next_gen,sweep:s,anchor:&next_anchor,started:&next_started,
@@ -1877,8 +1887,13 @@ fn worker(
         let stalled = result.as_ref().is_err_and(|e| e.to_string()==crate::system_reader::PROGRESS_LOST);
         if stalled {
             let mut q = shared.inbox.lock().unwrap();
-            q.progress_failure = json!({"id":id,"generation":generation,"primary_error":crate::system_reader::PROGRESS_LOST,
-                "last_sample":q.progress,"recovery":"returning"});
+            if q.progress_failure["id"] == *id {
+                q.progress_failure["repeat_sample"] = q.progress.clone();
+                q.progress_failure["recovery"] = json!("returning");
+            } else {
+                q.progress_failure = json!({"id":id,"generation":generation,"primary_error":crate::system_reader::PROGRESS_LOST,
+                    "last_sample":q.progress,"recovery":"returning"});
+            }
         }
         let result = if guard_taken {
             let return_start = Instant::now();

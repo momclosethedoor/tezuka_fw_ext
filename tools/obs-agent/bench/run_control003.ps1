@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','take','take-stop')][string]$Case,
+    [Parameter(Mandatory=$true)][ValidateSet('repeat','maps','tx-map','protection','modes','ack-last','ack-exhaust','take','take-stop','progress')][string]$Case,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Run,
     [Parameter(Mandatory=$true)][string]$Agent,
     [Parameter(Mandatory=$true)][string]$Modules,
@@ -58,6 +58,7 @@ switch ($Case) {
         $fixture.PLANNER_BENCH_ACK3_FAST='1'
     }
     'modes' { $fixture.PLANNER_BENCH_SWEEP="$old/modes-cases.json"; $fixture.PLANNER_BENCH_ACK3_FAST='1' }
+    'progress' { $fixture.PLANNER_BENCH_PROGRESS='1'; $fixture.PLANNER_BENCH_ACK3_FAST='1' }
     'ack-last' {
         $fixture.PLANNER_BENCH_ACK3_FAST='1'
         $fixture.PLANNER_BENCH_ACK_DROP_FIRST='4'
