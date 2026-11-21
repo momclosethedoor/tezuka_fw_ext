@@ -43,7 +43,7 @@ fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}f
 struct Map{ptr:*mut u8,len:usize}
 impl Map{fn new(fd:&File,len:usize,off:i64,write:bool)->R<Self>{let p=unsafe{libc::mmap(std::ptr::null_mut(),len,libc::PROT_READ|if write{libc::PROT_WRITE}else{0},libc::MAP_SHARED,fd.as_raw_fd(),off as libc::off_t)};if p==libc::MAP_FAILED{return Err(std::io::Error::last_os_error().to_string())}Ok(Self{ptr:p.cast(),len})}}
 impl Drop for Map{fn drop(&mut self){unsafe{libc::munmap(self.ptr.cast(),self.len);}}}
-struct Hardware{managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,snapshots:u64,empty_snapshots:u64,release_commands:u64,sync_bytes:u64,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
+struct Hardware{managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,snapshots:u64,empty_snapshots:u64,release_commands:u64,idle_wait_us:u64,sync_bytes:u64,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
 impl Hardware{
  fn open(c:&Config,managed_view_only:bool)->R<Self>{
   let read=|p:&str|std::fs::read_to_string(p).map_err(|e|e.to_string());
@@ -67,7 +67,7 @@ impl Hardware{
   for(a,n)in[(info.full,info.full_len),(info.view,info.view_len)]{for(lo,hi)in[(0x06000000,0x0e000000),(0x16000000,0x16040000)]{if a<hi&&a+n as u64>lo{return Err("DMA overlaps stock reserve".into())}}}
   let full=Map::new(&device,info.full_len as usize,0,false)?;let overview=Map::new(&device,info.view_len as usize,0x1000000,false)?;
   let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
-  let h=Self{managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,snapshots:0,empty_snapshots:0,release_commands:0,sync_bytes:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
+  let h=Self{managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,snapshots:0,empty_snapshots:0,release_commands:0,idle_wait_us:0,sync_bytes:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
   view::geometry(h.r(0xe4),h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))?;if h.r(0x50)!=continuous::ABI{return Err("OBN2 ID".into())}
   Ok(h)
  }
@@ -286,7 +286,7 @@ fn full_read_without_sum(b:&[u8]){
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"sync_bytes":io.sync_bytes,
 "payload_read_bytes":io.copied_bytes,"metadata_span_bytes":if io.managed_view_only{reader.visited*512}else{0},
-"owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
+"owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"managed_idle_wait_us":if io.managed_view_only{io.idle_wait_us}else{0},"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
 pub(crate) fn view_bins(header: Header) -> usize {
  view::view_len(header)
@@ -315,6 +315,13 @@ pub(crate) struct NextView<'a>{
  pub anchor:&'a dyn Fn()->Option<u64>,
  pub started:&'a dyn Fn(Header,Execution),
 }
+fn view_idle_wait(k:u32)->Duration {
+ // At 61.44 MS/s one group spans K*4096 samples. Check the ring
+ // again after at most one eighth of a group (and at most 64 us).
+ // This only applies after an empty snapshot, never to a ready prefix.
+ Duration::from_micros((u64::from(k)*4096*1_000_000/(8*61_440_000)).min(64))
+}
+
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
@@ -327,6 +334,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  // captures use the separate local reader paths.
  let managed_view_only=control.is_some();
  let mut io=Hardware::open(c,managed_view_only)?;
+ let empty_wait=if managed_view_only{view_idle_wait(c.k)}else{Duration::ZERO};
+ io.idle_wait_us=empty_wait.as_micros() as u64;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
  if c.command=="capture"{
@@ -432,7 +441,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
-  if s.committed==s.released{std::hint::spin_loop();} // CSR has no completion fd/IRQ; no timer delay.
+  if s.committed==s.released {
+   if empty_wait.is_zero(){std::hint::spin_loop();}
+   else{std::thread::sleep(empty_wait);}
+  }
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
  if !draining.get(){draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}}
