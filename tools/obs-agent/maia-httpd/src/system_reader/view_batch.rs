@@ -1,6 +1,7 @@
 use std::{io,net::UdpSocket,time::{Duration,Instant}};
 pub struct UdpBatch {
- pub bytes:Vec<u8>,pub pending:u64,pub sent:u64,pub dropped:u64,pub datagrams:u64,
+ pub bytes:Vec<u8>,pub pending:u64,pub sent:u64,pub dropped:u64,pub datagrams:u64,pub send_calls:u64,
+ pub mtu:Option<u32>,pub ip_fragmentation:bool,
  pub max_records:usize,pub phase_on:bool,pub send_ns:u128,pub coalesce_us:u64,pub max_wait_ns:u128,
  pub sent_bytes:u64,pub high_records:u64,pub would_block:u64,pub send_errors:u64,
  pub last_errno:Option<i32>,pub notes_sent:u64,pub notes_lost:u64,pub transition:u64,
@@ -9,9 +10,9 @@ pub struct UdpBatch {
 }
 impl UdpBatch {
  pub fn configured(coalesce_us:u64,phase_on:bool,max_records:usize,record_size:usize)->Self {
-  assert!(matches!(max_records,2|4|8|16));
+  assert!(matches!(max_records,1|2|4|8|16));
   Self{max_records,bytes:Vec::with_capacity(record_size*max_records),pending:0,sent:0,dropped:0,datagrams:0,
-   phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,
+   phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,send_calls:0,mtu:None,ip_fragmentation:false,
    sent_bytes:0,high_records:0,would_block:0,send_errors:0,last_errno:None,
    notes_sent:0,notes_lost:0,transition:0,rejected_before_queue:0,suppressed:0}
  }
@@ -19,6 +20,13 @@ impl UdpBatch {
   let delay=std::env::var("OBS_VIEW_COALESCE_US").ok().and_then(|s|s.parse::<u64>().ok()).filter(|v|*v<=10000).unwrap_or(0);
   let count=std::env::var("OBS_VIEW_BATCH_RECORDS").ok().and_then(|s|s.parse::<usize>().ok()).filter(|n|matches!(*n,2|4|8|16)).unwrap_or(2);
   Self::configured(delay,std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),count,record_size)
+ }
+ pub fn record_size(&self)->usize{self.record_size}
+ pub fn set_path_mtu(&mut self,mtu:u32){
+  self.mtu=Some(mtu);
+  let budget=mtu.saturating_sub(28) as usize; // IPv4 and UDP headers
+  self.max_records=(budget/self.record_size).clamp(1,2);
+  self.ip_fragmentation=self.record_size>budget;
  }
  pub fn start_record(&mut self){if self.pending==0{self.first=Some(Instant::now());}}
  pub fn due(&self,now:Instant)->bool {
@@ -29,6 +37,7 @@ impl UdpBatch {
  }
  pub fn flush_due(&mut self,s:&UdpSocket){if self.due(Instant::now()){self.flush(s);}}
  pub fn completion(&mut self,s:&UdpSocket,bytes:&[u8])->bool {
+  self.send_calls+=1;
   match s.send(bytes) {
    Ok(n) if n==bytes.len()=>{self.notes_sent+=1;true}
    result=>{
@@ -46,6 +55,7 @@ impl UdpBatch {
   self.high_records=self.high_records.max(self.pending);
   let now=Instant::now();if let Some(t)=self.first{self.max_wait_ns=self.max_wait_ns.max(now.duration_since(t).as_nanos());}
   for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
+   self.send_calls+=1;
    match s.send(packet){
     Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;self.sent_bytes+=n as u64;},
     result=>{
@@ -93,6 +103,13 @@ fn send_error(result:io::Result<usize>)->(bool,Option<i32>){
    assert_eq!(receiver.recv(&mut buf).unwrap(),count*568);
    for n in 0..count{assert_eq!(&buf[n*568..(n+1)*568],&[n as u8;568]);}
    assert_eq!((q.sent,q.datagrams,q.dropped),(count as u64,1,0));
+  }
+ }
+ #[test] fn managed_ipv4_datagram_geometry_respects_path_mtu(){
+  for (size,batch,frag) in [(576,2,false),(1088,1,false),(2112,1,true)] {
+   let mut q=UdpBatch::configured(0,false,2,size);
+   q.set_path_mtu(1500);
+   assert_eq!((q.record_size(),q.max_records,q.ip_fragmentation),(size,batch,frag));
   }
  }
  #[test] fn controlled_view_preserves_extended_records_when_batch_splits(){

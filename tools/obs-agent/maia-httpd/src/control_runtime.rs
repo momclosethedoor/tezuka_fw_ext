@@ -253,7 +253,23 @@ fn clock_ns() -> u64 {
     crate::delivery_runtime::mono_ns()
 }
 
+fn view_mode(settings: &Value) -> Result<u32> {
+    match settings.get("view_bins") {
+        None => Ok(1),
+        Some(bins) => match bins.as_u64() {
+            Some(512) => Ok(1),
+            Some(1024) => Ok(2),
+            Some(2048) => Ok(3),
+            _ => bail!("view_bins must be 512, 1024 or 2048"),
+        },
+    }
+}
+
 fn validate(v: &Value) -> Result<()> {
+    if v.get("view_bins").is_some() {
+        ensure!(matches!(v["op"].as_str(), Some("scan" | "analysis")), "view_bins requires scan or analysis");
+        view_mode(v)?;
+    }
     match v["op"].as_str() {
         Some("scan") => {
             if let Some(delivery) = v.get("view_delivery") {
@@ -1239,6 +1255,8 @@ fn continuous(
                 let mut bytes = [0u8; video_egress::MAX_BLOCK_BYTES];
                 let mut have = 0;
                 let mut status_due = Instant::now();
+                let mut sampled_reads = 0;
+                let mut source_progress_at = None;
                 while !shared.switch.load(Ordering::Acquire) {
                     let previous_sent = queue.counts.frames;
                     let sent = queue.pump(&mut conn).map_err(|e| anyhow!("real8 socket send: {e}"))?;
@@ -1272,9 +1290,23 @@ fn continuous(
                         have -= len;
                     }
                     if status_due.elapsed() >= Duration::from_millis(200) {
-                        shared.inbox.lock().unwrap().metrics =
-                            video_counters(generation, &queue, false, None);
-                        status_due = Instant::now();
+                        let now = Instant::now();
+                        if queue.counts.source_reads != sampled_reads {
+                            sampled_reads = queue.counts.source_reads;
+                            source_progress_at = Some(now);
+                        }
+                        let age = now.duration_since(source_progress_at.unwrap_or(start));
+                        let mut stats = video_counters(generation, &queue, false, None);
+                        stats["iio_progress_sample_age_ms"] = json!(age.as_millis());
+                        stats["iio_progress"] = json!(if age >= Duration::from_secs(1) {
+                            "no_progress"
+                        } else if source_progress_at.is_some() {
+                            "reading"
+                        } else {
+                            "waiting_first_read"
+                        });
+                        shared.inbox.lock().unwrap().metrics = stats;
+                        status_due = now;
                     }
                     if !sent && n == 0 {
                         let mut fds = [
@@ -1429,6 +1461,7 @@ fn worker(
         trace_control("worker_start", ||json!({"id":id,"generation":generation,"op":op,
             "received_ns":shared.inbox.lock().unwrap().received_ns}));
         pending["spectrum"] = Value::Null;
+        pending["view_bins"] = Value::Null;
         pending["epoch"] = json!(0);
         pending["rx_lo_hz"] = Value::Null;
         pending["if_hz"] = Value::Null;
@@ -1505,6 +1538,9 @@ fn worker(
                     pending["alternative"] = Value::Null;
                 }
                 "scan" | "analysis" => {
+                    if request.get("view_bins").is_none() {
+                        request["view_bins"] = pending[op]["view_bins"].as_u64().unwrap_or(512).into();
+                    }
                     resume_scan = None;
                     pending["alternative"] = Value::Null;
                     if op == "scan" && carrier.on() {
@@ -1826,7 +1862,9 @@ fn worker(
             let tx_active = actual.borrow()["tx"]["on"] == true;
             let work = c.output.join("reader");
             let k = actual.borrow()["k"].clone();
-            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":1,"previous_mode":1,
+            let mode_index = view_mode(&actual.borrow()[&mode])?;
+            let previous_mode = regs.read(0x1a4) & 3;
+            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":previous_mode,
                 "seconds":1.0,"warmup":0.0,"shift544":true,"settling":0,"batch_limit":64,"direct":true,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
@@ -1840,6 +1878,7 @@ fn worker(
                 let epoch = execution.anchor;
                 a["epoch"] = json!(epoch);
                 a["dma_run"] = json!(execution.run);
+                a["view_bins"] = json!(crate::system_reader::view_bins(h));
                 if !a["alternative"].is_null() {
                     a["alternative"]["generation"] = json!(generation);
                     a["alternative"]["first_epoch"] = json!(h.epoch);
@@ -1857,7 +1896,7 @@ fn worker(
                     ("fft_bins", json!(4096)),
                     (
                         "view_bins",
-                        json!([0, 512, 1024, 2048][((h.flags >> 3) & 3) as usize]),
+                        json!(crate::system_reader::view_bins(h)),
                     ),
                     ("TX_OFF", if managed_tx {Value::Null} else {json!(!tx_active)}),
                 ] {
@@ -1903,10 +1942,11 @@ fn worker(
                 let mut s = next_spectrum.as_ref().unwrap().clone();
                 for (key,value) in [("generation",json!(next_gen)),("map_epoch",json!(anchor)),
                     ("k",k.clone()),("scan",json!(true)),("fs_hz",json!(FS)),("flags",json!(h.flags)),
-                    ("fft_bins",json!(4096)),("view_bins",json!(512)),("TX_OFF",Value::Null)] {
+                    ("fft_bins",json!(4096)),("view_bins",json!(crate::system_reader::view_bins(h))),("TX_OFF",Value::Null)] {
                     s[key]=value;
                 }
                 a["generation"]=json!(next_gen);
+                a["view_bins"]=s["view_bins"].clone();
                 a["map_version"]=s["version"].clone();
                 a["epoch"]=json!(anchor);
                 a["dma_run"]=json!(execution.run);
@@ -2411,7 +2451,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let (threshold, mult) = generated::environment()?;
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
-    let capabilities = json!({"tx_on":manual,"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
+    let capabilities = json!({"tx_on":manual,"view_bins":[512,1024,2048],"view_delivery_reads_full":false,"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,

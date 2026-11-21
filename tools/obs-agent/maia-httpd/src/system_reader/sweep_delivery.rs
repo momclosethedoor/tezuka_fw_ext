@@ -4,7 +4,6 @@ use super::{Header, R, UdpBatch, Value};
 use std::{net::UdpSocket,time::Instant};
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
-const RECORD_BYTES: usize = 576;
 
 pub(crate) struct SweepSpec {
     version: u64,
@@ -53,9 +52,6 @@ impl SweepSpec {
         if count.contains(&0) || last[0] >= first[1] {
             return Err("invalid A/B boundary".into());
         }
-        if mode == Mode::Pass && count.iter().any(|n| *n as usize * RECORD_BYTES > MAX_BYTES) {
-            return Err("one scan pass exceeds the bounded VIEW buffer".into());
-        }
         let version = desc["version"].as_u64().ok_or("missing sweep map version")?;
         let mut next = 2;
         let mut route_to = vec![0;positions.len()];
@@ -89,13 +85,16 @@ pub(super) struct Delivery<'a> {
 }
 
 impl<'a> Delivery<'a> {
-    pub(super) fn new(spec: &'a SweepSpec, anchor:u64, generation:u64, net:&mut UdpBatch)->Self {
-        net.max_records = 2; // 1152 bytes of IPv4/IPv6 UDP payload
+    pub(super) fn new(spec: &'a SweepSpec, anchor:u64, generation:u64, net:&mut UdpBatch)->R<Self> {
         net.coalesce_us = match spec.mode {Mode::Timed(us)=>us,_=>0};
         if spec.mode == Mode::Pass {
-            net.bytes.reserve(*spec.count.iter().max().unwrap() as usize * RECORD_BYTES);
+            let bytes = *spec.count.iter().max().unwrap() as usize * net.record_size();
+            if bytes > MAX_BYTES {
+                return Err("one scan pass exceeds the bounded VIEW buffer".into());
+            }
+            net.bytes.reserve(bytes);
         }
-        Self{spec,anchor,generation,pass:None,completed:None,notes_sent:0,notes_lost:0,peak_bytes:0}
+        Ok(Self{spec,anchor,generation,pass:None,completed:None,notes_sent:0,notes_lost:0,peak_bytes:0})
     }
 
     pub(super) fn accept(&mut self,h:Header,view:&[u8],net:&mut UdpBatch,sock:&UdpSocket) {
@@ -116,7 +115,7 @@ impl<'a> Delivery<'a> {
             pass.last_tick = h.first_tick;
         }
         if self.spec.positions[position].is_none() {net.transition+=1;}
-        if net.bytes.len()+RECORD_BYTES <= MAX_BYTES {
+        if net.bytes.len()+net.record_size() <= MAX_BYTES {
             if net.pending==0 {net.start_record();}
             net.bytes.extend_from_slice(&self.header(h));
             net.bytes.extend_from_slice(view);

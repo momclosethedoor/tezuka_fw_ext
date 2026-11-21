@@ -49,3 +49,55 @@ fn mock()->Mock{Mock{full:hex("tools/obs-agent/maia-httpd/tests/view/mode1/ordin
 #[path="maia-httpd/src/control_runtime/generated/tx_schedule.rs"] mod tx_schedule;
 #[path="maia-httpd/src/system_reader/progress.rs"] mod progress;
 #[path="maia-httpd/src/control_runtime/video_egress.rs"] mod video_egress;
+
+#[test]
+fn view_only_wrap_and_short_after_long_survive_immediate_dma_reuse() {
+ use std::{cell::Cell,rc::Rc};
+ struct MockView{header:continuous::Header,view:Vec<u8>,snap:continuous::Snapshot,released:Rc<Cell<u64>>}
+ impl PairIo for MockView{
+  fn snapshot(&mut self)->Result<continuous::Snapshot,String>{Ok(self.snap)}
+  fn full_read(&self)->bool{false}
+  fn copy_full(&mut self,_:usize,_:&mut[u8])->Result<(),String>{panic!("VIEW consumer requested full DMA")}
+  fn copy_view(&mut self,_:usize,_:&mut[u8])->Result<(),String>{panic!("test expects borrowed DMA")}
+  fn visit_pair<F:FnMut(continuous::Header,&[&[u8]],&[u8])->Result<(),String>>(
+   &mut self,slot:usize,_:&mut[u8],_:&mut[u8],sink:&mut F
+  )->Result<(),String>{
+   assert_eq!(slot,self.snap.released as usize%1024);
+   sink(self.header,&[],&self.view)
+  }
+  fn release(&mut self,run:u32,tail:u64)->Result<(),String>{
+   assert_eq!(run,23);
+   assert_eq!(tail,self.snap.released+1);
+   self.snap.released=tail;
+   self.view.fill(0);
+   self.released.set(tail);
+   Ok(())
+  }
+ }
+ let released=Rc::new(Cell::new(1022));
+ let mut io=MockView{
+  header:continuous::header_revision(&mock().full,3).unwrap(),view:vec![],
+  snap:continuous::Snapshot{cookie:23,committed:1022,reserved:1022,released:1022,..Default::default()},
+  released:released.clone(),
+ };
+ let mut reader=view::PairReader::attach(io.snap).unwrap();
+ for (ordinal,bins) in [512,1024,2048,512].into_iter().enumerate(){
+  let ordinal=ordinal as u64+1022;
+  let mode=match bins{512=>1,1024=>2,_=>3};
+  io.header.ordinal=ordinal;
+  io.header.flags=(mode<<3)|1;
+  io.view=(0..bins).map(|i| ((i+ordinal as usize)%251+1)as u8).collect();
+  let expected=io.view.clone();
+  io.snap.committed+=1;
+  io.snap.reserved+=1;
+  reader.service_released(&mut io,|_|panic!("VIEW read of native bins"),|header,data|{
+   assert_eq!(released.get(),ordinal+1);
+   assert_eq!(header.ordinal,ordinal);
+   assert_eq!(view::view_len(header),bins);
+   assert_eq!(data,expected);
+   Ok(())
+  }).unwrap();
+ }
+ assert_eq!(reader.visited,4);
+ assert_eq!(reader.read,0);
+}

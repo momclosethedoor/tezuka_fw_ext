@@ -43,7 +43,7 @@ fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}f
 struct Map{ptr:*mut u8,len:usize}
 impl Map{fn new(fd:&File,len:usize,off:i64,write:bool)->R<Self>{let p=unsafe{libc::mmap(std::ptr::null_mut(),len,libc::PROT_READ|if write{libc::PROT_WRITE}else{0},libc::MAP_SHARED,fd.as_raw_fd(),off as libc::off_t)};if p==libc::MAP_FAILED{return Err(std::io::Error::last_os_error().to_string())}Ok(Self{ptr:p.cast(),len})}}
 impl Drop for Map{fn drop(&mut self){unsafe{libc::munmap(self.ptr.cast(),self.len);}}}
-struct Hardware{managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
+struct Hardware{managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,snapshots:u64,empty_snapshots:u64,release_commands:u64,sync_bytes:u64,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
 impl Hardware{
  fn open(c:&Config,managed_view_only:bool)->R<Self>{
   let read=|p:&str|std::fs::read_to_string(p).map_err(|e|e.to_string());
@@ -67,7 +67,7 @@ impl Hardware{
   for(a,n)in[(info.full,info.full_len),(info.view,info.view_len)]{for(lo,hi)in[(0x06000000,0x0e000000),(0x16000000,0x16040000)]{if a<hi&&a+n as u64>lo{return Err("DMA overlaps stock reserve".into())}}}
   let full=Map::new(&device,info.full_len as usize,0,false)?;let overview=Map::new(&device,info.view_len as usize,0x1000000,false)?;
   let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
-  let h=Self{managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
+  let h=Self{managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,snapshots:0,empty_snapshots:0,release_commands:0,sync_bytes:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
   view::geometry(h.r(0xe4),h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))?;if h.r(0x50)!=continuous::ABI{return Err("OBN2 ID".into())}
   Ok(h)
  }
@@ -75,7 +75,7 @@ impl Hardware{
  fn w(&self,o:usize,v:u32){unsafe{std::ptr::write_volatile(self.regs.ptr.add(o).cast(),v)};compiler_fence(Ordering::SeqCst);}
  fn r64(&self,o:usize)->u64{self.r(o)as u64|((self.r(o+4)as u64)<<32)}
  fn live64(&self,o:usize)->u64{loop{let hi=self.r(o+4);let lo=self.r(o);if hi==self.r(o+4){return(hi as u64)<<32|lo as u64}}}
- fn sync(&mut self,region:u32,offset:u32,len:u32,cpu:bool)->R<()>{let t=Instant::now();let s=Sync{region,offset,len,for_cpu:cpu as u32};if unsafe{libc::ioctl(self.device.as_raw_fd(),0x4f02,&s)}!=0{return Err(format!("DMA sync: {}",std::io::Error::last_os_error()))}compiler_fence(Ordering::SeqCst);self.sync_ns+=t.elapsed().as_nanos();self.sync_calls+=1;Ok(())}
+ fn sync(&mut self,region:u32,offset:u32,len:u32,cpu:bool)->R<()>{let t=Instant::now();let s=Sync{region,offset,len,for_cpu:cpu as u32};if unsafe{libc::ioctl(self.device.as_raw_fd(),0x4f02,&s)}!=0{return Err(format!("DMA sync: {}",std::io::Error::last_os_error()))}compiler_fence(Ordering::SeqCst);self.sync_ns+=t.elapsed().as_nanos();self.sync_calls+=1;self.sync_bytes+=u64::from(len);Ok(())}
  fn copy(&mut self,region:u32,off:usize,out:&mut[u8])->R<()>{self.ensure_sync(region,off as u32,out.len()as u32)?;let p=if region==0{self.full.ptr}else{self.overview.ptr};let t=Instant::now();
   #[cfg(target_arch="arm")] unsafe{obs_neon_copy(out.as_mut_ptr(),p.add(off),out.len())};
   #[cfg(not(target_arch="arm"))] unsafe{std::ptr::copy_nonoverlapping(p.add(off),out.as_mut_ptr(),out.len())};
@@ -191,7 +191,7 @@ impl Hardware{
    if self.pressure.len()<65536{self.pressure.push([(crate::delivery_runtime::mono()*1e9)as u64,reserved,self.r64(0x100),physical]);}else{self.pressure_omitted+=1;}
    self.pressure_due=Instant::now();
   }
-  let value=Snapshot{committed:self.r64(0x100),reserved,released:logical,input_seq:if details{self.r64(0x118)}else{0},finished:if details{self.r64(0x128)}else{0},selected:if details{self.r64(0x130)}else{0},unselected:if details{self.r64(0x138)}else{0},dirty_drop:if details{self.r(0x148)}else{0},stop_drop:if details{self.r(0x14c)}else{0},stop_input_limit:if details{self.r64(0x158)}else{0},cookie:self.r(0x150),dropped:if details{self.r(0x140)as u64+self.r(0x144)as u64+self.r(0x160)as u64}else{0},running:status&1!=0,dma_busy:status&2!=0,drained:status&16!=0,fault:status&4!=0};if let Some(t)=phase{self.snapshot_ns+=t.elapsed().as_nanos();}Ok(value)}
+  let value=Snapshot{committed:self.r64(0x100),reserved,released:logical,input_seq:if details{self.r64(0x118)}else{0},finished:if details{self.r64(0x128)}else{0},selected:if details{self.r64(0x130)}else{0},unselected:if details{self.r64(0x138)}else{0},dirty_drop:if details{self.r(0x148)}else{0},stop_drop:if details{self.r(0x14c)}else{0},stop_input_limit:if details{self.r64(0x158)}else{0},cookie:self.r(0x150),dropped:if details{self.r(0x140)as u64+self.r(0x144)as u64+self.r(0x160)as u64}else{0},running:status&1!=0,dma_busy:status&2!=0,drained:status&16!=0,fault:status&4!=0};self.snapshots+=1;if value.committed==value.released{self.empty_snapshots+=1;}if let Some(t)=phase{self.snapshot_ns+=t.elapsed().as_nanos();}Ok(value)}
  fn fld(&self)->Value{loop{let v=self.r(0x22c);let epoch=self.live64(0x238);let pass=self.r(0x268);let status=self.r(0x228);let loads=self.r(0x254);let late=self.r(0x258);let errors=self.r(0x25c);let current_pass=self.r(0x230);let position=self.r(0x234);if v==self.r(0x22c){return json!({"version":v,"map_epoch":epoch,"map_pass":pass,"status":status,"loads":loads,"late":late,"errors":errors,"pass":current_pass,"position":position,"tx_changes":self.r(0x260),"transactions":self.r(0x264)})}}}
  fn counters(&mut self)->R<Value>{let s=self.snapshot()?;Ok(json!({"fld":self.fld(),"committed":s.committed,"reserved":s.reserved,"released":self.r64(0x110),"logical_released":s.released,"input_seq":s.input_seq,"formed":s.finished,"selected":s.selected,"unselected":s.unselected,"bank_drop":self.r(0x140),"ring_drop":self.r(0x144),"dirty_drop":s.dirty_drop,"stop_drop":s.stop_drop,"dma_drop":self.r(0x160),"run":s.cookie,"status":self.r(0x154),"visit_epoch":self.live64(0x180),"visit_status":self.r(0x188),"first_epoch":self.live64(0x198)}))}
 }
@@ -273,7 +273,7 @@ impl PairIo for Hardware{
   // The network never participates. After STOP/DRAINED flush the held slot.
   let safe_tail=if self.shift&&self.active{tail.checked_sub(1).ok_or("split tail underflow")?}else{tail};
   let physical=self.r64(0x110);if safe_tail<physical{return Err("backward physical release".into())}
-  if safe_tail>physical{self.w(0xe8,safe_tail as u32);self.w(0xec,(safe_tail>>32)as u32);self.w(0xf0,run);self.w(0x54,self.valid|64);}
+  if safe_tail>physical{self.release_commands+=1;self.w(0xe8,safe_tail as u32);self.w(0xec,(safe_tail>>32)as u32);self.w(0xf0,run);self.w(0x54,self.valid|64);}
   self.logical_tail=Some(tail);self.max_release_gap_us=self.max_release_gap_us.max(self.last_release.elapsed().as_micros()as u64);self.last_release=Instant::now();if let Some(t)=phase{self.release_ns+=t.elapsed().as_nanos();}Ok(())}
 }
 fn cpu()->f64{let mut r=std::mem::MaybeUninit::<libc::rusage>::zeroed();unsafe{libc::getrusage(libc::RUSAGE_SELF,r.as_mut_ptr());let r=r.assume_init();(r.ru_utime.tv_sec+r.ru_stime.tv_sec)as f64+(r.ru_utime.tv_usec+r.ru_stime.tv_usec)as f64/1e6}}
@@ -284,8 +284,14 @@ fn full_read_without_sum(b:&[u8]){
  #[cfg(not(target_arch="arm"))] for x in b{unsafe{std::ptr::read_volatile(x);}}
 }
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
-fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
+fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"sync_bytes":io.sync_bytes,
+"payload_read_bytes":io.copied_bytes,"metadata_span_bytes":if io.managed_view_only{reader.visited*512}else{0},
+"owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
+pub(crate) fn view_bins(header: Header) -> usize {
+ view::view_len(header)
+}
+
 pub(crate) struct RunControl<'a>{
  pub generation:u64,
  pub version:u32,
@@ -340,9 +346,26 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let record_bytes=(if control.is_some(){64}else{56})+[0,512,1024,2048][c.mode as usize];
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
+ if control.is_some() && let Some(sock)=&socket{
+  let mut net=network.borrow_mut();
+  let mut mtu:libc::c_int=0;
+  let mut len=std::mem::size_of_val(&mtu) as libc::socklen_t;
+  let fd=sock.as_raw_fd();
+  if unsafe{libc::getsockopt(fd,libc::IPPROTO_IP,libc::IP_MTU,(&mut mtu as *mut libc::c_int).cast(),&mut len)}!=0 || mtu<=28{
+   return Err("managed VIEW needs an IPv4 route MTU".into());
+  }
+  net.set_path_mtu(mtu as u32);
+  if net.ip_fragmentation {
+   let mode:libc::c_int=libc::IP_PMTUDISC_DONT;
+   let len=std::mem::size_of_val(&mode) as libc::socklen_t;
+   if unsafe{libc::setsockopt(fd,libc::IPPROTO_IP,libc::IP_MTU_DISCOVER,(&mode as *const libc::c_int).cast(),len)}!=0 {
+    return Err(format!("VIEW IPv4 fragmentation option: {}",std::io::Error::last_os_error()));
+   }
+  }
+ }
  let initial_anchor=io.live64(0x238);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
-   sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))));
+   sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
  let execution=std::cell::Cell::<Option<Execution>>::new(None);
  let draining=std::cell::Cell::new(false);
  let next_announced=std::cell::Cell::new(false);
@@ -351,6 +374,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut sampled_execution=None;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(q)=control {
+   if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if draining.get(){network.borrow_mut().suppressed+=1;return Ok(())}
    if execution.get().is_none(){
     let e=Execution{generation:q.generation,version:q.version,anchor:if c.scan{initial_anchor}else{h.epoch},run:initial.cookie};
@@ -359,13 +383,13 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     (q.started)(h,e);
    }
   }
-  if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
+  if let Some(sock)=&socket{if !overview.is_empty(){if control.is_none() && overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
    if let Some(next)=control.and_then(|q|q.next.as_ref()) && !next_announced.get()
       && let Some(anchor)=(next.anchor)() && h.epoch>=anchor {
     let mut delivery=sweeps.borrow_mut();
     if let Some(old)=delivery.as_mut(){old.finish(&mut net,sock,false);}
-    *delivery=Some(sweep_delivery::Delivery::new(next.sweep,anchor,next.generation,&mut net));
+    *delivery=Some(sweep_delivery::Delivery::new(next.sweep,anchor,next.generation,&mut net)?);
     next_announced.set(true);
     let e=Execution{generation:next.generation,version:next.version,anchor,run:initial.cookie};
     execution.set(Some(e));
@@ -373,7 +397,6 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
    if execution.get().is_some_and(|e|h.epoch<e.anchor){net.suppressed+=1;return Ok(())}
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
-    if overview.len()!=512{return Err("sweep delivery requires VIEW512".into())}
     sweep.accept(h,overview,&mut net,sock);
    } else {
     net.start_record();net.bytes.extend_from_slice(if control.is_some(){b"GVIEW4\0\0"}else{b"GVIEW3\0\0"});for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64]{net.bytes.extend_from_slice(&x.to_le_bytes());}if let Some(q)=control{net.bytes.extend_from_slice(&q.generation.to_le_bytes());}net.bytes.extend_from_slice(overview);net.pending+=1;if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}
@@ -449,7 +472,7 @@ pub(crate) fn run_controlled(data:&[u8],q:&RunControl<'_>)->R<()>{let c:Config=s
 
 impl UdpBatch {
  fn counts(&self)->Value{json!({"sent":self.sent,"sent_bytes":self.sent_bytes,"dropped":self.dropped,
-  "datagrams":self.datagrams,"pending":self.pending,"pending_bytes":self.bytes.len(),"queue_high_records":self.high_records.max(self.pending),
+  "datagrams":self.datagrams,"send_calls":self.send_calls,"path_mtu":self.mtu,"ip_fragmentation":self.ip_fragmentation,"pending":self.pending,"pending_bytes":self.bytes.len(),"queue_high_records":self.high_records.max(self.pending),
   "send_errors":self.send_errors,"send_would_block":self.would_block,"last_socket_errno":self.last_errno,
   "admitted_records":self.sent+self.dropped+self.pending-self.rejected_before_queue,
   "rejected_before_queue":self.rejected_before_queue,"transition_records":self.transition,"suppressed_records":self.suppressed,
