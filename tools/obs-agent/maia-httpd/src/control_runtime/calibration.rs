@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-type Bank = BTreeMap<u64, (u64, [u8; 16])>;
+pub(super) type Bank = BTreeMap<u64, (u64, [u8; 16])>;
 
 #[derive(Default)]
 pub(super) struct Cache {
@@ -9,6 +9,7 @@ pub(super) struct Cache {
     rx: Bank,
     tx: Bank,
     core: Vec<generated::Tile>,
+    grid: Vec<generated::Tile>,
     bands: Value,
     mixer: Value,
     keep_rx: BTreeSet<u64>,
@@ -110,10 +111,16 @@ impl Cache {
         full["alternative"] = Value::Null;
         full["scan"]["ranges"] = json!(union.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
         let core = generated::core_tiles(&full)?;
-        let tiles = generated::catalog_profiles(&full,&core)?;
+        let grid = if full["grid_27"] == true {
+            generated::working_grid(&full, &core)?
+        } else {
+            Vec::new()
+        };
+        let tiles = generated::catalog_profiles(&full, &core, &grid)?;
         let mut cache = Self::default();
         let (_, desc) = cache.prepare_tiles(&full,shared,tiles,None,start,cpu_start,true)?;
         cache.core = core;
+        cache.grid = grid;
         cache.bands = full["scan"]["antenna_bands"].clone();
         cache.mixer = full["scan"]["mixer"].clone();
         cache.keep_rx = cache.rx.keys().copied().collect();
@@ -150,6 +157,11 @@ impl Cache {
                     cursor = b;
                 }
                 ensure!(cursor == hi,"uncovered RF [{cursor},{hi})");
+            }
+            if !self.grid.is_empty() && pending["grid_27"] == true
+                && scan["bench_overlap_hz"].is_null() && scan["recalibrate"] != true
+                && snapshot()? == self.snapshot {
+                return generated::catalog_subset(pending, &subset, &self.grid, &self.rx, &self.tx);
             }
             generated::executable_tiles(pending,&subset)
         } else { generated::tiles(pending) }

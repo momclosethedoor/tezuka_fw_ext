@@ -97,8 +97,71 @@ fn position(template: &Tile, bounds: [u64;2], center: u64, phase: &'static str) 
     Ok(v)
 }
 
+pub(super) fn select(
+    grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
+    bounds: [u64; 2], row: usize, mult: i64,
+) -> Option<Vec<Tile>> {
+    let mut visits = Vec::new();
+    let mut coverage = Vec::new();
+    let mut phases = [false; 2];
+    for tile in grid {
+        let Some((phase, segment)) = tile.grid else { continue };
+        let Some(clip) = intersection(segment, bounds) else { continue };
+        let Some(&(rx_hz, _)) = rx.get(&tile.rx) else { continue };
+        let (tone, side) = match tile.tx {
+            Some(t) => {
+                let Some(&(pll, _)) = tx.get(&(t.pll as u64)) else { continue };
+                (Some(pll as i64 + OFFSET), t.side)
+            }
+            None => (None, 1),
+        };
+        let offset = tone.map_or(0, |f| f * mult);
+        let center = offset + side * rx_hz as i64;
+        let clean = lobes(clip, center, offset, side, tone);
+        let witness = [
+            (center - mixer_math::HALF_PASS).max(0) as u64,
+            (center + mixer_math::HALF_PASS) as u64,
+        ];
+        // The raw map carries one verified clean interval. VIEW carries
+        // both usable lobes, clipped to the specified RF row.
+        let Some(rf) = intersection(tile.rf, clip).or_else(|| clean.iter()
+            .filter_map(|&r| intersection(r, witness)).max_by_key(|r| r[1] - r[0]))
+            else { continue };
+        if clean.is_empty() { continue; }
+        phases[usize::from(phase == "offset")] = true;
+        coverage.extend(clean);
+        let mut visit = tile.clone();
+        visit.rf = rf;
+        visit.rf_row = row;
+        visit.grid = Some((phase, clip));
+        visits.push(visit);
+    }
+    let channel = 8_000_000;
+    let covers_channels = bounds[1] - bounds[0] < channel
+        || covers([bounds[0], bounds[1] - channel], coverage.iter()
+            .filter(|[lo, hi]| hi - lo >= channel).map(|&[lo, hi]| [lo, hi - channel]));
+    (phases == [true, true] && covers(bounds, coverage) && covers_channels).then_some(visits)
+}
+
+fn intersection(a: [u64; 2], b: [u64; 2]) -> Option<[u64; 2]> {
+    let clip = [a[0].max(b[0]), a[1].min(b[1])];
+    (clip[0] < clip[1]).then_some(clip)
+}
+
+fn covers([mut cursor, end]: [u64; 2], spans: impl IntoIterator<Item = [u64; 2]>) -> bool {
+    let mut spans: Vec<_> = spans.into_iter().collect();
+    spans.sort_unstable();
+    for [lo, hi] in spans {
+        if lo > cursor { return false; }
+        if hi < cursor { continue; }
+        cursor = cursor.max(hi);
+        if cursor >= end { return true; }
+    }
+    false
+}
+
 pub(super) fn lobes(bounds: [u64;2], center: i64, offset: i64, side: i64, tone: Option<i64>)
-    -> Result<Vec<[u64;2]>> {
+    -> Vec<[u64;2]> {
     let [lo,hi] = bounds.map(|f| f as i64);
     let extent = 27_000_000;
     let dc = mixer_math::DC_CLEARANCE;
@@ -118,9 +181,8 @@ pub(super) fn lobes(bounds: [u64;2], center: i64, offset: i64, side: i64, tone: 
             if l < h {clean.push([l as u64,h as u64]);}
         }
     }
-    ensure!(!clean.is_empty(),"empty calibrated grid coverage in {bounds:?}");
     clean.sort_unstable();
-    Ok(clean)
+    clean
 }
 
 pub(super) fn validate_cover(desc: &Value) -> Result<()> {

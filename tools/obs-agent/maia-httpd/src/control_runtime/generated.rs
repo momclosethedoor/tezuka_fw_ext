@@ -90,9 +90,37 @@ pub(super) fn executable_tiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>
         return transitions(state, &schedule);
     }
     if state["grid_27"] == true && state["alternative"].is_null() {
-        return transitions(state, &grid_bench::schedule(core, 9_000_000, 27_000_000, Some(state))?);
+        return transitions(state, &working_grid(state, core)?);
     }
     transitions(state, core)
+}
+
+pub(super) fn working_grid(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
+    grid_bench::schedule(core, 9_000_000, 27_000_000, Some(state))
+}
+
+pub(super) fn catalog_subset(
+    state: &Value, core: &[Tile], grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
+) -> Result<Vec<Tile>> {
+    let mult = environment()?.1;
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for row in core.chunk_by(|a, b| a.rf_row == b.rf_row) {
+        let bounds = [row[0].rf[0], row.last().unwrap().rf[1]];
+        let row_id = row[0].rf_row;
+        let visits = match grid_bench::select(grid, rx, tx, bounds, row_id, mult) {
+            Some(visits) => visits,
+            None => working_grid(state, row)?,
+        };
+        for tile in visits {
+            match tile.grid {
+                Some(("main", _)) => first.push(tile),
+                _ => second.push(tile),
+            }
+        }
+    }
+    first.extend(second);
+    transitions(state, &first)
 }
 
 pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
@@ -314,11 +342,11 @@ pub(super) fn transitions(state: &Value, tiles: &[Tile]) -> Result<Vec<Tile>> {
 
 /// Requests can reorder subbands. Warm each distinct RX/TX tuning needed to
 /// hand off between any two configured antenna routes, including the wrap.
-pub(super) fn catalog_profiles(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
+pub(super) fn catalog_profiles(state: &Value, core: &[Tile], grid: &[Tile]) -> Result<Vec<Tile>> {
     let mut representatives = BTreeMap::new();
     let mut profiles = BTreeMap::new();
-    if state["grid_27"] == true {
-        for tile in executable_tiles(state, core)? {
+    if !grid.is_empty() {
+        for tile in transitions(state, grid)? {
             profiles.insert((tile.rx, tile.tx.map(|t| t.pll)), tile);
         }
     }
@@ -431,8 +459,8 @@ pub(super) fn encode(
             "readback places DC in useful interval [{a},{b})"
         );
         ensure!(
-            (a as i64 - center).unsigned_abs() <= 23_800_000
-                && (b as i64 - center).unsigned_abs() <= 23_800_000,
+            (a as i64 - center).abs() <= mixer_math::HALF_PASS
+                && (b as i64 - center).abs() <= mixer_math::HALF_PASS,
             "readback leaves uncovered RF edge [{a},{b})"
         );
         if let Some(p) = pll {
@@ -462,7 +490,9 @@ pub(super) fn encode(
             put_hz(&mut bytes, at + 24, b);
         }
         let useful = if let Some((_,bounds)) = v.grid.filter(|_| working_grid && !v.transition_only) {
-            grid_bench::lobes(bounds, center, offset, side, tone)?
+            let clean = grid_bench::lobes(bounds, center, offset, side, tone);
+            ensure!(!clean.is_empty(), "empty calibrated grid coverage in {bounds:?}");
+            clean
         } else if !v.transition_only {
             vec![v.rf]
         } else {
