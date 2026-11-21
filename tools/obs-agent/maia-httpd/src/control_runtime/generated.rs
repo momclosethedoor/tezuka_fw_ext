@@ -142,6 +142,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
     };
     let mut tiles = Vec::new();
     let mut previous = None;
+    let mut selected = Vec::new();
     for (rf_row, range) in scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?.iter().enumerate() {
         if range["enabled"] != true {
             continue;
@@ -198,7 +199,9 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                         mult,
                         pll_bounds,
                         previous,
+                        &selected,
                         state["alternative"]["excluded_tx_pll_hz"].as_i64(),
+                        state["alternative"]["excluded_rx_lo_hz"].as_i64(),
                         bands.get(&antenna).map_or(&[], Vec::as_slice),
                     )
                     .ok_or_else(|| anyhow!("no measured mixer setting covers [{lo},{hi}) Hz"))?,
@@ -211,6 +214,9 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 .ok_or_else(|| anyhow!("no RX tuning with DC clearance for [{lo},{hi})"))?
                 as u64;
             if let Some(t) = tx {
+                if !selected.contains(&t.pll) {
+                    selected.push(t.pll);
+                }
                 previous = Some(t.pll);
             }
             tiles.push(Tile {

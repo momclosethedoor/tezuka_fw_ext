@@ -27,24 +27,49 @@ pub fn place_rx(edges: [i64; 2], exclude: Option<i64>) -> Option<i64> {
         .max_by_key(|v| exclude.map_or(0, |x| v.abs_diff(x)))
 }
 
-/// Prefer a PLL for which the image of the whole requested tile is outside
-/// the admitted antenna bands. An in-band image remains visible in readback.
+/// Reuse exact PLL settings in the caller's priority order within each image
+/// quality class. Only create a profile when no existing one has that quality.
 pub fn choose_on_antenna(
     rf: [i64; 2],
     m: i64,
     p: [i64; 2],
     previous: Option<i64>,
+    selected: &[i64],
     exclude: Option<i64>,
+    exclude_rx: Option<i64>,
     bands: &[[u64; 2]],
 ) -> Option<Tuning> {
-    let fallback = choose(rf, m, p, previous, exclude)?;
+    let usable = |t: Tuning| place_rx(t.if_edges, exclude_rx).is_some();
+    let fallback = solve(rf, m, p, previous, exclude, usable)?;
+    let reuse = |free: &[[i64; 2]]| previous.into_iter().chain(
+        selected.iter().rev().copied().filter(|pll| Some(*pll) != previous))
+        .filter(|pll| free.iter().any(|[lo, hi]| (*lo..=*hi).contains(pll)))
+        .find_map(|pll| solve(rf, m, [pll; 2], Some(pll), exclude, usable));
+    // Try readback-safe image clearance first, followed by the nominal
+    // clearance used by the descriptor. Never trade either for a saved slot.
+    for margin in [READBACK_MARGIN, 0] {
+        let free = image_free(rf, m, p, bands, margin)?;
+        if let Some(t) = reuse(&free) {
+            return Some(t);
+        }
+        if let Some(t) = free.into_iter()
+            .filter_map(|r| solve(rf, m, r, previous, exclude, usable))
+            .min_by_key(|t| t.pll.abs_diff(fallback.pll)) {
+            return Some(t);
+        }
+    }
+    reuse(&[p]).or(Some(fallback))
+}
+
+fn image_free(rf: [i64; 2], m: i64, p: [i64; 2], bands: &[[u64; 2]], margin: i64)
+    -> Option<Vec<[i64; 2]>> {
     let mut free = vec![p];
     for &[a, b] in bands {
         if a >= b || b > 18_000_000_000 {
             return None;
         }
-        let lo = (a as i64 + rf[0]).div_euclid(2 * m) - OFFSET + 1;
-        let hi = (b as i64 + rf[1] - 1).div_euclid(2 * m) - OFFSET;
+        let lo = (a as i64 + rf[0] - margin).div_euclid(2 * m) - OFFSET + 1;
+        let hi = (b as i64 + rf[1] + margin - 1).div_euclid(2 * m) - OFFSET;
         let mut next = Vec::new();
         for [l, h] in free {
             if h < lo || l > hi {
@@ -60,10 +85,7 @@ pub fn choose_on_antenna(
         }
         free = next;
     }
-    free.into_iter()
-        .filter_map(|r| choose(rf, m, r, previous, exclude))
-        .min_by_key(|t| (Some(t.pll) != previous, t.pll.abs_diff(fallback.pll)))
-        .or(Some(fallback))
+    Some(free)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +105,17 @@ pub fn choose(
     pll_range: [i64; 2],
     previous: Option<i64>,
     exclude: Option<i64>,
+) -> Option<Tuning> {
+    solve(rf, mult, pll_range, previous, exclude, |_| true)
+}
+
+fn solve(
+    rf: [i64; 2],
+    mult: i64,
+    pll_range: [i64; 2],
+    previous: Option<i64>,
+    exclude: Option<i64>,
+    usable: impl Fn(Tuning) -> bool,
 ) -> Option<Tuning> {
     let [a, b] = rf;
     if !(1..=2).contains(&mult)
@@ -155,7 +188,7 @@ pub fn choose(
                     side,
                     if_edges: [k * pll + l, k * pll + h],
                 };
-                if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                if usable(t) && best.as_ref().is_none_or(|(r, _)| rank < *r) {
                     best = Some((rank, t));
                 }
             }
@@ -167,6 +200,39 @@ pub fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn returns_to_an_older_profile_at_fixed_pll() {
+        let limits = [2_250_000_000, 2_490_000_000];
+        let bands = [[4_000_000_000, 13_000_000_000]];
+        let select = |rf, previous, selected: &[i64]| {
+            choose_on_antenna(rf, 2, limits, previous, selected, None, None, &bands).unwrap()
+        };
+        let a = select([6_100_000_000, 6_116_000_000], None, &[]);
+        let b = select([10_800_000_000, 10_816_000_000], Some(a.pll), &[a.pll]);
+        let last = [7_332_000_000, 7_348_000_000];
+        assert_ne!(a.pll, b.pll);
+        assert!(choose(last, 2, [b.pll; 2], None, None).is_none());
+        let old = select(last, Some(b.pll), &[]);
+        assert_ne!(old.pll, a.pll);
+        assert_eq!(select(last, Some(b.pll), &[a.pll, b.pll]).pll, a.pll);
+    }
+
+    #[test]
+    fn checks_both_if_edges_at_fixed_pll() {
+        let pll = 2_350_000_000;
+        let lo = 2 * (pll + OFFSET);
+        let limits = [2_250_000_000, 2_490_000_000];
+        for (rf, center, side) in [
+            ([lo + IF_MAX - 15_000_000, lo + IF_MAX + 1], lo + IF_MAX - 7_500_000, 1),
+            ([lo - IF_MIN - 15_000_000, lo - IF_MIN + 1], lo - IF_MIN - 7_500_000, -1),
+        ] {
+            assert_eq!(choose([center, center + 1], 2, [pll; 2], None, None).unwrap().side, side);
+            assert!(choose(rf, 2, [pll; 2], None, None).is_none());
+            assert_ne!(choose_on_antenna(rf, 2, limits, Some(pll), &[pll], None, None, &[])
+                .unwrap().pll, pll);
+        }
+    }
+
     #[test]
     fn owned_boundary_holdout_spur_and_alternative() {
         let rf = [6_748_000_000, 6_752_000_000];
@@ -189,11 +255,13 @@ mod tests {
             (2 * main.mixer_lo - rf[1]) as u64,
             (2 * main.mixer_lo - rf[0]) as u64,
         ];
-        let filtered = choose_on_antenna(rf, 2, limits, None, None, &[image]).unwrap();
+        let filtered = choose_on_antenna(rf, 2, limits, None, &[], None, None, &[image]).unwrap();
         assert!(
             2 * filtered.mixer_lo - rf[0] <= image[0] as i64
                 || 2 * filtered.mixer_lo - rf[1] >= image[1] as i64
         );
+        let reused = choose_on_antenna(rf, 2, limits, Some(main.pll), &[main.pll], None, None, &[image]);
+        assert_eq!(reused, Some(filtered));
         assert!(choose(rf, 2, [main.pll; 2], None, Some(main.pll)).is_none());
     }
     #[test]
