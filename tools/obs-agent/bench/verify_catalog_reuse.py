@@ -32,12 +32,23 @@ def check_geometry(descriptor):
     return {p["rx_lo_hz"] for p in positions}
 
 
-def main(folder):
-    cases = [c for c in load(folder / "commands.json") if c["command"]["run"]]
-    assert len(cases) == 7
+def signature(command):
+    return json.dumps([command["ranges"], command.get("next_ranges")], sort_keys=True)
+
+
+def main(folders):
+    fixtures = load(Path(__file__).with_name("catalog_reuse_cases.json"))
+    captured = {}
+    for folder in folders:
+        for number, case in enumerate(load(folder / "commands.json"), 1):
+            if case["command"]["run"] and case["status"]["phase"] == "running":
+                captured.setdefault(signature(case["command"]), (folder, number, case))
     baseline = None
     rows = []
-    for index, case in enumerate(cases, 1):
+    for index, fixture in enumerate(fixtures, 1):
+        key = signature(fixture)
+        assert key in captured, f"no successful capture for case {index}"
+        folder, number, case = captured[key]
         status = case["status"]
         assert status["phase"] == "running" and not status["error"], status["error"]
         actual = status["actual"]
@@ -51,16 +62,16 @@ def main(folder):
             assert 0 < preparation["rx_calibrated"] <= 2 and rx - baseline, preparation
         else:
             assert preparation["rx_calibrated"] == 0 and rx <= baseline, preparation
-        passes, _ = physical_passes(folder, index, descriptor, actual["generation"])
+        passes, _ = physical_passes(folder, number, descriptor, actual["generation"])
         assert all(pass_['complete'] >= 12 for pass_ in passes.values()), passes
         if index == 5:
             markers = {p["marker_path"] for p in descriptor["positions"]}
             assert {"direct", "mixer"} <= markers
-        rows.append(dict(case=index, required=preparation["rx_required"],
+        rows.append(dict(case=index, capture=folder.name, required=preparation["rx_required"],
                          calibrated=preparation["rx_calibrated"], prepare_us=preparation["prepare_us"],
                          positions=len(descriptor["positions"]), complete={
                              phase: data["complete"] for phase, data in passes.items()}))
-    next_log = load(folder / "next-7.json")
+    next_log = load(folder / f"next-{number}.json")
     before, after = next_log["before"], next_log["after"]
     assert before["actual"]["generation"] != after["actual"]["generation"]
     assert check_geometry(after["actual"]["spectrum"]) <= baseline
@@ -69,5 +80,5 @@ def main(folder):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("folder", type=Path)
-    main(parser.parse_args().folder)
+    parser.add_argument("folders", type=Path, nargs="+")
+    main(parser.parse_args().folders)
