@@ -1528,7 +1528,9 @@ fn worker(
                     let pll = actual.borrow()["spectrum"]["first_tx_pll_hz"]
                         .as_u64()
                         .ok_or_else(|| anyhow!("first TX PLL"))?;
-                    carrier.prepare_guarded(pll, &shared.switch)?;
+                    carrier.prepare_guarded(pll, &shared.switch, |stage| {
+                        trace_control(stage, ||json!({"id":id,"generation":generation}));
+                    })?;
                     trace_control("carrier_ready", ||json!({"id":id,"generation":generation}));
                 }
                 shared.inbox.lock().unwrap().phase = "loading";
@@ -1548,7 +1550,12 @@ fn worker(
                         "lease expired or preparation cancelled before guard take");
                 }
                 guard_taken = true;
-                let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })?;
+                let s = guard_cmd(&guard_fd, if guard_rf { 0x4607 } else { 0x4602 })
+                    .inspect_err(|error| trace_control("take_failed", || {
+                        let raw = guard_raw(&guard_fd);
+                        json!({"id":id,"generation":generation,"error":error.to_string(),
+                            "guard":raw.map(|s| [s[1],s[2],s[9],s[17],s[30],s[112],s[118]])})
+                    }))?;
                 trace_control("take_done", ||json!({"id":id,"generation":generation,"version":word(setup,16)}));
                 ensure!(
                     s[1] == 2
@@ -1807,12 +1814,16 @@ fn worker(
             match handback {
                 Ok(()) => result,
                 Err(e) => {
+                    let error = match &result {
+                        Ok(()) => e.to_string(),
+                        Err(original) => format!("{original:#}; guard handback: {e:#}"),
+                    };
                     let mut stopped = before;
                     stopped["running"] = json!(false);
                     stopped["spectrum"] = Value::Null;
                     stopped["generation"] = json!(generation);
-                    receipt(&shared, &stopped, id, Some(e.to_string()));
-                    return Err(e);
+                    receipt(&shared, &stopped, id, Some(error.clone()));
+                    return Err(anyhow!(error));
                 }
             }
         } else {

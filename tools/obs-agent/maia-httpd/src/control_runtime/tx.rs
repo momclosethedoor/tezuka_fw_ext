@@ -228,7 +228,7 @@ impl Carrier {
         ensure!(lease_is_live(), "TX lease not confirmed");
         self.off()?;
         self.frequency_hz = requested;
-        let result = self.start(requested, attenuation, false);
+        let result = self.start(requested, attenuation, false, |_| {});
         if result.is_err() {
             self.off()?;
         }
@@ -239,8 +239,9 @@ impl Carrier {
         self.lease.as_ref().is_some_and(LeaseDecisions::live)
     }
 
-    pub fn prepare_guarded(&mut self, pll: u64, cancel: &AtomicBool) -> Result<()> {
+    pub fn prepare_guarded(&mut self, pll: u64, cancel: &AtomicBool, trace: impl Fn(&'static str)) -> Result<()> {
         self.off()?;
+        trace("carrier_muted");
         if self.lease.is_none() {
             self.lease = Some(LeaseDecisions::start()?);
         }
@@ -250,8 +251,9 @@ impl Carrier {
             ensure!(Instant::now() < deadline, "fresh TX lease required before guarded scan");
             std::thread::sleep(Duration::from_millis(20));
         }
+        trace("carrier_lease_ready");
         self.frequency_hz = pll + OFFSET;
-        if let Err(e) = self.start(pll + OFFSET, 89750, true) {
+        if let Err(e) = self.start(pll + OFFSET, 89750, true, trace) {
             self.off()?;
             return Err(e);
         }
@@ -265,7 +267,7 @@ impl Carrier {
             && self.device.as_ref().is_some_and(|d| buffer_enabled(d))
     }
 
-    fn start(&mut self, requested: u64, attenuation: u64, guarded: bool) -> Result<Value> {
+    fn start(&mut self, requested: u64, attenuation: u64, guarded: bool, trace: impl Fn(&'static str)) -> Result<Value> {
         let sample_rate=attr("out_voltage_sampling_frequency")?;
         ensure!(
             sample_rate == FS.to_string(),
@@ -277,6 +279,7 @@ impl Carrier {
             (pll + OFFSET).abs_diff(requested) <= 10,
             "TX frequency readback"
         );
+        trace("carrier_pll_ready");
         let device = tx_device()?;
         ensure!(!buffer_enabled(&device), "IIO TX buffer owned");
         let mut cmd = Command::new(IIO_TX);
@@ -342,6 +345,7 @@ impl Carrier {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+        trace("carrier_buffer_ready");
         ensure!(
             lease_is_live() && child.try_wait()?.is_none(),
             "TX lease lost before activation"
