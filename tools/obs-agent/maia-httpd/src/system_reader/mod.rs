@@ -5,7 +5,7 @@ mod discard;
 mod view_batch;
 mod sweep_delivery;
 mod progress;
-pub(crate) use progress::LOST as PROGRESS_LOST;
+pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
 use view_batch::UdpBatch;
 pub(crate) use continuous::Header;
@@ -125,6 +125,7 @@ impl Hardware{
     self.service_route(q)?;
     (q.check)()?;
    }
+   let map=self.map_stamp();
    let s=self.snapshot()?;
    if !s.running||s.fault||s.cookie!=1||s.released!=0||s.reserved>=view::SLOTS as u64{
     return Err("cold split lost initial ownership".into())
@@ -132,7 +133,7 @@ impl Hardware{
    if s.committed>=2{break}
    if STOP.load(Ordering::Relaxed){return Err("cold split cancelled".into())}
    if let Some(q)=control {
-    if sampled.elapsed()>=progress::POLL {self.check_progress(&mut progress,start,&s,q)?;sampled=Instant::now();}
+    if sampled.elapsed()>=progress::POLL {self.check_progress(&mut progress,start,&s,q,None,Some(map))?;sampled=Instant::now();}
    }else if start.elapsed()>=Duration::from_secs(1){return Err("cold split header deadline".into())}
    std::thread::sleep(Duration::from_micros(40));
   }
@@ -151,16 +152,31 @@ impl Hardware{
   Ok(json!({"discarded":1,"run":1,"ordinal":0,"first_epoch":first_epoch,
             "next_epoch":next.epoch,"physical_released":self.r64(0x110)}))
  }
- fn check_progress(&self,progress:&mut progress::Progress,start:Instant,s:&Snapshot,q:&RunControl)->R<()>{
+ fn map_stamp(&self)->(u32,u64){(self.r(0x22c),self.live64(0x238))}
+ fn check_progress(&self,progress:&mut progress::Progress,start:Instant,s:&Snapshot,q:&RunControl,
+   execution:Option<Execution>,map:Option<(u32,u64)>)->R<()>{
   let mux=self.r(0x228);
-  let counts=if q.bench_stall {[0;3]}else{[s.finished,s.committed,s.dropped]};
+  let epoch=if map.is_some(){self.live64(0x180)}else{self.live64(0x198)};
+  if map.is_some_and(|m| m!=self.map_stamp()) || s.cookie!=self.r(0x150){
+   (q.progress)(Value::Null);
+   return Ok(());
+  }
+  let observed=execution.filter(|e| e.matches(s.cookie,map,epoch));
+  let injected=q.bench_stall || q.bench_stall_after_next && observed.is_some_and(|e|e.generation!=q.generation);
+  let counts=if injected {[0;3]}else{[s.finished,s.committed,s.dropped]};
   let state=progress.observe(start.elapsed(),counts,s.running && !s.fault,
    mux&8!=0,s.reserved.saturating_sub(s.released)>=1023);
-  (q.progress)(json!({"state":state.as_str(),"generation":q.generation,"run":s.cookie,"arm_ns":((crate::delivery_runtime::mono()*1e9)as u64).to_string(),
+  let sample=json!({"state":state.as_str(),"generation":observed.map(|e|e.generation),"run":s.cookie,
+   "arm_ns":crate::delivery_runtime::mono_ns().to_string(),
    "budget_us":progress.budget().as_micros() as u64,"input_seq":s.input_seq,"formed":s.finished,"committed":s.committed,
-   "released":s.released,"dropped":s.dropped,"epoch":self.live64(0x180),"version":self.r(0x22c),"mux_status":mux,
-   "test_injected":q.bench_stall}));
-  if state==progress::State::Stalled && !q.stop.load(Ordering::Acquire){return Err(progress::LOST.into())}Ok(())
+   "released":s.released,"dropped":s.dropped,"epoch":epoch,"version":map.map(|m|m.0).or(observed.map(|e|e.version)),
+   "map_epoch":map.map(|m|m.1).or(observed.map(|e|e.anchor)),"mux_status":mux,"test_injected":injected});
+  if state==progress::State::Stalled && !q.stop.load(Ordering::Acquire){
+   (q.stalled)(sample);
+   return Err(progress::LOST.into());
+  }
+  (q.progress)(if observed.is_some(){sample}else{Value::Null});
+  Ok(())
  }
  fn stop(&mut self){self.valid=0;self.w(0x54,4);self.active=false;}
  fn read_snapshot(&mut self,details:bool)->R<Snapshot>{let phase=self.phase_on.then(Instant::now);self.w(0x54,self.valid|32);let status=self.r(0x154);if status&8!=0{return Err("sticky rejected command".into())}
@@ -260,21 +276,25 @@ fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let r
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
 pub(crate) struct RunControl<'a>{
  pub generation:u64,
+ pub version:u32,
  pub stop:&'a AtomicBool,
- pub started:&'a dyn Fn(Header),
+ pub started:&'a dyn Fn(Header,Execution),
  pub trace:&'a dyn Fn(&'static str),
  pub route:&'a dyn Fn(u32,u64,u32,u32,u32)->R<Option<u32>>,
  pub check:&'a dyn Fn()->R<()>,
  pub progress:&'a dyn Fn(Value),
+ pub stalled:&'a dyn Fn(Value),
  pub bench_stall:bool,
+ pub bench_stall_after_next:bool,
  pub sweep:Option<&'a SweepSpec>,
  pub next:Option<NextView<'a>>,
 }
 pub(crate) struct NextView<'a>{
  pub generation:u64,
+ pub version:u32,
  pub sweep:&'a SweepSpec,
  pub anchor:&'a dyn Fn()->Option<u64>,
- pub started:&'a dyn Fn(Header,u64),
+ pub started:&'a dyn Fn(Header,Execution),
 }
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
@@ -297,19 +317,31 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
  let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split(control.filter(|_|c.scan),c)?}else{Value::Null};
  save(c,"cold-start.json",&cold)?;
- let mut reader=view::PairReader::attach(io.snapshot()?)?;
+ let initial=io.snapshot()?;
+ let mut reader=view::PairReader::attach(initial)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
  let record_bytes=(if control.is_some(){64}else{56})+[0,512,1024,2048][c.mode as usize];
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
+ let initial_anchor=io.live64(0x238);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
-   sweep_delivery::Delivery::new(spec,io.live64(0x238),q.generation,&mut network.borrow_mut()))));
- let announced=std::cell::Cell::new(false);let draining=std::cell::Cell::new(false);
+   sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))));
+ let execution=std::cell::Cell::<Option<Execution>>::new(None);
+ let draining=std::cell::Cell::new(false);
  let next_announced=std::cell::Cell::new(false);
  let mut first_view_sent=false;
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
+ let mut sampled_execution=None;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
-  if let Some(q)=control{if draining.get(){return Ok(())}if !announced.replace(true){(q.started)(h);}}
+  if let Some(q)=control {
+   if draining.get(){return Ok(())}
+   if execution.get().is_none(){
+    let e=Execution{generation:q.generation,version:q.version,anchor:if c.scan{initial_anchor}else{h.epoch},run:initial.cookie};
+    if h.epoch<e.anchor{return Ok(())}
+    execution.set(Some(e));
+    (q.started)(h,e);
+   }
+  }
   if let Some(sock)=&socket{if !overview.is_empty(){if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
    if let Some(next)=control.and_then(|q|q.next.as_ref()) && !next_announced.get()
@@ -318,8 +350,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     if let Some(old)=delivery.as_mut(){old.finish(&mut net,sock,false);}
     *delivery=Some(sweep_delivery::Delivery::new(next.sweep,anchor,next.generation,&mut net));
     next_announced.set(true);
-    (next.started)(h,anchor);
+    let e=Execution{generation:next.generation,version:next.version,anchor,run:initial.cookie};
+    execution.set(Some(e));
+    (next.started)(h,e);
    }
+   if execution.get().is_some_and(|e|h.epoch<e.anchor){return Ok(())}
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
     if overview.len()!=512{return Err("sweep delivery requires VIEW512".into())}
     sweep.accept(h,overview,&mut net,sock);
@@ -338,8 +373,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if status_due.elapsed()>=progress::POLL{
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
    if let Some(q)=control {
+    let map=c.scan.then(||io.map_stamp());
     let s=io.snapshot()?;
-    if let Err(e)=io.check_progress(&mut progress,start,&s,q){route_failure=Some(e);break;}
+    if sampled_execution!=execution.get(){progress.reset();sampled_execution=execution.get();}
+    if let Err(e)=io.check_progress(&mut progress,start,&s,q,execution.get(),map){route_failure=Some(e);break;}
    }
    if let Ok(v)=mark(&mut io,&reader,start){*STATUS.lock().unwrap()=v;}status_due=Instant::now();
   }

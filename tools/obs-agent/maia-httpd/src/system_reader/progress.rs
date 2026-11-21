@@ -4,6 +4,20 @@ pub(super) const POLL: Duration = Duration::from_millis(100);
 pub(crate) const LOST: &str = "PL producer stopped making progress";
 const FFT_WINDOW_NS: u64 = (4096u64 * 1_000_000_000).div_ceil(61_440_000);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Execution {
+    pub generation: u64,
+    pub version: u32,
+    pub anchor: u64,
+    pub run: u32,
+}
+
+impl Execution {
+    pub(super) fn matches(self, run: u32, map: Option<(u32, u64)>, epoch: u64) -> bool {
+        self.run == run && map.is_none_or(|m| m == (self.version, self.anchor)) && epoch >= self.anchor
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum State {
     Running,
@@ -30,6 +44,8 @@ pub(super) struct Progress {
 }
 
 impl Progress {
+    pub(super) fn reset(&mut self) { self.last = None; }
+
     pub(super) fn new(k: u32, scan: bool, settling: u32, gate_wait_ticks: u32) -> Self {
         let group = u64::from(k) + u64::from(scan);
         let visit = (group + u64::from(settling)) * FFT_WINDOW_NS + u64::from(gate_wait_ticks) * 16;
@@ -57,6 +73,18 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_requires_the_same_run_and_the_confirmed_map_anchor() {
+        let old = Execution { generation: 5, version: 7, anchor: 31, run: 8 };
+        let next = Execution { generation: 6, version: 8, anchor: 51, run: 8 };
+        assert!(old.matches(8, Some((7, 31)), 50));
+        assert!(!old.matches(8, Some((8, 51)), 51));
+        assert!(!next.matches(8, Some((8, 51)), 50));
+        assert!(!next.matches(8, Some((8, 31)), 51));
+        assert!(!next.matches(9, Some((8, 51)), 51));
+        assert!(next.matches(8, Some((8, 51)), 51));
+    }
 
     #[test]
     fn route_wait_and_backpressure_without_output_do_not_spend_progress_budget() {

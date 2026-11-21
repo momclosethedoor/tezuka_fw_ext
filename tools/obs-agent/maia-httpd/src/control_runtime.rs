@@ -188,6 +188,7 @@ struct Inbox {
     metrics: Value,
     operation: Value,
     progress: Value,
+    last_progress: Value,
     progress_failure: Value,
     last_confirmed: Value,
     worker_error: Option<String>,
@@ -195,6 +196,7 @@ struct Inbox {
     next_map_request: Option<(Value, u64)>,
 }
 struct Shared {
+    clock_session: String,
     inbox: Mutex<Inbox>,
     wake: Condvar,
     switch: AtomicBool,
@@ -246,7 +248,7 @@ fn radio_access<T>(direction: &str, attribute: &str, access: impl FnOnce() -> Re
     result
 }
 fn clock_ns() -> u64 {
-    (crate::delivery_runtime::mono() * 1e9) as u64
+    crate::delivery_runtime::mono_ns()
 }
 
 fn validate(v: &Value) -> Result<()> {
@@ -383,8 +385,9 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
             .or(q.next_map_request.as_ref().map(|(v,_)|&v["id"])),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
         "route_pending":q.route_pending,"arm_clock_ns":q.receipt_ns.to_string(),
+        "arm_now_ns":clock_ns().to_string(),"boot_id":q.actual["boot"],"clock_session":shared.clock_session,
         "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,
-        "operation":q.operation,"progress":q.progress,"progress_failure":q.progress_failure,
+        "operation":q.operation,"progress":q.progress,"last_progress":q.last_progress,"progress_failure":q.progress_failure,
         "last_confirmed":q.last_confirmed,"worker_error":q.worker_error,
         "metrics":{"owner":q.metrics,"reader":reader}}),
     )
@@ -498,10 +501,19 @@ async fn submit(
     (StatusCode::ACCEPTED, Json(json!({"accepted_id":id})))
 }
 
+fn progress_matches(sample: &Value, state: &Value) -> bool {
+    state["running"] == true && !sample["generation"].is_null()
+        && sample["generation"] == state["generation"]
+        && sample["version"] == state["spectrum"]["version"]
+        && sample["map_epoch"] == state["spectrum"]["map_epoch"]
+        && sample["run"] == state["dma_run"]
+}
+
 fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     let mut q = shared.inbox.lock().unwrap();
     q.pending = None;
     q.actual = state.clone();
+    if !progress_matches(&q.progress, state) { q.progress = Value::Null; }
     q.phase = if error.is_some() {
         "failed"
     } else if state["running"] == true {
@@ -530,7 +542,7 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
                 q.progress_failure["recovery_generation"] = state["generation"].clone();
             }
             q.last_confirmed = json!({"id":id,"generation":state["generation"],"mode":state["mode"],
-                "version":state["spectrum"]["version"],"map_epoch":state["spectrum"]["map_epoch"],
+                "version":state["spectrum"]["version"],"map_epoch":state["spectrum"]["map_epoch"],"run":state["dma_run"],
                 "path":state["spectrum"]["path_confirmation"],"confirmed_arm_ns":q.receipt_ns.to_string()});
         }
     }
@@ -1240,6 +1252,7 @@ fn worker(
     let mut restart: Option<Value> = None;
     let mut retried_id = Value::Null;
     let mut bench_stall = std::env::var_os("OBS_CONTROL_TEST_PROGRESS").is_some_and(|v|v=="1");
+    let bench_stall_after_next = std::env::var_os("OBS_CONTROL_TEST_NEXT_PROGRESS").is_some_and(|v|v=="1");
     while !shared.shutdown.load(Ordering::Acquire) {
         let cmd = {
             let mut q = shared.inbox.lock().unwrap();
@@ -1525,6 +1538,8 @@ fn worker(
         let mut guard_rf = false;
         let mut managed_tx = false;
         let actual = RefCell::new(pending);
+        let applied_next = RefCell::new(None);
+        let stall_sample = RefCell::new(Value::Null);
         let watch = RefCell::new(None);
         let result = (|| {
             let mut setup = config_result?;
@@ -1677,17 +1692,15 @@ fn worker(
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
-            let started = |h: crate::system_reader::Header| {
+            let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
+            let started = |h: crate::system_reader::Header, execution: crate::system_reader::Execution| {
                 trace_control("first_view_arm", ||json!({"id":id,"generation":generation,
                     "epoch":h.epoch,"fft_tick":h.first_tick,"ordinal":h.ordinal}));
                 let mut a = actual.borrow_mut();
-                let version = a["map_version"].clone();
-                let epoch = if scan {
-                    u64::from(regs.read(0x238)) | (u64::from(regs.read(0x23c)) << 32)
-                } else {
-                    h.epoch
-                };
+                let version = json!(execution.version);
+                let epoch = execution.anchor;
                 a["epoch"] = json!(epoch);
+                a["dma_run"] = json!(execution.run);
                 if !a["alternative"].is_null() {
                     a["alternative"]["generation"] = json!(generation);
                     a["alternative"]["first_epoch"] = json!(h.epoch);
@@ -1742,9 +1755,11 @@ fn worker(
                 next_epoch.set(Some(epoch));
                 Some(epoch)
             };
-            let next_started = |h: crate::system_reader::Header, anchor: u64| {
+            let next_started = |h: crate::system_reader::Header, execution: crate::system_reader::Execution| {
                 let request = shared.inbox.lock().unwrap().next_map_request.take();
                 let Some((cmd,received)) = request else {return};
+                let anchor = execution.anchor;
+                *applied_next.borrow_mut() = Some(cmd.clone());
                 let mut a = actual.borrow_mut();
                 let mut s = next_spectrum.as_ref().unwrap().clone();
                 for (key,value) in [("generation",json!(next_gen)),("map_epoch",json!(anchor)),
@@ -1755,6 +1770,7 @@ fn worker(
                 a["generation"]=json!(next_gen);
                 a["map_version"]=s["version"].clone();
                 a["epoch"]=json!(anchor);
+                a["dma_run"]=json!(execution.run);
                 a["scan"]["ranges"]=s["requested_ranges"].clone();
                 a["scan"].as_object_mut().unwrap().remove("next_ranges");
                 a["spectrum"]=s;
@@ -1804,15 +1820,26 @@ fn worker(
             let last_renew = std::cell::Cell::new(Instant::now());
             let q = crate::system_reader::RunControl {
                 generation,
+                version:initial_version,
                 stop: &shared.switch,
                 started: &started,
                 trace: &|stage| trace_control(stage, ||json!({"id":id,"generation":generation})),
                 route: &route_fn,
-                progress: &|sample| shared.inbox.lock().unwrap().progress=sample,
+                progress: &|sample| {
+                    let mut q = shared.inbox.lock().unwrap();
+                    if progress_matches(&sample,&q.actual) {
+                        q.last_progress = sample.clone();
+                        q.progress = sample;
+                    } else {
+                        q.progress = Value::Null;
+                    }
+                },
+                stalled: &|sample| *stall_sample.borrow_mut()=sample,
                 bench_stall: scan && std::mem::take(&mut bench_stall),
+                bench_stall_after_next,
                 sweep: sweep.as_ref(),
-                next: next_sweep.as_ref().map(|s|crate::system_reader::NextView {
-                    generation:next_gen,sweep:s,anchor:&next_anchor,started:&next_started,
+                next: next_sweep.as_ref().zip(next_version).map(|(s,version)|crate::system_reader::NextView {
+                    generation:next_gen,version,sweep:s,anchor:&next_anchor,started:&next_started,
                 }),
                 check: &|| {
                     if let Some(note) = watch
@@ -1879,7 +1906,11 @@ fn worker(
             crate::system_reader::run_controlled(&serde_json::to_vec(&cfg)?, &q)
                 .map_err(|e| anyhow!(e))
         })();
-        trace_control("mode_exit", ||json!({"id":id,"generation":generation,"ok":result.is_ok()}));
+        let applied_next = applied_next.into_inner();
+        let execution_cmd = applied_next.as_ref().unwrap_or(&cmd);
+        let execution_id = &execution_cmd["id"];
+        let execution_generation = actual.borrow()["generation"].clone();
+        trace_control("mode_exit", ||json!({"id":execution_id,"generation":execution_generation,"ok":result.is_ok()}));
         let field_stop = watch
             .into_inner()
             .map_or(Ok(()), |field| field.finish(&regs));
@@ -1887,12 +1918,13 @@ fn worker(
         let stalled = result.as_ref().is_err_and(|e| e.to_string()==crate::system_reader::PROGRESS_LOST);
         if stalled {
             let mut q = shared.inbox.lock().unwrap();
-            if q.progress_failure["id"] == *id {
-                q.progress_failure["repeat_sample"] = q.progress.clone();
+            let sample = stall_sample.into_inner();
+            if q.progress_failure["id"] == *execution_id {
+                q.progress_failure["repeat_sample"] = sample;
                 q.progress_failure["recovery"] = json!("returning");
             } else {
-                q.progress_failure = json!({"id":id,"generation":generation,"primary_error":crate::system_reader::PROGRESS_LOST,
-                    "last_sample":q.progress,"recovery":"returning"});
+                q.progress_failure = json!({"id":execution_id,"generation":sample["generation"],
+                    "primary_error":crate::system_reader::PROGRESS_LOST,"last_sample":sample,"recovery":"returning"});
             }
         }
         let result = if guard_taken {
@@ -1902,6 +1934,7 @@ fn worker(
                 q.phase = if stalled {"recovering"} else {"returning"};
                 q.actual["running"] = json!(false);
                 q.actual["spectrum"] = Value::Null;
+                q.progress = Value::Null;
             }
             let handback = (|| {
                 let s = guard_cmd(&guard_fd, 0x4605)?;
@@ -1924,6 +1957,7 @@ fn worker(
             {
                 let mut q = shared.inbox.lock().unwrap();
                 let mut handback = json!({"us":return_start.elapsed().as_micros() as u64,
+                    "execution_id":execution_id,"generation":execution_generation,
                     "error":handback.as_ref().err().map(|e|format!("{e:#}"))});
                 if q.operation["generation"] == generation {
                     if managed_tx {handback["trace"] = guard_take::return_trace(&guard_fd,&q.operation);}
@@ -1938,11 +1972,11 @@ fn worker(
                         Ok(()) => e.to_string(),
                         Err(original) => format!("{original:#}; guard handback: {e:#}"),
                     };
-                    let mut stopped = before;
+                    let mut stopped = if applied_next.is_some(){actual.borrow().clone()}else{before};
                     stopped["running"] = json!(false);
                     stopped["spectrum"] = Value::Null;
-                    stopped["generation"] = json!(generation);
-                    receipt(&shared, &stopped, id, Some(error.clone()));
+                    stopped["generation"] = execution_generation.clone();
+                    receipt(&shared, &stopped, execution_id, Some(error.clone()));
                     return Err(anyhow!(error));
                 }
             }
@@ -1989,13 +2023,13 @@ fn worker(
                 }
             }
             Err(e) => {
-                state = before;
+                state = if applied_next.is_some(){actual.borrow().clone()}else{before};
                 if op == "scan" || op == "alternative" {
-                    state["failed_plan"] = generated::failure(&actual.borrow()["scan"], &cmd, e.to_string());
+                    state["failed_plan"] = generated::failure(&actual.borrow()["scan"], execution_cmd, e.to_string());
                 }
                 state["running"] = json!(false);
                 state["spectrum"] = Value::Null;
-                state["generation"] = json!(generation);
+                state["generation"] = execution_generation;
                 if carrier.on() {
                     state["tx"] = carrier.off()?;
                     if state["route"]["kind"] == "mixer" {
@@ -2009,11 +2043,44 @@ fn worker(
                     state["tx"]["powerdown"] = json!(1);
                     state["waiting"] = json!("mixer LO off");
                 }
-                receipt(&shared, &state, id, Some(e.to_string()));
+                receipt(&shared, &state, execution_id, Some(e.to_string()));
             }
         }
         drop(radio_lock);
     }
+    Ok(())
+}
+
+/// Probe the actual binary table encoder on ARM without installing a table.
+pub fn check_scan_tx_bank() -> Result<()> {
+    let mut state = json!({"map_version":1,"pl_timing_only":true});
+    let mut tiles = Vec::new();
+    let mut tx = BTreeMap::new();
+    let mut rx = BTreeMap::new();
+    for i in 0..9u8 {
+        let pll = 2_250_000_000 + u64::from(i) * 1_000_000;
+        let lo = 6_100_000_000 + u64::from(i) * 8_000_000;
+        state["scan"] = json!({"ranges":[{"enabled":true,"path":"mixer","lo_hz":lo,"hi_hz":lo+1_000_000}],
+            "mixer":{"pll_range_hz":[pll,pll]}});
+        let tile = generated::core_tiles(&state)?.pop().ok_or_else(|| anyhow!("fixture tile missing"))?;
+        rx.insert(tile.rx,(tile.rx,[i;16]));
+        tx.insert(pll,(pll,[i;16]));
+        tiles.push(tile);
+    }
+    let last = *tx.keys().last().unwrap();
+    let (bytes,descriptors) = generated::encode(&tiles[..8],&rx,&tx.range(..last).map(|(k,v)|(*k,*v)).collect(),
+        [2_400_000_000,2_450_000_000],&state,128)?;
+    let tail = bytes.len()-160;
+    for (i,position) in descriptors["positions"].as_array().unwrap().iter().enumerate() {
+        ensure!(position["tx_slot"]==i && bytes[tail+24+16*i..tail+40+16*i]==[i as u8;16],"TX slot {i}");
+        for page in [40+4096,40+8192] {
+            ensure!((word(&bytes,page+32*i+4)>>8)&7==i as u32,"TX row slot {i}");
+        }
+    }
+    let error = generated::encode(&tiles,&rx,&tx,[2_400_000_000,2_450_000_000],&state,128)
+        .expect_err("nine TX profiles must be rejected").to_string();
+    ensure!(error.contains("9 TX") && error.contains("/8"),"unexpected bank error: {error}");
+    println!("{}",json!({"eight_slots":[0,1,2,3,4,5,6,7],"nine_error":error,"installed":false}));
     Ok(())
 }
 
@@ -2215,6 +2282,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         );
     }
     let shared = Arc::new(Shared {
+        clock_session: format!("{}:{:x}",std::process::id(),clock_ns()),
         inbox: Mutex::new(Inbox {
             phase: if catalog_policy {"accepted"} else {"stopped"},
             next: catalog_policy.then(||json!({"op":"antennas","id":format!("{:032x}",clock_ns()),
@@ -2238,6 +2306,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
                 let mut q = shared.inbox.lock().unwrap_or_else(|e| e.into_inner());
                 q.actual["running"] = json!(false);
                 q.actual["spectrum"] = Value::Null;
+                q.progress = Value::Null;
                 q.phase = "failed";
                 q.take_cancel = None;
                 q.route_pending = Value::Null;

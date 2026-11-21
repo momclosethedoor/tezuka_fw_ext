@@ -16,6 +16,10 @@ pub struct Args {
     /// Interactive OBS row99 owner configuration.
     #[clap(long,conflicts_with_all=["system_observations","continuous_observations","native_observations","system_field_input"])]
     pub system_control: Option<PathBuf>,
+
+    /// Exercise the real scan-bank encoder with a synthetic 8/9-TX fixture.
+    #[clap(long, conflicts_with = "system_control")]
+    pub check_scan_tx_bank: bool,
     /// Offline check of the in-process native field module, without hardware.
     #[clap(long,requires="system_field_output",conflicts_with="system_observations")]
     pub system_field_input: Option<PathBuf>,
@@ -69,6 +73,7 @@ impl Default for Args {
         Args {
             system_observations: None,
             system_control: None,
+            check_scan_tx_bank: false,
             system_field_input: None,
             system_field_output: None,
             continuous_observations: None,

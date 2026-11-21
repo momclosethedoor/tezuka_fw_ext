@@ -15,7 +15,8 @@ type Shared=Arc<Inner>;
 fn guard_ioctl(fd:&File,cmd:libc::c_ulong)->Result<Value>{let mut s=[0u32;128];ensure!(unsafe{libc::ioctl(fd.as_raw_fd(),cmd,s.as_mut_ptr())}==0,"guard ioctl {cmd:x}: {}",std::io::Error::last_os_error());ensure!(unsafe{libc::ioctl(fd.as_raw_fd(),0x4605,s.as_mut_ptr())}==0&&s[2]==0,"guard status/error");Ok(json!({"abi":s[0],"state":s[1],"error":s[2],"control":s[9],"tx_powerdown":s[112]}))}
 async fn status(State(s):State<Shared>)->Json<Value>{Json(json!({"kind":"OBS007A-real8-byte-delivery","running":s.running.load(Ordering::Acquire),"reader":crate::system_reader::status(),"result":s.result.lock().unwrap().clone(),"delivery":s.delivery.lock().unwrap().clone(),"software_video_decoder":false,"tx_authorized":s.tx_authorized}))}
 async fn stop(State(s):State<Shared>)->Json<Value>{s.stop.store(true,Ordering::Release);crate::system_reader::stop();Json(json!({"stop_requested":true}))}
-pub(crate) fn mono()->f64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t)};t.tv_sec as f64+t.tv_nsec as f64*1e-9}
+pub(crate) fn mono_ns()->u64{let mut t=libc::timespec{tv_sec:0,tv_nsec:0};unsafe{libc::clock_gettime(libc::CLOCK_MONOTONIC,&mut t)};t.tv_sec as u64*1_000_000_000+t.tv_nsec as u64}
+pub(crate) fn mono()->f64{mono_ns() as f64*1e-9}
 fn replay(q:Replay,s:Shared,warmup:f64)->Result<Value>{
  ensure!((1..=20).contains(&q.hz)&&(1..=600).contains(&q.count)&&(1..=10).contains(&q.targets),"bounded replay load");
  let bytes=std::fs::read(&q.file)?;let base:Value=serde_json::from_slice(&std::fs::read(&q.metadata)?)?;
