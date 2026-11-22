@@ -1,11 +1,19 @@
 """Short RX-only OBN3 RAM check with the existing Pentium UART rollback."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
 import time
+
+
+def file_digest(stream, algorithm):
+    digest = hashlib.new(algorithm)
+    for block in iter(lambda: stream.read(262144), b""):
+        digest.update(block)
+    return digest
 
 
 def main():
@@ -15,7 +23,10 @@ def main():
     parser.add_argument("--modules", type=Path, required=True)
     parser.add_argument("--reader", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--capture-layout", action="store_true")
     args = parser.parse_args()
+    if not hasattr(hashlib, "file_digest"):
+        hashlib.file_digest = file_digest
     sys.path.insert(0, str(args.stand.resolve()))
     import run_live as stand
 
@@ -50,7 +61,8 @@ def main():
         ]) + b"\n")
     prepare = log / "loader/prepare-r3.sh"
     prepare.write_bytes(prepare.read_bytes().replace(b"0x324E424F", b"0x334E424F")
-                        .replace(b"0x7c4600e4)\" = 0x00000003", b"0x7c4600e4)\" = 0x00000004"))
+                        .replace(b"0x7c4600e4)\" = 0x00000003", b"0x7c4600e4)\" = 0x00000004")
+                        .replace(b"OBS006C_R3_GEOMETRY_VERIFIED", b"OBN3_R4_GEOMETRY_VERIFIED"))
     staged = json.loads((log / "staged.json").read_text())
     for name, path in [("row99.bit.bin", args.image), (loader.name, loader), (prepare.name, prepare)]:
         stand.upload(path, remote, name)
@@ -65,8 +77,9 @@ def main():
         mapping.write_bytes(stand.make_map(profiles, 0, 7700))
         config = log / "reader.json"
         stand.write_json(config, dict(setup=remote + "/map.bin", replay=None, reader=dict(
-            boot_id=boot, output=remote + "/probe", command="rate", k=2, mode=1, scan=True,
-            hot=True, settling=0, seconds=2.0, warmup=.5, batch_limit=64, trace_limit=50000)))
+            boot_id=boot, output=remote + "/probe", command="capture" if args.capture_layout else "rate",
+            k=2, mode=1, scan=True, hot=True, settling=0, seconds=.03 if args.capture_layout else 2.0,
+            warmup=.5, batch_limit=64, trace_limit=50000)))
         for path in (mapping, config):
             stand.upload(path, remote, path.name)
         stand.ssh(f"cd {remote}; mkdir probe; (OBS_PHASE_TIMING=1 timeout 25 ./maia-delivery "
@@ -80,10 +93,29 @@ def main():
             time.sleep(.25)
         else:
             raise RuntimeError("Reader did not report a terminal result")
-        stand.fetch(log, remote + "/probe")
+        if args.capture_layout:
+            for name in ("agent-result.json", "memory.json", "unreleased.json"):
+                content = stand.ssh(f"cat {remote}/probe/{name}")
+                (log / name).write_text(content, encoding="utf-8")
+        else:
+            stand.fetch(log, remote + "/probe")
         status = json.loads(result)
         if "Ok" not in status["reader_outcome"] or status["guard_return"].get("state") != 3:
             raise RuntimeError(f"Reader or RF return failed: {status}")
+        if args.capture_layout:
+            stand.ssh(f"cd {remote}/probe; dd if=full-ring.bin of=full-prefix.bin bs=32768 count=8")
+            stand.transfer(f"root@192.168.2.1:{remote}/probe/full-prefix.bin", str(log / "full-prefix.bin"))
+            records = (log / "full-prefix.bin").read_bytes()
+            observations = []
+            for offset in range(0, len(records) - 64):
+                if records[offset:offset+8] == b"OBN3\x04\x00\x40\x00":
+                    ordinal = int.from_bytes(records[offset+56:offset+64], "little")
+                    pad = records[offset+64:offset+128]
+                    observations.append(dict(offset=offset, ordinal=ordinal,
+                        offset_in_slot=offset%32768, nonzero_padding=sum(x!=0 for x in pad),
+                        first_bytes=records[offset:offset+160].hex()))
+            stand.write_json(log / "layout.json", observations)
+            return
         stats = json.loads((log / "result.json").read_text())
         if not stats["full_read_total"] or stats["after"]["committed"] != stats["after"]["released"]:
             raise RuntimeError("OBN3 decoding or the committed/released balance failed")
