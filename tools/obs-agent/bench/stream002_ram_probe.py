@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--reader", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--capture-layout", action="store_true")
+    parser.add_argument("--view-mode", type=int, choices=range(4), default=1)
+    parser.add_argument("--bench-obn3-layout", action="store_true")
     args = parser.parse_args()
     if not hasattr(hashlib, "file_digest"):
         hashlib.file_digest = file_digest
@@ -78,7 +80,8 @@ def main():
         config = log / "reader.json"
         stand.write_json(config, dict(setup=remote + "/map.bin", replay=None, reader=dict(
             boot_id=boot, output=remote + "/probe", command="capture" if args.capture_layout else "rate",
-            k=2, mode=1, scan=True, hot=True, settling=0, seconds=.03 if args.capture_layout else 2.0,
+            k=2, mode=args.view_mode, scan=True, hot=True, settling=0, seconds=.03 if args.capture_layout else 2.0,
+            bench_obn3_layout=args.bench_obn3_layout,
             warmup=.5, batch_limit=64, trace_limit=50000)))
         for path in (mapping, config):
             stand.upload(path, remote, path.name)
@@ -103,15 +106,20 @@ def main():
         if "Ok" not in status["reader_outcome"] or status["guard_return"].get("state") != 3:
             raise RuntimeError(f"Reader or RF return failed: {status}")
         if args.capture_layout:
-            stand.ssh(f"cd {remote}/probe; dd if=full-ring.bin of=full-prefix.bin bs=32768 count=8")
-            stand.transfer(f"root@192.168.2.1:{remote}/probe/full-prefix.bin", str(log / "full-prefix.bin"))
-            records = (log / "full-prefix.bin").read_bytes()
+            stand.ssh(f"cd {remote}/probe; set -e; dd if=full-ring.bin of=full-prefix.bin bs=32768 count=8; "
+                      "dd if=full-ring.bin of=full-last.bin bs=32768 skip=1023 count=1; "
+                      "dd if=view-ring.bin of=view-prefix.bin bs=2048 count=8; "
+                      "dd if=view-ring.bin of=view-last.bin bs=2048 skip=1023 count=1")
+            for name in ("full-prefix.bin", "full-last.bin", "view-prefix.bin", "view-last.bin"):
+                stand.transfer(f"root@192.168.2.1:{remote}/probe/{name}", str(log / name))
+            records = (log / "full-prefix.bin").read_bytes() + (log / "full-last.bin").read_bytes()
             observations = []
             for offset in range(0, len(records) - 64):
                 if records[offset:offset+8] == b"OBN3\x04\x00\x40\x00":
                     ordinal = int.from_bytes(records[offset+56:offset+64], "little")
                     pad = records[offset+64:offset+128]
-                    observations.append(dict(offset=offset, ordinal=ordinal,
+                    slot=offset//32768
+                    observations.append(dict(slot=1023 if slot==8 else slot, ordinal=ordinal,
                         offset_in_slot=offset%32768, nonzero_padding=sum(x!=0 for x in pad),
                         first_bytes=records[offset:offset+160].hex()))
             stand.write_json(log / "layout.json", observations)

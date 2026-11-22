@@ -1,6 +1,6 @@
 //! GVIEW4 frames retain their original encoding. GSWEEP1 is an independent
 //! UDP completion record for one executed pass.
-use super::{Header, R, UdpBatch, Value};
+use super::{Header, R, UdpBatch};
 use std::net::UdpSocket;
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -15,48 +15,102 @@ pub(crate) struct SweepSpec {
     mode: Mode,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[derive(Debug, PartialEq)]
+    struct Closed(u64, u64, u64, Vec<u64>, bool);
+
+    fn replay(versions: &[(u64,u64)], epochs: &[u64], final_epoch: u64) -> Vec<Closed> {
+        let receiver=UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let sender=UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.connect(receiver.local_addr().unwrap()).unwrap();
+        let mut network=UdpBatch::configured(0,false,1,576);
+        let specs=versions.iter().map(|&(version,_)|
+            SweepSpec::from_layout(version,vec![Some(0),Some(0),Some(1),Some(1)],"pass").unwrap())
+            .collect::<Vec<_>>();
+        let mut index=0;
+        let mut notes=0;
+        let mut delivery=Delivery::new(&specs[index],versions[index].1,1,&mut network).unwrap();
+        for (ordinal,&epoch) in epochs.iter().enumerate() {
+            if versions.get(index+1).is_some_and(|&(_,anchor)|epoch>=anchor) {
+                delivery.finish(&mut network,&sender,true);
+                notes+=delivery.notes_sent;
+                index+=1;
+                delivery=Delivery::new(&specs[index],versions[index].1,2,&mut network).unwrap();
+            }
+            delivery.accept(Header{first_seq:ordinal as u64*2,last_seq:ordinal as u64*2+1,
+                ordinal:ordinal as u64,epoch,first_tick:epoch*100,k:2,flags:9},&[0;512],&mut network,&sender);
+        }
+        delivery.finish_drained(&mut network,&sender,final_epoch);
+        notes+=delivery.notes_sent;
+        assert_eq!(network.sent,epochs.len() as u64);
+        assert_eq!((network.pending,network.suppressed),(0,0));
+        let mut result=Vec::new();
+        let mut ordinals=Vec::new();
+        let mut bytes=[0;576];
+        while result.len()<notes as usize {
+            let n=receiver.recv(&mut bytes).unwrap();
+            let word=|at: usize|u64::from_le_bytes(bytes[at..at+8].try_into().unwrap());
+            if n==112 && &bytes[..8]==b"GSWEEP1\0" {
+                result.push(Closed(word(16),word(32)/2,word(40),std::mem::take(&mut ordinals),word(104)&1==1));
+            } else {
+                assert_eq!((n,&bytes[..8]),(576,&b"GVIEW4\0\0"[..]));
+                ordinals.push(word(8));
+            }
+        }
+        assert!(ordinals.is_empty());
+        result
+    }
+
+    #[test]
+    fn replays_the_four_pass_publication_vectors() {
+        // Commit epochs from PL-SCAN-STREAM-002/evidence/pass-publication-vectors.json.
+        // Recall alone changes no publication state.
+        assert_eq!(replay(&[(11,1)],&[1,2,2,2,3,4,4,5],5),[
+            Closed(11,0,0,vec![0,1,2,3],true),Closed(11,0,1,vec![4,5,6],true),
+            Closed(11,1,0,vec![7],false)]);
+        assert_eq!(replay(&[(21,100),(22,104)],&[100,101,102,103,103,104,105,105],105),[
+            Closed(21,0,0,vec![0,1],true),Closed(21,0,1,vec![2,3,4],true),
+            Closed(22,0,0,vec![5,6,7],true)]);
+        assert_eq!(replay(&[(31,300)],&[300,300],300),[Closed(31,0,0,vec![0,1],false)]);
+        assert!(replay(&[(34,1)],&[],0).is_empty());
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode { Stream, Pass }
 
 impl SweepSpec {
-    pub(crate) fn from_descriptor(desc: &Value, mode: &str) -> R<Option<Self>> {
-        if desc["sweep_wire_version"] != 1 {return Ok(None);}
+    pub(super) fn from_layout(version: u64, positions: Vec<Option<usize>>, mode: &str) -> R<Self> {
         let mode = match mode {
             "stream" => Mode::Stream,
             "pass" => Mode::Pass,
             _ => return Err("view delivery must be stream or pass".into()),
         };
-        let rows = desc["positions"].as_array().ok_or("sweep map positions")?;
         let mut first = [usize::MAX;2];
         let mut last = [0;2];
         let mut count = [0;2];
-        let mut positions = Vec::with_capacity(rows.len());
-        for (i,row) in rows.iter().enumerate() {
-            if row["transition_only"] == true {
-                positions.push(None);
-                continue;
-            }
-            let phase = match row["sweep_phase"].as_str() {
-                Some("A") => 0,
-                Some("B") => 1,
-                _ => return Err("missing sweep phase".into()),
-            };
+        for (i,row) in positions.iter().enumerate() {
+            let Some(phase) = *row else {continue};
+            if phase > 1 {return Err("invalid sweep phase".into());}
             first[phase] = first[phase].min(i);
             last[phase] = i;
             count[phase] += 1;
-            positions.push(Some(phase));
         }
         if count.contains(&0) || last[0] >= first[1] {
             return Err("invalid A/B boundary".into());
         }
-        let version = desc["version"].as_u64().ok_or("missing sweep map version")?;
         let mut next = 2;
         let mut route_to = vec![0;positions.len()];
         for (i,phase) in positions.iter().enumerate().rev() {
             if let Some(p) = phase {next=*p;}
             route_to[i]=next;
         }
-        Ok(Some(Self {version,positions,route_to,first,last,count,mode}))
+        Ok(Self {version,positions,route_to,first,last,count,mode})
     }
 }
 

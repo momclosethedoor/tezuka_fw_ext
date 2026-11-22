@@ -46,6 +46,8 @@ struct Config {
     #[serde(default)]
     bench_split544: bool,
     #[serde(default)]
+    bench_obn3_layout: bool,
+    #[serde(default)]
     setup: PathBuf,
     output: PathBuf,
     view: SocketAddr,
@@ -1936,7 +1938,7 @@ fn worker(
             let k = actual.borrow()["k"].clone();
             let mode_index = view_mode(&actual.borrow()[&mode])?;
             let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":mode_index,
-                "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
+                "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
@@ -2471,6 +2473,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "row99 CAP2 and compatible spectral ABI required"
     );
     ensure!(!stream002 || !c.bench_split544, "OBN3 requires separate DMA regions");
+    ensure!(stream002 || !c.bench_obn3_layout,"OBN3 RAM layout requires OBN3");
     ensure!(!stream002 || c.field_preview.is_none(), "legacy FIELD1 collector requires OBN2");
     ensure!(stream002 || c.resident_field.is_none(), "resident FIELD collector requires OBN3/FLD2/FFM1");
     ensure!(stream002 || c.bench_roi.is_none(),"bench ROI requires OBN3");
@@ -2556,7 +2559,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
-    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":stream002,"ring_layout":if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
+    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":stream002,"ring_layout":if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
@@ -2648,6 +2651,7 @@ mod tests {
         };
         let c = Config {
             bench_split544: false,
+            bench_obn3_layout: false,
             boot_id: String::new(),
             setup: "setup".into(),
             output: "out".into(),

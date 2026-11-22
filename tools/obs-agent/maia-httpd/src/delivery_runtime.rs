@@ -40,8 +40,9 @@ pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  let c:Config=serde_json::from_slice(&std::fs::read(path)?)?;
  let capture=c.reader["command"]=="capture";
  let view_mode=c.reader["mode"].as_u64();
+ let bounded_obn3=c.reader["bench_obn3_layout"]==true || c.reader["stream_config"].is_number();
  ensure!(c.reader["hot"]==true&&c.reader["scan"]==true&&c.reader["k"]==2&&
-        (view_mode==Some(1)||capture&&matches!(view_mode,Some(2|3))),
+        (view_mode==Some(1)||capture&&matches!(view_mode,Some(2|3))||bounded_obn3&&matches!(view_mode,Some(0|2|3))),
         "guarded K2 VIEW512, or offline reference capture in VIEW1024/2048");
  ensure!(std::fs::read_to_string("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()=="1","TX must be off");
  ensure!(c.reader["boot_id"].as_str()==Some(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()),"boot mismatch");

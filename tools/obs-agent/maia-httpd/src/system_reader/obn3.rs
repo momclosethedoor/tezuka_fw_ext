@@ -85,35 +85,38 @@ impl Format {
             return Err("OBN3 decode length".into());
         }
         let count = if header.peak() { 1 } else { u64::from(header.k) };
-        let max_mantissa = count << 35;
         let scale = 1.0 / (750668.0_f64 * 750668.0 * count as f64);
         let mut factors = [0.0; 5];
         for (exponent, factor) in factors.iter_mut().enumerate() {
             *factor = scale * (1u32 << (2 * exponent)) as f64;
         }
-        let (bytes, width, mantissa_bits) = match self {
-            Self::Compact => (&slot[128..], 6, 45),
-            Self::Native => (slot, 8, 47),
-        };
-        for (index, (bin, bytes)) in power.iter_mut().zip(bytes.chunks_exact(width)).enumerate() {
-            let lo = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-            let hi = match self {
-                Self::Compact => u32::from(u16::from_le_bytes(bytes[4..6].try_into().unwrap())),
-                Self::Native => u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            };
-            if self == Self::Native && (hi & 0x00fc0000 != 0 || index >= 64 && hi >> 24 != 0) {
-                return Err("OBN3 native reserved bin bits".into());
-            }
-            let exponent = ((hi >> (mantissa_bits - 32)) & 7) as usize;
-            let mantissa = u64::from(lo) | (u64::from(hi & ((1 << (mantissa_bits - 32)) - 1)) << 32);
-            let factor = factors.get(exponent).ok_or("OBN3 invalid bin exponent")?;
-            if mantissa > max_mantissa {
-                return Err("OBN3 bin exceeds accumulator bound".into());
-            }
-            *bin = (mantissa as f64 * factor) as f32;
+        match self {
+            Self::Compact => decode_bins::<6,13>(&slot[128..],power,(count as u32)<<3,&factors),
+            Self::Native => decode_bins::<8,15>(slot,power,(count as u32)<<3,&factors),
         }
-        Ok(())
     }
+}
+
+fn decode_bins<const WIDTH: usize, const MANTISSA_HIGH_BITS: u32>(
+    bytes: &[u8], power: &mut [f32], maximum_high: u32, factors: &[f64;5],
+) -> Result<(), String> {
+    for (index, (bin, word)) in power.iter_mut().zip(bytes.chunks_exact(WIDTH)).enumerate() {
+        let low=u32::from_le_bytes(word[..4].try_into().unwrap());
+        let high=if WIDTH==6 {u32::from(u16::from_le_bytes(word[4..6].try_into().unwrap()))}
+            else {u32::from_le_bytes(word[4..8].try_into().unwrap())};
+        if WIDTH==8 && (high & 0x00fc0000 != 0 || index >= 64 && high >> 24 != 0) {
+            return Err("OBN3 native reserved bin bits".into());
+        }
+        let exponent=((high>>MANTISSA_HIGH_BITS)&7) as usize;
+        let mantissa_high=high&((1<<MANTISSA_HIGH_BITS)-1);
+        if mantissa_high>maximum_high || mantissa_high==maximum_high && low!=0 {
+            return Err("OBN3 bin exceeds accumulator bound".into());
+        }
+        let factor=factors.get(exponent).ok_or("OBN3 invalid bin exponent")?;
+        // Both limbs and their sum are exact in f64. A9 converts u32 directly.
+        *bin=((f64::from(mantissa_high)*4_294_967_296.0+f64::from(low))*factor) as f32;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
