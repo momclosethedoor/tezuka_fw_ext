@@ -11,8 +11,10 @@ use std::{
 };
 
 const CAPACITY: usize = 16;
-const FRAME_LIMIT: usize = 128 + obn3::COMPACT_BYTES;
 const MAX_RANGES: usize = 12;
+const RANGE_WIRE_BYTES: usize = 4;
+const PACKED_ROI_HEADER: usize = 92;
+const FRAME_LIMIT: usize = PACKED_ROI_HEADER + MAX_RANGES * RANGE_WIRE_BYTES + obn3::COMPACT_BYTES;
 const IO_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
@@ -48,9 +50,9 @@ impl Map {
         Ok(Self{version,generation,rows:visits})
     }
 
-    fn select(&mut self, request: Request) -> R<()> {
+    fn select(&mut self, request: Request, source_bins: u16) -> R<()> {
         for row in self.rows.iter_mut().flatten() {
-            row.bins=roi::bin_ranges(request.center_hz,row.center_hz,row.side,&row.usable)
+            row.bins=roi::bin_ranges(request.range,row.center_hz,row.side,&row.usable,source_bins)
                 .filter(|bins| bins.len()<=MAX_RANGES).ok_or("ROI bin selection bounds")?;
         }
         Ok(())
@@ -67,6 +69,8 @@ struct Packet {
 
 pub(super) struct Stream {
     full_scan: bool,
+    configured_view_bins: u16,
+    source_bins: u16,
     request: Option<Request>,
     initial: Map,
     next: Option<Map>,
@@ -93,10 +97,12 @@ pub(super) struct Stream {
 }
 
 impl Stream {
-    pub(super) fn open(peer: SocketAddr, initial: Map, next: Option<Map>, full_scan: bool) -> R<Self> {
+    pub(super) fn open(peer: SocketAddr, initial: Map, next: Option<Map>,
+                       full_scan: bool, configured_view_bins: u16) -> R<Self> {
         let socket=TcpStream::connect_timeout(&peer,IO_DEADLINE).map_err(|e|e.to_string())?;
         socket.set_nonblocking(true).map_err(|e|e.to_string())?;
-        Ok(Self{full_scan,request:None,initial,next,socket:Some(socket),
+        Ok(Self{full_scan,configured_view_bins,source_bins:roi::FFT_BINS as u16,
+            request:None,initial,next,socket:Some(socket),
             free:(0..CAPACITY).map(|_|Vec::with_capacity(FRAME_LIMIT)).collect(),
             pending:VecDeque::with_capacity(CAPACITY),selected:0,selected_bins:0,prepared:0,
             sent:0,sent_bins:0,sent_bytes:0,accepted_bytes:0,rejected:0,abandoned:0,partial:0,
@@ -106,16 +112,25 @@ impl Stream {
 
     pub(super) fn update(&mut self, request: Option<Request>) -> R<()> {
         if request!=self.request {
-            if let Some(request)=request {
-                self.initial.select(request)?;
-                if let Some(next)=self.next.as_mut() { next.select(request)?; }
+            // Full-record legacy requests are retained for VIEW-OFF bench comparisons.
+            self.request=request.filter(|r| !r.legacy_full_record || self.configured_view_bins==0);
+            if let Some(request)=self.request {
+                self.source_bins=if request.view_bins==self.configured_view_bins {
+                    self.configured_view_bins
+                } else { roi::FFT_BINS as u16 };
+                self.initial.select(request,self.source_bins)?;
+                if let Some(next)=self.next.as_mut() { next.select(request,self.source_bins)?; }
             }
-            self.request=request;
         }
         Ok(())
     }
 
-    pub(super) fn prepare(&mut self, h: Header, raw: &[u8], anchor: u64, next_anchor: Option<u64>) -> R<()> {
+    pub(super) fn filters_view(&self) -> bool {
+        self.request.is_some_and(|request| !request.legacy_full_record)
+    }
+
+    pub(super) fn prepare(&mut self, h: Header, raw: &[u8], view: &[u8],
+                          anchor: u64, next_anchor: Option<u64>) -> R<()> {
         if !self.full_scan && self.request.is_none() {return Ok(());}
         let (map,anchor)=match (self.next.as_ref(),next_anchor) {
             (Some(next),Some(start)) if h.epoch>=start => (next,start),
@@ -138,20 +153,48 @@ impl Stream {
         if self.socket.is_none() {self.rejected+=1;return Ok(());}
         let Some(mut frame)=self.free.pop() else { self.rejected+=1;return Ok(()); };
         frame.clear();
-        frame.extend_from_slice(b"GROI1\0\0\0");
-        frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        let (payload, word_bytes)=if self.source_bins==roi::FFT_BINS as u16 {
+            (&raw[obn3::COMPACT_PREFIX_BYTES..],obn3::M45E3_WORD_BYTES)
+        } else { (view,1) };
+        if payload.len()!=usize::from(self.source_bins)*word_bytes {
+            return Err("ROI source payload differs from its bin grid".into());
+        }
+        let wire_bytes=if request.legacy_full_record {
+            frame.extend_from_slice(b"GROI1\0\0\0");
+            raw.len()
+        } else {
+            frame.extend_from_slice(b"GROI2\0\0\0");
+            bins as usize*word_bytes
+        };
+        frame.extend_from_slice(&(wire_bytes as u32).to_le_bytes());
         frame.extend_from_slice(&(row.bins.len() as u16).to_le_bytes());
         frame.push(row.phase);
         frame.push(row.side as i8 as u8);
         for value in [request.generation,u64::from(map.version),map.generation,
-            anchor,position,relative/map.rows.len() as u64,row.center_hz as u64,request.center_hz as u64] {
+            anchor,position,relative/map.rows.len() as u64,row.center_hz as u64] {
             frame.extend_from_slice(&value.to_le_bytes());
+        }
+        let [low,high]=request.range;
+        if request.legacy_full_record {
+            frame.extend_from_slice(&((low+(high-low)/2) as u64).to_le_bytes());
+        } else {
+            frame.extend_from_slice(&low.to_le_bytes());
+            frame.extend_from_slice(&high.to_le_bytes());
+            frame.extend_from_slice(&self.source_bins.to_le_bytes());
+            frame.extend_from_slice(&request.view_bins.to_le_bytes());
         }
         for range in &row.bins {
             frame.extend_from_slice(&range.start.to_le_bytes());
             frame.extend_from_slice(&range.end.to_le_bytes());
         }
-        frame.extend_from_slice(raw);
+        if request.legacy_full_record {
+            frame.extend_from_slice(raw);
+        } else {
+            frame.extend_from_slice(&raw[..obn3::COMPACT_PREFIX_BYTES]);
+            for range in &row.bins {
+                frame.extend_from_slice(&payload[usize::from(range.start)*word_bytes..usize::from(range.end)*word_bytes]);
+            }
+        }
         self.enqueue(frame,bins);
         Ok(())
     }

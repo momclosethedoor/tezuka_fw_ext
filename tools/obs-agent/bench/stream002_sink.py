@@ -8,11 +8,13 @@ from pathlib import Path
 
 
 ROI = struct.Struct("<8sIHbb8Q")
+ROI_RANGE = struct.Struct("<QHH")
 COMPACT = struct.Struct("<8s7Q")
 OBN3 = struct.Struct("<IHHQQQIIIIIIQ")
 FIELD = struct.Struct("<4sII")
 BIN_HZ = 15_000
 COMPACT_BYTES = 24_704
+COMPACT_PREFIX_BYTES = 128
 
 
 def exact(conn, size, eof=False):
@@ -49,27 +51,46 @@ def compact_frame(conn, header):
 
 
 def roi_frame(conn, header):
-    magic, size, count, phase, side, generation, version, map_gen, anchor, position, turn, profile, center = (
+    magic, size, count, phase, side, generation, version, map_gen, anchor, position, turn, profile, center_or_low = (
         ROI.unpack(header))
-    if (magic != b"GROI1\x00\x00\x00" or size != COMPACT_BYTES or not 1 <= count <= 12 or
+    if (magic not in (b"GROI1\x00\x00\x00", b"GROI2\x00\x00\x00") or not 1 <= count <= 12 or
             phase not in (0, 1) or side not in (-1, 1) or min(generation, version, map_gen, anchor) == 0):
         raise ValueError("invalid ROI frame metadata")
+    packed = magic == b"GROI2\x00\x00\x00"
+    if packed:
+        high, source_bins, display_bins = ROI_RANGE.unpack(exact(conn, ROI_RANGE.size))
+        low = center_or_low
+        if (not low < high or source_bins not in (512, 1024, 2048, 4096) or
+                display_bins not in (512, 1024, 2048, 4096)):
+            raise ValueError("invalid ROI grids")
+    else:
+        if size != COMPACT_BYTES:
+            raise ValueError("invalid full ROI record length")
+        low, high = center_or_low - 28_000_000, center_or_low + 28_000_000
+        source_bins = 4096
     ranges = tuple(struct.iter_unpack("<HH", exact(conn, 4 * count)))
-    ordinal, _, epoch, _, _, _ = compact_header(exact(conn,size))
+    prefix_bytes = COMPACT_PREFIX_BYTES if packed else size
+    ordinal, _, epoch, _, _, _ = compact_header(exact(conn,prefix_bytes))
     if epoch<anchor:
         raise ValueError("ROI observation precedes map anchor")
     selected = 0
     prev = 0
     for lo, hi in ranges:
-        if not prev <= lo < hi <= 4096:
+        if not prev <= lo < hi <= source_bins:
             raise ValueError("invalid or overlapping ROI intervals")
-        for index in (lo, hi-1):
+        stride = 4096 // source_bins
+        for index in (lo * stride, hi * stride - 1):
             hz = profile + side * (index - 2048) * BIN_HZ
-            if not center - 28_000_000 <= hz < center + 28_000_000:
-                raise ValueError("bin outside 56 MHz window")
+            if not low <= hz < high:
+                raise ValueError("bin outside the requested RF range")
         selected += hi-lo
         prev = hi
-    return ordinal, selected, ROI.size + 4 * count + size
+    if packed:
+        if size != selected * (6 if source_bins == 4096 else 1):
+            raise ValueError("packed ROI payload length differs from its intervals")
+        exact(conn,size)
+    return ordinal, selected, ROI.size + 4 * count + size + (
+        ROI_RANGE.size + COMPACT_PREFIX_BYTES if packed else 0)
 
 
 def field_frame(conn, header):

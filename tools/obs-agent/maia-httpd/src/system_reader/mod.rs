@@ -13,8 +13,14 @@ mod roi_stream;
 mod timing;
 #[cfg(feature="scan-stream-bench")]
 pub(crate) use roi_stream::Map as RoiMap;
+pub(crate) const LEGACY_ROI_WIDTH_HZ:i64=56_000_000;
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RoiRequest {pub center_hz:i64,pub generation:u64}
+pub(crate) struct RoiRequest {
+ pub range:[i64;2],
+ pub view_bins:u16,
+ pub generation:u64,
+ pub legacy_full_record:bool,
+}
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
 use view_batch::UdpBatch;
@@ -528,8 +534,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let roi_control=control.and_then(|q|q.roi.as_ref());
  #[cfg(feature="scan-stream-bench")]
  let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
-  if !c.scan || !stream002 || c.mode != 0 { return Err("compact TCP requires an active OBN3 scan with VIEW OFF".into()); }
-  let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),config.full_scan)?;
+  if !c.scan || !stream002 || (config.full_scan && c.mode != 0) {
+   return Err("ROI requires an active OBN3 scan; full compact TCP requires VIEW OFF".into());
+  }
+  let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),
+   config.full_scan,[0,512,1024,2048][c.mode as usize])?;
   stream.update((config.request)())?;
   Some(stream)
  }else{None});
@@ -589,7 +598,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut sink=|h:Header,overview:&[u8],_owned_full:&[u8]|->R<()>{
   #[cfg(feature="scan-stream-bench")]
   if let Some(zoom)=zoom.borrow_mut().as_mut(){
-   zoom.prepare(h,_owned_full,initial_anchor,control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)()))?;
+   zoom.prepare(h,_owned_full,overview,initial_anchor,control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)()))?;
    zoom.pump();
   }
   if let Some(q)=control {
@@ -612,6 +621,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     execution.set(Some(e));
     (next.started)(h,e);
    }
+  #[cfg(feature="scan-stream-bench")]
+  let overview=if zoom.borrow().as_ref().is_some_and(roi_stream::Stream::filters_view){
+   if !overview.is_empty(){network.borrow_mut().suppressed+=1;}
+   &[][..]
+  }else{overview};
   if let Some(sock)=&socket{
    if control.is_none() && !overview.is_empty() && overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
@@ -632,7 +646,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
    #[cfg(feature="scan-stream-bench")]
-   if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){zoom.update((config.request)())?;}
+   if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){
+    let filtering=zoom.filters_view();
+    zoom.update((config.request)())?;
+    if !filtering && zoom.filters_view(){network.borrow_mut().suppress_pending();}
+   }
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
    if let Some(q)=control {
     let map=c.scan.then(||io.map_stamp());

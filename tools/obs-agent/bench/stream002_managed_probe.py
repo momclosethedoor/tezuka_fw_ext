@@ -155,14 +155,16 @@ test "$(devmem 0x7c460284)" = 0x00000000
         stand.ssh(f"chmod 700 {remote}/obs-ffm1-iio")
         control["resident_field"]=dict(collector=remote+"/obs-ffm1-iio",timeout_ms=FIELD_TIMEOUT_MS)
     roi_center=getattr(args,"roi_center_hz",None)
+    roi_range=getattr(args,"roi_range_hz",None)
     full=getattr(args,"full_compact_tcp",False)
-    if full or roi_center is not None:
+    roi_enabled=full or roi_center is not None or roi_range is not None
+    if roi_enabled:
         control["bench_roi"]=f"{HOST}:{ROI_PORT}"
         control["bench_full_compact_tcp"]=full
     stand.write_json(config,control)
     stand.upload(config, remote, config.name)
     receiver = BenchReceiver(log)
-    roi_process = launch_roi(log,full) if full or roi_center is not None else None
+    roi_process = launch_roi(log,full) if roi_enabled else None
     halted, ready = threading.Event(), threading.Event()
     lease = threading.Thread(target=lease_loop, args=(halted, ready, log, threading.Event()), daemon=True)
     lease.start()
@@ -211,6 +213,9 @@ test "$(devmem 0x7c460284)" = 0x00000000
             stand.write_json(log / f"{label}-descriptor.json", active["spectrum"])
             if roi_center is not None:
                 probe.request(dict(op="roi",id=uuid.uuid4().hex,center_hz=roi_center))
+            elif roi_range is not None:
+                probe.request(dict(op="roi",id=uuid.uuid4().hex,lo_hz=roi_range[0],hi_hz=roi_range[1],
+                                   view_bins=args.roi_view_bins))
             time.sleep(1)
             generation = active["generation"]
             start = time.monotonic()

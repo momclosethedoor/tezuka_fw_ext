@@ -33,16 +33,21 @@ def main():
     parser.add_argument("--field-counts", type=int, nargs="+", choices=(0, 1, 3, 5, 10), default=(0,))
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--roi-center-hz", type=int)
+    parser.add_argument("--roi-range-hz", type=int, nargs=2, metavar=("LOW", "HIGH"))
+    parser.add_argument("--roi-view-bins", type=int, choices=(512, 1024, 2048, 4096), default=4096)
     parser.add_argument("--full-compact-tcp", action="store_true")
     parser.add_argument("--gate-transmitter", action="store_true",
                         help="pause before FIELD windows for the operator's ready signal")
     parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
     args = parser.parse_args()
     compact_tcp = args.full_compact_tcp or args.roi_center_hz is not None
-    if args.full_compact_tcp and args.roi_center_hz is not None:
-        parser.error("choose full compact TCP or a 56 MHz ROI")
+    if sum((args.full_compact_tcp, args.roi_center_hz is not None, args.roi_range_hz is not None)) > 1:
+        parser.error("choose one of full compact TCP, legacy ROI or packed ROI")
     if compact_tcp and (not args.managed or args.regression or any(args.widths)):
         parser.error("compact TCP requires a managed scan with VIEW OFF")
+    if args.roi_range_hz and (not args.managed or args.regression or
+                              not 70_000_000 <= args.roi_range_hz[0] < args.roi_range_hz[1] <= 13_000_000_000):
+        parser.error("packed ROI requires a managed scan and increasing RF limits")
     if not hasattr(hashlib, "file_digest"):
         hashlib.file_digest = file_digest
     sys.path.insert(0, str(args.stand.resolve()))

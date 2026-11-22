@@ -280,7 +280,29 @@ fn view_mode(settings: &Value) -> Result<u32> {
     }
 }
 
+fn roi_request(cmd:&Value,generation:u64)->Result<Option<crate::system_reader::RoiRequest>> {
+    use crate::system_reader::{LEGACY_ROI_WIDTH_HZ,RoiRequest};
+    let ranged=cmd.get("lo_hz").is_some()||cmd.get("hi_hz").is_some()||cmd.get("view_bins").is_some();
+    if ranged {
+        ensure!(cmd["center_hz"].is_null(),"specify ROI limits or a legacy center");
+        let low=int(cmd,"lo_hz",70_000_000,plan_math::MAX_RF)? as i64;
+        let high=int(cmd,"hi_hz",70_000_000,plan_math::MAX_RF)? as i64;
+        ensure!(low<high,"ROI limits must be increasing");
+        let view_bins=cmd["view_bins"].as_u64().filter(|n|matches!(*n,512|1024|2048|4096))
+            .ok_or_else(||anyhow!("ROI view_bins must be 512, 1024, 2048 or 4096"))? as u16;
+        return Ok(Some(RoiRequest{range:[low,high],view_bins,generation,legacy_full_record:false}));
+    }
+    if cmd["center_hz"].is_null(){return Ok(None);}
+    let center=int(cmd,"center_hz",70_000_000,plan_math::MAX_RF)? as i64;
+    let half=LEGACY_ROI_WIDTH_HZ/2;
+    Ok(Some(RoiRequest{range:[center-half,center+half],view_bins:4096,generation,legacy_full_record:true}))
+}
+
 fn validate(v: &Value) -> Result<()> {
+    if v["op"]=="roi" {
+        roi_request(v,0)?;
+        return Ok(());
+    }
     if v.get("field_targets").is_some() {
         ensure!(v["op"] == "scan" && v["planner_version"] == 2, "field_targets requires v2 scan");
         resident_field::targets(&v["field_targets"])?;
@@ -288,10 +310,6 @@ fn validate(v: &Value) -> Result<()> {
     if v.get("view_bins").is_some() {
         ensure!(matches!(v["op"].as_str(), Some("scan" | "analysis")), "view_bins requires scan or analysis");
         view_mode(v)?;
-    }
-    if v["op"]=="roi" {
-        if !v["center_hz"].is_null() { int(v,"center_hz",70_000_000,plan_math::MAX_RF)?; }
-        return Ok(());
     }
     match v["op"].as_str() {
         Some("scan") => {
@@ -429,7 +447,8 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
         "arm_now_ns":clock_ns().to_string(),"boot_id":q.actual["boot"],"clock_session":shared.clock_session,
         "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,
         "operation":q.operation,"progress":q.progress,"last_progress":q.last_progress,"progress_failure":q.progress_failure,
-        "roi":{"id":q.roi_id,"generation":q.roi_generation,"center_hz":q.roi.map(|r|r.center_hz)},
+        "roi":{"id":q.roi_id,"generation":q.roi_generation,"center_hz":q.roi.map(|r|r.range[0]+(r.range[1]-r.range[0])/2),
+               "range_hz":q.roi.map(|r|r.range),"view_bins":q.roi.map(|r|r.view_bins)},
         "last_confirmed":q.last_confirmed,"worker_error":q.worker_error,
         "metrics":{"owner":q.metrics,"reader":reader}}),
     )
@@ -457,13 +476,19 @@ async fn submit(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
     }
     if cmd["op"]=="roi" {
-        if !cfg!(feature="scan-stream-bench") || q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true || q.actual["view_bins"]!=0 {
-            return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan with VIEW OFF required"})));
+        if !cfg!(feature="scan-stream-bench") || q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true {
+            return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan required"})));
         }
         if q.roi_id != *id {
-            q.roi_generation+=1;
-            let generation=q.roi_generation;
-            q.roi=cmd["center_hz"].as_i64().map(|center_hz|crate::system_reader::RoiRequest{center_hz,generation});
+            let generation=q.roi_generation+1;
+            let Ok(request)=roi_request(&cmd,generation) else {
+                return (StatusCode::BAD_REQUEST,Json(json!({"error":"invalid ROI configuration"})));
+            };
+            if q.actual["view_bins"]!=0 && request.is_some_and(|r|r.legacy_full_record) {
+                return (StatusCode::CONFLICT,Json(json!({"error":"full-record ROI requires VIEW OFF"})));
+            }
+            q.roi_generation=generation;
+            q.roi=request;
             q.roi_id=id.clone();
         }
         return (StatusCode::ACCEPTED,Json(json!({"accepted_id":id,"roi_generation":q.roi_generation})));
@@ -2075,7 +2100,7 @@ fn worker(
             #[cfg(feature="scan-stream-bench")]
             let roi_request=||shared.inbox.lock().unwrap().roi;
             #[cfg(feature="scan-stream-bench")]
-            let roi=if let Some(peer)=c.bench_roi.filter(|_| scan && mode_index == 0) {
+            let roi=if let Some(peer)=c.bench_roi.filter(|_| scan && (!c.bench_full_compact_tcp || mode_index == 0)) {
                 let a=actual.borrow();
                 let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
                     .map_err(anyhow::Error::msg)?;

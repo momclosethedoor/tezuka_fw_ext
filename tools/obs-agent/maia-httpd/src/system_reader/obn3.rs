@@ -2,7 +2,9 @@
 use super::continuous::{BINS, BYTES, Header, TICK_HZ};
 
 pub const ID: u32 = 0x334e424f;
-pub const COMPACT_BYTES: usize = 128 + 6 * BINS;
+pub const COMPACT_PREFIX_BYTES: usize = 128;
+pub const M45E3_WORD_BYTES: usize = 6;
+pub const COMPACT_BYTES: usize = COMPACT_PREFIX_BYTES + M45E3_WORD_BYTES * BINS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -29,7 +31,7 @@ impl Format {
     pub fn prefix_bytes(self) -> usize {
         match self {
             Self::Native => 512,
-            Self::Compact => 128,
+            Self::Compact => COMPACT_PREFIX_BYTES,
         }
     }
 

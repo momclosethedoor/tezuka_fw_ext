@@ -40,6 +40,11 @@ impl UdpBatch {
   self.first.is_some_and(|t|now.saturating_duration_since(t)>=Duration::from_micros(self.coalesce_us))
  }
  pub fn flush_due(&mut self,s:&UdpSocket){if self.due(Instant::now()){self.flush(s);}}
+ #[cfg(feature="scan-stream-bench")]
+ pub(super) fn suppress_pending(&mut self){
+  self.suppressed+=self.pending;
+  self.bytes.clear();self.pending=0;self.first=None;
+ }
  pub fn completion(&mut self,s:&UdpSocket,bytes:&[u8])->bool {
   self.send_calls+=1;
   match s.send(bytes) {
