@@ -116,8 +116,12 @@ impl Session {
     pub(super) fn start(config: &Config, directory: &Path, peer: SocketAddr, regs: &Registers,
         mut renew: impl FnMut() -> Result<()>) -> Result<Self> {
         let log=directory.join("collector.log");
-        let mut child=Command::new(&config.collector).arg(directory).arg(config.timeout_ms.to_string())
-            .env("OBS_FFM1_HOST",peer.ip().to_string()).env("OBS_FFM1_PORT",peer.port().to_string())
+        let mut command=Command::new(&config.collector);
+        command.arg(directory).arg(config.timeout_ms.to_string())
+            .env("OBS_FFM1_HOST",peer.ip().to_string()).env("OBS_FFM1_PORT",peer.port().to_string());
+        #[cfg(feature="scan-stream-bench")]
+        if std::env::var_os("OBS_FFM1_TRACE").is_some() { command.env("OBS_FFM1_TRACE","1"); }
+        let mut child=command
             .stdin(Stdio::null()).stdout(File::create(directory.join("receipts.jsonl"))?)
             .stderr(File::create(&log)?).spawn()?;
         let ready=(|| {

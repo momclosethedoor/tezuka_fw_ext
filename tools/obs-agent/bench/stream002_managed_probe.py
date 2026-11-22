@@ -1,14 +1,53 @@
 """Measure full product-map, zero-FIELD managed validation windows."""
 import json
+import subprocess
+import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 
 from egress_probe import HOST, Probe, Receiver, lease_loop
+from stream002_sink import FIELD, exact, field_frame
 
 
 SCAN = dict(op="scan", planner_version=2, path_ack_version=1, sweep_geometry="27/9",
             xtg1_wait_ticks=256, catalog_on_boot=True, run=True, k=2,
             ranges=[dict(lo_hz=70_000_000, hi_hz=12_000_000_000, enabled=True)])
+FIELD_TIMEOUT_MS = 90
+ROI_PORT = 18011
+
+
+class BenchReceiver(Receiver):
+    field_mode = False
+
+    def real8(self, conn):
+        if not self.field_mode:
+            return super().real8(conn)
+        while not self.stop.is_set():
+            header = exact(conn, FIELD.size, eof=True)
+            if header is None:
+                return
+            try:
+                meta, length = field_frame(conn, header)
+            except (ValueError, KeyError) as error:
+                self.protocol_errors.append(str(error))
+                return
+            self.field_stats["end"] += 1
+            self.field_stats["bytes"] += length
+            outcomes = self.field_stats["outcomes"]
+            code = str(meta["outcome"])
+            outcomes[code] = outcomes.get(code, 0)+1
+
+
+def launch_roi(log, full):
+    output=(log/"roi-sink.log").open("w",encoding="utf-8")
+    try:
+        return subprocess.Popen([sys.executable,"-B","-u",str(Path(__file__).with_name("stream002_sink.py")),
+            "compact" if full else "roi",str(ROI_PORT),"--bind",HOST,"--seconds","240","--done-file",str(log/"roi-done")],
+            stdout=output,stderr=subprocess.STDOUT)
+    finally:
+        output.close()
 
 
 def install_lease(stand, args):
@@ -75,16 +114,40 @@ def mode_regressions(stand, probe, receiver, log, analysis):
 
 def run(stand, args, log, boot):
     remote = stand.REMOTE
+    ddc = stand.ssh(f'''set -eu; cd {remote}; sh ddc4.sh
+test "$(devmem 0x7c460354)" = 0x00000000
+devmem 0x7c460284 32 0
+test "$(devmem 0x7c460284)" = 0x00000000
+''')
+    (log / "ddc-readback.txt").write_text(ddc, encoding="utf-8")
     install_lease(stand, args)
     config = log / "owner.json"
     stopped = dict(SCAN, run=False)
     analysis = dict(op="analysis", center_hz=5_865_000_000, width_hz=24_000_000, k=700,
                     gain_db=35, agc="manual")
-    stand.write_json(config, dict(boot_id=boot, output=remote+"/control", scan=stopped,
+    control = dict(boot_id=boot, output=remote+"/control", scan=stopped,
         analysis=analysis, view=f"{HOST}:18010", route=f"{HOST}:18008", video=f"{HOST}:18009",
-        bench_obn3_layout=args.bench_obn3_layout))
+        bench_obn3_layout=args.bench_obn3_layout)
+    fields = getattr(args,"field_counts",(0,))
+    targets = json.loads(args.targets.read_text(encoding="utf-8-sig")) if max(fields) else []
+    if len(targets)<max(fields):
+        raise ValueError("insufficient distinct targets for requested FIELD window")
+    if targets:
+        collector=stand.member(args.reader,"obs-ffm1-iio")
+        stand.upload(collector,remote,"obs-ffm1-iio")
+        stand.ssh(f"chmod 700 {remote}/obs-ffm1-iio")
+        control["resident_field"]=dict(collector=remote+"/obs-ffm1-iio",timeout_ms=FIELD_TIMEOUT_MS)
+    roi_center=getattr(args,"roi_center_hz",None)
+    full=getattr(args,"full_compact_tcp",False)
+    if full and roi_center is not None:
+        raise ValueError("choose full compact TCP or 56 MHz ROI for this run")
+    if full or roi_center is not None:
+        control["bench_roi"]=f"{HOST}:{ROI_PORT}"
+        control["bench_full_compact_tcp"]=full
+    stand.write_json(config,control)
     stand.upload(config, remote, config.name)
-    receiver = Receiver(log)
+    receiver = BenchReceiver(log)
+    roi_process = launch_roi(log,full) if full or roi_center is not None else None
     halted, ready = threading.Event(), threading.Event()
     lease = threading.Thread(target=lease_loop, args=(halted, ready, log, threading.Event()), daemon=True)
     lease.start()
@@ -93,18 +156,31 @@ def run(stand, args, log, boot):
     try:
         if not ready.wait(8):
             raise RuntimeError("accepted scanner lease/will unavailable")
-        stand.ssh(f"cd {remote}; (OBS_PHASE_TIMING=1 timeout 270 ./maia-delivery --system-control owner.json "
+        if roi_process is not None:
+            deadline=time.monotonic()+3
+            while "READY" not in (log/"roi-sink.log").read_text(encoding="utf-8"):
+                if roi_process.poll() is not None or time.monotonic()>=deadline:
+                    raise RuntimeError("compact ROI receiver did not bind")
+                time.sleep(.05)
+        stand.ssh(f"cd {remote}; (OBS_PHASE_TIMING=1 OBS_FFM1_TRACE=1 timeout 270 ./maia-delivery --system-control owner.json "
                   "--listen 0.0.0.0:18080 </dev/null >probe-agent.log 2>&1 &)")
+        time.sleep(.3)
+        if not stand.ssh("pidof maia-delivery || true").strip():
+            raise RuntimeError(stand.ssh(f"cat {remote}/probe-agent.log"))
         probe.until(lambda s: isinstance(s["actual"].get("catalog"), dict), 100)
         if getattr(args,"regression",False):
             mode_regressions(stand,probe,receiver,log,analysis)
             return
-        for width in args.widths:
-            label = f"wide-{width}"
-            active = probe.command(label, dict(SCAN, view_bins=width), seconds=40)
+        combinations=((width,num) for width in args.widths for num in fields)
+        for width, num in combinations:
+            label = f"wide-{width}-field-{num}"
+            receiver.field_mode = bool(num)
+            active = probe.command(label, dict(SCAN, view_bins=width, field_targets=targets[:num]), seconds=40)
             if active["running"] is not True or active.get("view_bins") != width:
                 raise RuntimeError(f"{label} did not start: {probe.cases[-1]['status']['error']}")
             stand.write_json(log / f"{label}-descriptor.json", active["spectrum"])
+            if roi_center is not None:
+                probe.request(dict(op="roi",id=uuid.uuid4().hex,center_hz=roi_center))
             time.sleep(1)
             generation = active["generation"]
             start = time.monotonic()
@@ -121,11 +197,17 @@ def run(stand, args, log, boot):
             host_end = dict(receiver.view_stats(generation))
             elapsed = time.monotonic()-start
             arm_end = stand.ssh("cat /proc/stat /proc/net/snmp; pidof maia-delivery | xargs -r -I{} cat /proc/{}/stat")
-            row = dict(view=width, seconds=elapsed, generation=generation, samples=snapshots,
+            row = dict(view=width, field=num, seconds=elapsed, generation=generation, samples=snapshots,
                        host_begin=host_begin, host_end=host_end, arm_begin=arm_begin, arm_end=arm_end)
             rows.append(row)
-            probe.command(f"stop-{width}", dict(stopped, view_bins=width), seconds=12)
+            probe.command(f"stop-{label}", dict(stopped, view_bins=width), seconds=12)
             row["drained"]=summary(probe.request())
+            if num:
+                row["assignments"]=active.get("field_watch")
+                directory=remote+f"/control/field-{generation}"
+                for name in ("collector.log","receipts.jsonl"):
+                    content=stand.ssh(f"cat {directory}/{name}")
+                    (log/f"{label}-{name}").write_text(content,encoding="utf-8")
             stand.write_json(log / "windows.json", rows)
             print(json.dumps(dict(view=width, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
                 b=host_end["B"]-host_begin["B"])),flush=True)
@@ -133,4 +215,11 @@ def run(stand, args, log, boot):
         halted.set()
         lease.join(4)
         receiver.close()
+        if roi_process is not None:
+            (log/"roi-done").touch()
+            try:
+                roi_process.wait(5)
+            except subprocess.TimeoutExpired:
+                roi_process.terminate()
+                roi_process.wait(5)
         probe.save()

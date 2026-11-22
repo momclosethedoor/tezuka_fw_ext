@@ -6,10 +6,15 @@ mod view_batch;
 mod sweep_delivery;
 mod progress;
 mod obn3;
+#[cfg(feature="scan-stream-bench")]
 mod roi;
+#[cfg(feature="scan-stream-bench")]
 mod roi_stream;
 mod timing;
-pub(crate) use roi_stream::{Map as RoiMap, Request as RoiRequest};
+#[cfg(feature="scan-stream-bench")]
+pub(crate) use roi_stream::Map as RoiMap;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoiRequest {pub center_hz:i64,pub generation:u64}
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
 use view_batch::UdpBatch;
@@ -62,9 +67,12 @@ fn kdefault()->u32{2}fn settledefault()->u32{6250}fn secondsdefault()->f64{30.}f
 struct Map{ptr:*mut u8,len:usize}
 impl Map{fn new(fd:&File,len:usize,off:i64,write:bool)->R<Self>{let p=unsafe{libc::mmap(std::ptr::null_mut(),len,libc::PROT_READ|if write{libc::PROT_WRITE}else{0},libc::MAP_SHARED,fd.as_raw_fd(),off as libc::off_t)};if p==libc::MAP_FAILED{return Err(std::io::Error::last_os_error().to_string())}Ok(Self{ptr:p.cast(),len})}}
 impl Drop for Map{fn drop(&mut self){unsafe{libc::munmap(self.ptr.cast(),self.len);}}}
-struct Hardware{stream_format:Option<obn3::Format>,bench_obn3_layout:bool,previous_full_len:usize,power:Vec<f32>,decoded:u64,decode_ns:u128,managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,snapshots:u64,empty_snapshots:u64,release_commands:u64,idle_wait_us:u64,sync_bytes:u64,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
+struct Hardware{stream_format:Option<obn3::Format>,bench_obn3_layout:bool,previous_full_len:usize,managed_view_only:bool,phase_on:bool,snapshot_ns:u128,release_ns:u128,snapshots:u64,empty_snapshots:u64,release_commands:u64,idle_wait_us:u64,sync_bytes:u64,fast_snapshot_on:bool,pressure_on:bool,pressure_due:Instant,pressure:Vec<[u64;4]>,pressure_omitted:u64,_lease:File,device:File,regs:Map,full:Map,overview:Map,info:Info,valid:u32,active:bool,shift:bool,logical_tail:Option<u64>,physical_high_water:u64,previous_view:usize,ranges:Vec<(u32,u32,u32)>,copied_bytes:u64,view_bytes:u64,max_release_gap_us:u64,last_release:Instant,sync_ns:u128,copy_ns:u128,batch_sync:bool,direct:bool,release_only:bool,batch_limit:usize,covered:Vec<(u32,u32,u32)>,sync_calls:u64,process_ns:u128,actual_copy_bytes:u64,reuse_owned_cache:bool,retained_synced:Option<u64>,sync_reused_bytes:u64}
 impl Hardware{
  fn open(c:&Config,managed_view_only:bool)->R<Self>{
+  if c.bench_obn3_layout && !cfg!(feature="scan-stream-bench") {
+   return Err("bench_obn3_layout requires the scan-stream-bench feature".into());
+  }
   let read=|p:&str|std::fs::read_to_string(p).map_err(|e|e.to_string());
   if read("/proc/sys/kernel/random/boot_id")?.trim()!=c.boot_id{return Err("boot lease mismatch".into())}
   if read("/tmp/pl-uart-obs-session/phase")?.trim()!="OBS_READY"{return Err("UART loader prerequisite".into())}
@@ -86,7 +94,7 @@ impl Hardware{
   for(a,n)in[(info.full,info.full_len),(info.view,info.view_len)]{for(lo,hi)in[(0x06000000,0x0e000000),(0x16000000,0x16040000)]{if a<hi&&a+n as u64>lo{return Err("DMA overlaps stock reserve".into())}}}
   let full=Map::new(&device,info.full_len as usize,0,false)?;let overview=Map::new(&device,info.view_len as usize,0x1000000,false)?;
   let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
-  let mut h=Self{stream_format:None,bench_obn3_layout:c.bench_obn3_layout,previous_full_len:continuous::BYTES,power:Vec::new(),decoded:0,decode_ns:0,managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,snapshots:0,empty_snapshots:0,release_commands:0,idle_wait_us:0,sync_bytes:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544||c.bench_obn3_layout,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
+  let mut h=Self{stream_format:None,bench_obn3_layout:c.bench_obn3_layout,previous_full_len:continuous::BYTES,managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,snapshots:0,empty_snapshots:0,release_commands:0,idle_wait_us:0,sync_bytes:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544||c.bench_obn3_layout,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
   if (h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))!=(1024,32768,2048) {
    return Err("DMA ring geometry mismatch".into());
   }
@@ -96,7 +104,6 @@ impl Hardware{
      return Err("OBN3 requires separate full and VIEW slots".into());
     }
     h.stream_format=Some(obn3::Format::from_config(h.r(0x34c))?);
-    h.power.resize(continuous::BINS,0.0);
     h.managed_view_only=false;
    }
    (continuous::ABI,3) if c.stream_config.is_none() && !c.bench_obn3_layout && !(managed_view_only && c.mode==0) => {}
@@ -160,6 +167,7 @@ impl Hardware{
   Ok(())
  }
  fn cold_split(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
+  #[cfg(feature="scan-stream-bench")]
   if self.bench_obn3_layout{return self.bind_obn3_prefix(control,c);}
   let initial=self.snapshot()?;
   if !self.shift||control.is_none()&&(initial.cookie!=1||initial.released!=0){return Ok(Value::Null)}
@@ -208,6 +216,7 @@ impl Hardware{
   Ok(json!({"discarded":1,"run":1,"ordinal":0,"first_epoch":first_epoch,
             "next_epoch":next.epoch,"physical_released":self.r64(0x110)}))
  }
+ #[cfg(feature="scan-stream-bench")]
  fn bind_obn3_prefix(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
   let initial=self.snapshot()?;
   let cold=initial.cookie==1 && initial.released==0;
@@ -236,17 +245,18 @@ impl Hardware{
         "previous_active_bytes":length,"previous_view_bytes":view_width,
         "unrecoverable_cold_records":first-initial.released}));
    }
-   if s.committed-initial.released>=2 || start.elapsed()>Duration::from_secs(8){
+   if s.committed-initial.released>=2 || start.elapsed()>OBN3_PREFIX_TIMEOUT{
     return Err("could not bind the observed OBN3 RAM prefix".into());
    }
-   std::thread::sleep(Duration::from_micros(50));
+   std::thread::sleep(OBN3_PREFIX_POLL);
   }
  }
+ #[cfg(feature="scan-stream-bench")]
  fn find_obn3_prefix(&mut self,format:obn3::Format,ordinal:u64,c:&Config)->R<Option<(usize,usize,Header)>>{
   let slot=ordinal.wrapping_sub(1) as usize&(view::SLOTS-1);
   for previous_active in [obn3::COMPACT_BYTES,continuous::BYTES] {
    for previous_view in [0,512,1024,2048] {
-    let offset=slot*continuous::BYTES+previous_active-4352+previous_view;
+    let offset=slot*continuous::BYTES+previous_active-OBN3_RAM_SHIFT_BYTES+previous_view;
     let len=format.prefix_bytes();
     self.ensure_sync(0,offset as u32,len as u32)?;
     let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(offset),len)};
@@ -324,6 +334,7 @@ impl PairIo for Hardware{
  fn batch_limit(&self)->usize{self.batch_limit}
  fn phase_timing(&self)->bool{self.phase_on}
  fn full_read(&self)->bool{!self.release_only&&!self.managed_view_only}
+ fn owned_full_bytes(&self)->usize{self.stream_format.map_or(0,obn3::Format::active_bytes)}
  fn prepare_prefix(&mut self,first:u64,end:u64)->R<()>{
   self.covered.clear();if !self.batch_sync||self.release_only||self.managed_view_only||self.stream_format.is_some()||first==end{return Ok(())}
   let count=(end-first) as u32;let slot=(first&1023)as u32;
@@ -351,29 +362,20 @@ impl PairIo for Hardware{
   if let Some(format)=self.stream_format {
    let offset=slot*continuous::BYTES;
    let length=format.active_bytes();
-   let bytes=if self.bench_obn3_layout {
+   if cfg!(feature="scan-stream-bench") && self.bench_obn3_layout {
     let previous=slot.wrapping_sub(1)&(view::SLOTS-1);
     let prev_view=self.previous_view;
-    let prefix=4352-prev_view;
+    let prefix=OBN3_RAM_SHIFT_BYTES-prev_view;
     let (head,rest)=full[..length].split_at_mut(prefix);
     let (middle,tail)=rest.split_at_mut(prev_view);
     self.copy(0,previous*continuous::BYTES+self.previous_full_len-prefix,head)?;
     if prev_view!=0{self.copy(1,previous*view::VIEW_BYTES,middle)?;}
     self.copy(0,offset,tail)?;
-    &full[..length]
-   }else{
-    self.ensure_sync(0,offset as u32,length as u32)?;
-    unsafe{std::slice::from_raw_parts(self.full.ptr.add(offset),length)}
-   };
-   let header=format.header(bytes)?;
-   let t=self.phase_on.then(Instant::now);
-   format.decode(bytes,header,&mut self.power)?;
-   // The local consumer owns numerical bins and takes no DMA slot or queue.
-   std::hint::black_box(&self.power);
-   if let Some(t)=t{self.decode_ns+=t.elapsed().as_nanos();}
-   self.decoded+=1;
+   }else{self.copy(0,offset,&mut full[..length])?;}
+   let header=format.header(&full[..length])?;
    let n=view::view_len(header);
-   let (region,view_offset,base)=if self.bench_obn3_layout {(0,offset+length-4352,self.full.ptr)}
+   let (region,view_offset,base)=if cfg!(feature="scan-stream-bench") && self.bench_obn3_layout {
+     (0,offset+length-OBN3_RAM_SHIFT_BYTES,self.full.ptr)}
      else {(1,slot*view::VIEW_BYTES,self.overview.ptr)};
    if n!=0{self.ensure_sync(region,view_offset as u32,n as u32)?;}
    let payload=unsafe{std::slice::from_raw_parts(base.add(view_offset),n)};
@@ -381,7 +383,7 @@ impl PairIo for Hardware{
    self.previous_full_len=length;
    self.copied_bytes+=length as u64;
    self.view_bytes+=n as u64;
-   return sink(header,&[bytes],payload);
+   return sink(header,&[],payload);
   }
   if self.managed_view_only {
    let (header_offset,region,view_offset)=view::delivery_offsets(slot,self.shift,self.previous_view);
@@ -449,7 +451,7 @@ fn full_read_without_sum(b:&[u8]){
  #[cfg(not(target_arch="arm"))] for x in b{unsafe{std::ptr::read_volatile(x);}}
 }
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
-fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"decoded_obn3":io.decoded,"decode_ns":io.decode_ns.to_string(),"stream_config":io.stream_format.map(|_|io.r(0x34c)),"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"sync_bytes":io.sync_bytes,
+fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"stream_config":io.stream_format.map(|_|io.r(0x34c)),"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"sync_bytes":io.sync_bytes,
 "payload_read_bytes":io.copied_bytes,"metadata_span_bytes":if io.managed_view_only{reader.visited*512}else{0},
 "owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"managed_idle_wait_us":if io.managed_view_only{io.idle_wait_us}else{0},"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
@@ -472,14 +474,23 @@ pub(crate) struct RunControl<'a>{
  pub bench_stall_after_next:bool,
  pub sweep:Option<&'a SweepSpec>,
  pub next:Option<NextView<'a>>,
+ #[cfg(feature="scan-stream-bench")]
  pub roi:Option<RoiControl<'a>>,
 }
+#[cfg(feature="scan-stream-bench")]
 pub(crate) struct RoiControl<'a>{
  pub peer:std::net::SocketAddr,
+ pub full_scan:bool,
  pub initial:RoiMap,
  pub next:Option<RoiMap>,
  pub request:&'a dyn Fn()->Option<RoiRequest>,
 }
+// RAM uses the observed 544-beat displacement. The ABI stride stays 32768 bytes.
+const OBN3_RAM_SHIFT_BYTES:usize=544*8;
+#[cfg(feature="scan-stream-bench")]
+const OBN3_PREFIX_TIMEOUT:Duration=Duration::from_secs(8);
+#[cfg(feature="scan-stream-bench")]
+const OBN3_PREFIX_POLL:Duration=Duration::from_micros(50);
 pub(crate) struct NextView<'a>{
  pub generation:u64,
  pub version:u32,
@@ -511,11 +522,14 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c,control.is_some())?;
+ #[cfg(feature="scan-stream-bench")]
  let stream002=io.stream_format.is_some();
+ #[cfg(feature="scan-stream-bench")]
  let roi_control=control.and_then(|q|q.roi.as_ref());
+ #[cfg(feature="scan-stream-bench")]
  let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
   if !c.scan || !stream002 { return Err("ROI requires an active OBN3 scan".into()); }
-  let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone())?;
+  let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),config.full_scan)?;
   stream.update((config.request)())?;
   Some(stream)
  }else{None});
@@ -564,15 +578,6 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
  }
  let initial_anchor=io.live64(0x238);
- let prepare_full=|h:Header,parts:&[&[u8]]|->R<()>{
-  if !stream002 {
-   for part in parts{full_read_without_sum(part);}
-  }else if let Some(zoom)=zoom.borrow_mut().as_mut() {
-   zoom.prepare(h,parts.first().copied().ok_or("ROI compact payload missing")?,initial_anchor,
-    control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)()))?;
-  }
-  Ok(())
- };
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
  let execution=std::cell::Cell::<Option<Execution>>::new(None);
@@ -581,8 +586,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut first_view_sent=false;
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
- let mut sink=|h:Header,overview:&[u8]|->R<()>{
-  if let Some(zoom)=zoom.borrow_mut().as_mut(){zoom.pump();}
+ let mut sink=|h:Header,overview:&[u8],_owned_full:&[u8]|->R<()>{
+  #[cfg(feature="scan-stream-bench")]
+  if let Some(zoom)=zoom.borrow_mut().as_mut(){
+   zoom.prepare(h,_owned_full,initial_anchor,control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)()))?;
+   zoom.pump();
+  }
   if let Some(q)=control {
    if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if execution.get().is_none(){
@@ -622,6 +631,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
+   #[cfg(feature="scan-stream-bench")]
    if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){zoom.update((config.request)())?;}
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
    if let Some(q)=control {
@@ -637,12 +647,14 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
      v["observed_to_payload"]=histogram(reader.observed_to_payload);
      v["release"]=histogram(reader.release);
     }
-    v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);
+    #[cfg(feature="scan-stream-bench")]
+    {v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);}
     *STATUS.lock().unwrap()=v;
    }status_due=Instant::now();
   }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
-  let s=reader.service_released(&mut io,&prepare_full,&mut sink)?;
+  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+  #[cfg(feature="scan-stream-bench")]
   if let Some(zoom)=zoom.borrow_mut().as_mut(){zoom.pump();}
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
@@ -658,7 +670,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
  if !draining.get(){draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}}
- let stop=Instant::now();loop{let s=reader.service_released(&mut io,&prepare_full,&mut sink)?;
+ let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
   let drained=s.drained&&!s.running&&!s.dma_busy&&s.reserved==s.committed&&reader.next==s.committed;
   if drained{io.release_drained(s.cookie,s.committed)?;}
   if let Some(sock)=&socket {
@@ -668,6 +680,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }else{net.flush(sock);}
   }
   if drained{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
+ #[cfg(feature="scan-stream-bench")]
  if let Some(zoom)=zoom.borrow_mut().as_mut(){
   let deadline=Instant::now()+Duration::from_secs(1);
   while zoom.pending() && Instant::now()<deadline {
@@ -683,7 +696,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    v["observed_to_payload"]=histogram(reader.observed_to_payload);
    v["release"]=histogram(reader.release);
   }
-  v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);
+  #[cfg(feature="scan-stream-bench")]
+  {v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);}
   *STATUS.lock().unwrap()=v;
  }
  if let Some(q)=control{(q.trace)("reader_drained");}

@@ -12,6 +12,7 @@ categories = ["hardware-support", "science", "web-programming::http-server", "we
 
 [features]
 default = []
+scan-stream-bench = []
 uclibc = []
 
 [dependencies]

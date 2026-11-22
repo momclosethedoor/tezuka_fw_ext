@@ -71,12 +71,21 @@ jobs:
           $OPENBLAS_CC -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-agent/maia-httpd/src/system_native/neon_sum.c -o "$PWD/agent-neon.o"
           $OPENBLAS_CC -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-agent/maia-httpd/src/system_native/preview.c -o "$PWD/agent-preview.o"
           export RUSTFLAGS="-C target-cpu=cortex-a9 -C link-arg=$PWD/agent-neon.o -C link-arg=$PWD/agent-preview.o -C link-arg=-ldl -C link-arg=-lm"
-          cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OPENBLAS_CC\""
+          bench_args=()
+          ffm_args=()
+          if [[ "$GITHUB_REF_NAME" == build/arm-scan-stream-002 ]]; then
+            bench_args=(--features scan-stream-bench)
+            ffm_args=(-DOBS_SCAN_STREAM_BENCH)
+          fi
+          cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OPENBLAS_CC\"" "${bench_args[@]}"
           mkdir agent-artifact
           cp tools/obs-agent/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd agent-artifact/
           $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -ldl -o agent-artifact/obs-field1
-          $OPENBLAS_CC -O2 -Wall -Wextra -Werror tools/obs-guard/obs-ffm1-iio.c -ldl -o agent-artifact/obs-ffm1-iio
+          $OPENBLAS_CC -O2 -Wall -Wextra -Werror "${ffm_args[@]}" tools/obs-guard/obs-ffm1-iio.c -ldl -o agent-artifact/obs-ffm1-iio
           output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
+          if [[ ${#bench_args[@]} -ne 0 ]]; then
+            cargo +1.94.0 check --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd
+          fi
           find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
           sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
           cp board/tezuka/nano/overlay_goofy/usr/sbin/goofy_lease.sh agent-artifact/

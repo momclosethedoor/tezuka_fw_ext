@@ -1,4 +1,4 @@
-//! OBN3 revision 4 wire decoding. The full allocation stride remains 32768.
+//! OBN3 revision 4 record geometry and header validation.
 use super::continuous::{BINS, BYTES, Header, TICK_HZ};
 
 pub const ID: u32 = 0x334e424f;
@@ -80,129 +80,26 @@ impl Format {
         })
     }
 
-    pub fn decode(self, slot: &[u8], header: Header, power: &mut [f32]) -> Result<(), String> {
-        if slot.len() != self.active_bytes() || power.len() != BINS {
-            return Err("OBN3 decode length".into());
-        }
-        let count = if header.peak() { 1 } else { u64::from(header.k) };
-        let scale = 1.0 / (750668.0_f64 * 750668.0 * count as f64);
-        let mut factors = [0.0; 5];
-        for (exponent, factor) in factors.iter_mut().enumerate() {
-            *factor = scale * (1u32 << (2 * exponent)) as f64;
-        }
-        match self {
-            Self::Compact => decode_bins::<6,13>(&slot[128..],power,(count as u32)<<3,&factors),
-            Self::Native => decode_bins::<8,15>(slot,power,(count as u32)<<3,&factors),
-        }
-    }
-}
-
-fn decode_bins<const WIDTH: usize, const MANTISSA_HIGH_BITS: u32>(
-    bytes: &[u8], power: &mut [f32], maximum_high: u32, factors: &[f64;5],
-) -> Result<(), String> {
-    for (index, (bin, word)) in power.iter_mut().zip(bytes.chunks_exact(WIDTH)).enumerate() {
-        let low=u32::from_le_bytes(word[..4].try_into().unwrap());
-        let high=if WIDTH==6 {u32::from(u16::from_le_bytes(word[4..6].try_into().unwrap()))}
-            else {u32::from_le_bytes(word[4..8].try_into().unwrap())};
-        if WIDTH==8 && (high & 0x00fc0000 != 0 || index >= 64 && high >> 24 != 0) {
-            return Err("OBN3 native reserved bin bits".into());
-        }
-        let exponent=((high>>MANTISSA_HIGH_BITS)&7) as usize;
-        let mantissa_high=high&((1<<MANTISSA_HIGH_BITS)-1);
-        if mantissa_high>maximum_high || mantissa_high==maximum_high && low!=0 {
-            return Err("OBN3 bin exceeds accumulator bound".into());
-        }
-        let factor=factors.get(exponent).ok_or("OBN3 invalid bin exponent")?;
-        // Both limbs and their sum are exact in f64. A9 converts u32 directly.
-        *bin=((f64::from(mantissa_high)*4_294_967_296.0+f64::from(low))*factor) as f32;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn slot(format: Format, k: u32, flags: u32, word: u64) -> Vec<u8> {
-        let mut h = [0; 64];
-        let format_code = if format == Format::Compact { 3u32 } else { 2u32 };
-        for (offset, value) in [
-            (0, ID), (4, (64 << 16) | 4), (8, 9), (16, 22), (24, 42),
-            (32, BINS as u32), (36, k), (40, TICK_HZ as u32), (44, flags),
-            (48, format_code), (52, format.active_bytes() as u32), (56, 1024),
-        ] {
-            h[offset..offset+4].copy_from_slice(&value.to_le_bytes());
-        }
-        let mut bytes = vec![0; format.active_bytes()];
-        match format {
-            Format::Compact => {
-                bytes[..64].copy_from_slice(&h);
-                for bin in bytes[128..].chunks_exact_mut(6) {
-                    bin.copy_from_slice(&word.to_le_bytes()[..6]);
-                }
-            }
-            Format::Native => {
-                for (index, bin) in bytes.chunks_exact_mut(8).enumerate() {
-                    bin.copy_from_slice(&word.to_le_bytes());
-                    bin[7] = h.get(index).copied().unwrap_or(0);
-                }
-            }
-        }
-        bytes
-    }
-
     #[test]
-    fn both_encodings_produce_identical_sum_and_peak_power_at_the_k_bounds() {
-        for k in [1, 2, 700, 1023] {
-            for peak in [false, true] {
-                let count = if peak { 1 } else { k };
-                let mantissa = u64::from(count) << 35;
-                let mut results = Vec::new();
-                for (format, shift) in [(Format::Compact, 45), (Format::Native, 47)] {
-                    let data = slot(format, k, 1 | (u32::from(peak) << 2), mantissa | (4 << shift));
-                    let header = format.header(&data).unwrap();
-                    assert_eq!((header.epoch, header.ordinal, header.last_seq), (22, 1024, 8 + u64::from(k)));
-                    let mut power = vec![0.0; BINS];
-                    format.decode(&data, header, &mut power).unwrap();
-                    results.push(power);
-                }
-                assert_eq!(results[0], results[1]);
-                let expected = ((1u64 << 43) as f64 / 750668.0_f64.powi(2)) as f32;
-                assert!(results[0].iter().all(|&value| value == expected));
-            }
+    fn rejects_invalid_compact_headers() {
+        let mut data=[0;128];
+        for (offset,value) in [(0,ID),(4,(64<<16)|4),(32,BINS as u32),(36,2),
+            (40,TICK_HZ as u32),(44,1),(48,3),(52,COMPACT_BYTES as u32)] {
+            data[offset..offset+4].copy_from_slice(&value.to_le_bytes());
         }
-    }
-
-    #[test]
-    fn rejects_invalid_headers_and_power_words() {
-        let format = Format::Compact;
-        for (k, flags) in [(0, 1), (1024, 1), (2, 0), (2, 0x23), (2, 0x41)] {
-            assert!(format.header(&slot(format, k, flags, 0)).is_err());
+        assert_eq!(Format::Compact.header(&data).unwrap().k,2);
+        for (offset,value) in [(36,0),(36,1024),(44,0),(44,0x23),(44,0x41),(52,32768)] {
+            let mut bad=data;
+            bad[offset..offset+4].copy_from_slice(&u32::to_le_bytes(value));
+            assert!(Format::Compact.header(&bad).is_err());
         }
-        let mut data = slot(format, 2, 1, 0);
-        data[64] = 1;
-        assert!(format.header(&data).is_err());
-        data[64] = 0;
-        data[52] ^= 1;
-        assert!(format.header(&data).is_err());
-        for word in [5 << 45, (2 << 35) + 1] {
-            let data = slot(format, 2, 1, word);
-            let header = format.header(&data).unwrap();
-            assert!(format.decode(&data, header, &mut [0.0; BINS]).is_err());
-        }
-        let data = slot(format, 2, 1, 0);
-        let header = format.header(&data).unwrap();
-        assert!(format.decode(&data[..data.len()-1], header, &mut [0.0; BINS]).is_err());
-    }
-
-    #[test]
-    fn decodes_the_supplied_rtl_slot_when_available() {
-        let Some(path) = std::env::var_os("OBS_OBN3_RTL_SLOT") else { return };
-        let data = std::fs::read(path).unwrap();
-        let format = Format::Compact;
-        let header = format.header(&data).unwrap();
-        let mut power = [0.0; BINS];
-        format.decode(&data[..COMPACT_BYTES], header, &mut power).unwrap();
-        assert!(power.iter().any(|&value| value > 0.0));
+        data[64]=1;
+        assert!(Format::Compact.header(&data).is_err());
     }
 }

@@ -68,11 +68,11 @@ impl UdpBatch {
   }
   for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
    self.send_calls+=1;
-   let before=self.phase_on.then(Instant::now);
+   let before=(self.phase_on && cfg!(feature="scan-stream-bench")).then(Instant::now);
    match s.send(packet){
     Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;self.sent_bytes+=n as u64;
      if let Some(before)=before {self.api_send.observe(before.elapsed());}
-     if self.phase_on && let Some(ready)=self.first {self.oldest_to_send.observe(ready.elapsed());}
+     if before.is_some() && let Some(ready)=self.first {self.oldest_to_send.observe(ready.elapsed());}
     },
     result=>{
      self.dropped+=count;

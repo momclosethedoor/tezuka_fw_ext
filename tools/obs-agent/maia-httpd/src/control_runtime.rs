@@ -69,6 +69,8 @@ struct Config {
     resident_field: Option<resident_field::Config>,
     #[serde(default)]
     bench_roi: Option<SocketAddr>,
+    #[serde(default)]
+    bench_full_compact_tcp: bool,
 }
 
 type AntennaBands = BTreeMap<u64, Vec<[u64; 2]>>;
@@ -455,7 +457,7 @@ async fn submit(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
     }
     if cmd["op"]=="roi" {
-        if q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true {
+        if !cfg!(feature="scan-stream-bench") || q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true {
             return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan required"})));
         }
         if q.roi_id != *id {
@@ -2070,7 +2072,9 @@ fn worker(
                 )
             };
             let last_renew = std::cell::Cell::new(Instant::now());
+            #[cfg(feature="scan-stream-bench")]
             let roi_request=||shared.inbox.lock().unwrap().roi;
+            #[cfg(feature="scan-stream-bench")]
             let roi=if let Some(peer)=c.bench_roi.filter(|_|scan) {
                 let a=actual.borrow();
                 let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
@@ -2078,7 +2082,8 @@ fn worker(
                 let next=next_spectrum.as_ref().zip(next_version).map(|(desc,version)|
                     crate::system_reader::RoiMap::from_descriptor(desc,version,next_gen)).transpose()
                     .map_err(anyhow::Error::msg)?;
-                Some(crate::system_reader::RoiControl{peer,initial,next,request:&roi_request})
+                Some(crate::system_reader::RoiControl{peer,initial,next,request:&roi_request,
+                    full_scan:c.bench_full_compact_tcp})
             }else{None};
             let q = crate::system_reader::RunControl {
                 generation,
@@ -2106,6 +2111,7 @@ fn worker(
                 stalled: &|sample| *stall_sample.borrow_mut()=sample,
                 bench_stall: scan && std::mem::take(&mut bench_stall),
                 bench_stall_after_next,
+                #[cfg(feature="scan-stream-bench")]
                 roi,
                 sweep: sweep.as_ref(),
                 next: next_sweep.as_ref().zip(next_version).map(|(s,version)|crate::system_reader::NextView {
@@ -2371,6 +2377,9 @@ pub fn check_scan_tx_bank() -> Result<()> {
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(cfg!(feature="scan-stream-bench") || (!c.bench_obn3_layout && c.bench_roi.is_none()),
+        "RAM layout and ROI require the scan-stream-bench feature");
+    ensure!(!c.bench_full_compact_tcp || c.bench_roi.is_some(),"full compact TCP requires a bench destination");
     let catalog_policy = c.scan["planner_version"] == 2 && c.scan["catalog_on_boot"] != false
         && c.external_mixer.is_none();
     if let Some(preview) = &c.field_preview {
@@ -2673,6 +2682,7 @@ mod tests {
             field_preview: None,
             resident_field: None,
             bench_roi: None,
+            bench_full_compact_tcp: false,
         };
         let input = json!({"scan":{"ranges":[
             {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},

@@ -52,6 +52,7 @@ pub trait PairIo{
     fn batch_limit(&self)->usize{512}
     fn phase_timing(&self)->bool{false}
     fn full_read(&self)->bool{true}
+    fn owned_full_bytes(&self)->usize{0}
     fn prepare_prefix(&mut self,_first:u64,_end:u64)->Result<(),String>{Ok(())}
     fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->Result<(),String>>(&mut self,slot:usize,full:&mut[u8],view:&mut[u8],sink:&mut F)->Result<(),String>{
         self.copy_full(slot,full)?;let h=c::header_revision(full,3)?;let n=view_len(h);
@@ -73,13 +74,14 @@ pub struct PairReader{pub full_read_ns:u128,pub view_own_ns:u128,pub after_relea
 impl PairReader{
     /// Finish all DMA reads, release, then expose only the small owned VIEW.
     /// No full-spectrum queue or checksum is part of this path.
-    pub fn service_released<I:PairIo,Rd:FnMut(Header,&[&[u8]])->Result<(),String>,F:FnMut(Header,&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
+    pub fn service_released<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8],&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
         let phase=io.phase_timing();
         let s=io.fast_snapshot()?;
-        let observed=phase.then(std::time::Instant::now);
+        let observed=(phase && cfg!(feature="scan-stream-bench")).then(std::time::Instant::now);
         if s.cookie!=self.run||s.released!=self.next||s.committed<self.next||s.committed>s.reserved||s.reserved-self.next>SLOTS as u64{return Err("r3 cursor/owner violation".into())}
         self.high_water=self.high_water.max(s.reserved-self.next);
         let end=s.committed.min(self.next+io.batch_limit() as u64);
+        let full_len=io.owned_full_bytes();
         io.prepare_prefix(self.next,end)?;
         let mut owned_view=[0u8;VIEW_BYTES];
         for ordinal in self.next..end{
@@ -90,19 +92,19 @@ impl PairReader{
                 n=v.len();owned_view[..n].copy_from_slice(v);header=Some(h);
                 if let Some(t)=t{self.view_own_ns+=t.elapsed().as_nanos();}
                 let t=phase.then(std::time::Instant::now);
-                read(h,parts)?;
+                if full_len==0 { for part in parts{read(part);} }
                 if let Some(t)=t{self.full_read_ns+=t.elapsed().as_nanos();}
                 Ok(())
             })?;
             if let Some(t)=observed{self.observed_to_payload.observe(t.elapsed());}
-            let release_begin=phase.then(std::time::Instant::now);
+            let release_begin=(phase && cfg!(feature="scan-stream-bench")).then(std::time::Instant::now);
             io.release(self.run,ordinal+1)?;
             if let Some(t)=release_begin{self.release.observe(t.elapsed());}
             self.next=ordinal+1;self.visited+=1;
             if io.full_read(){self.read+=1;self.consumed+=1;}
             // The DMA slot may already be overwritten here.
             let t=phase.then(std::time::Instant::now);
-            sink(header.ok_or("missing header")?,&owned_view[..n])?;
+            sink(header.ok_or("missing header")?,&owned_view[..n],&self.full[..full_len])?;
             if let Some(t)=t{self.after_release_ns+=t.elapsed().as_nanos();}
         }
         if s.fault{return Err("r3 fatal after committed prefix".into())}Ok(s)

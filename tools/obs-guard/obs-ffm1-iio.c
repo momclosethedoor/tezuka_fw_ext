@@ -145,7 +145,12 @@ static int report(const struct observation *o, const struct watch_table *wat,
         o->first,o->end,(unsigned)status,bytes,receipt_time,ready);
     if(count<0 || (size_t)count>=sizeof metadata) return -1;
     if(send_enabled) field_queue(egress,metadata,(size_t)count,payload,bytes,ready);
-    return puts(metadata)<0 || !known;
+#ifdef OBS_SCAN_STREAM_BENCH
+    if (!send_enabled || getenv("OBS_FFM1_TRACE")) {
+        if (puts(metadata)<0) return -1;
+    }
+#endif
+    return !known;
 }
 
 int main(int argc,char **argv)

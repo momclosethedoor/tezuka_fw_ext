@@ -7,7 +7,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 
-enum { FIELD_QUEUE = 4, FIELD_META = 512 };
+enum { FIELD_QUEUE = 4, FIELD_META = 512, FIELD_SEND_SLICE = 64*1024, FIELD_SEND_DEADLINE_S = 1 };
 
 struct field_packet {
     uint8_t *bytes;
@@ -29,7 +29,7 @@ static int field_connect(struct field_egress *q, const char *host, const char *p
     char *end;
     unsigned long number = strtoul(port, &end, 10);
     struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons(number)};
-    struct timeval timeout = {.tv_sec=1};
+    struct timeval timeout = {.tv_sec=FIELD_SEND_DEADLINE_S};
     if (*end || !number || number > 65535 || inet_pton(AF_INET, host, &addr.sin_addr) != 1)
         return -1;
     for (unsigned i=0; i<FIELD_QUEUE; ++i) {
@@ -80,10 +80,10 @@ static void field_pump(struct field_egress *q)
     if (!q->count) return;
     struct field_packet *p=&q->packets[q->head];
     double now=monotonic();
-    if (now-p->ready>1.0) { field_abandon(q);return; }
+    if (now-p->ready>FIELD_SEND_DEADLINE_S) { field_abandon(q);return; }
     if (!p->first_send) p->first_send=now;
     size_t left=p->length-p->used;
-    ssize_t n=send(q->fd,p->bytes+p->used,left>65536 ? 65536 : left,MSG_NOSIGNAL);
+    ssize_t n=send(q->fd,p->bytes+p->used,left>FIELD_SEND_SLICE ? FIELD_SEND_SLICE : left,MSG_NOSIGNAL);
     if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)) { ++q->blocked;return; }
     if (n<=0) { field_abandon(q);return; }
     q->accepted_bytes+=(size_t)n;

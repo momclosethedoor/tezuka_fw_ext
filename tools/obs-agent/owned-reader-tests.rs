@@ -42,7 +42,7 @@ fn mock()->Mock{Mock{full:hex("tools/obs-agent/maia-httpd/tests/view/mode1/ordin
  }
  let read=Rc::new(Cell::new(0));let phase=Rc::new(Cell::new(0));let m=mock();let expected=m.view.clone();
  let mut io=Direct{m,read:read.clone(),phase:phase.clone()};let mut reader=view::PairReader::attach(io.snapshot().unwrap()).unwrap();
- reader.service_released(&mut io,|_,parts|{assert_eq!(phase.get(),0);read.set(read.get()+parts.iter().map(|p|p.len()).sum::<usize>());Ok(())},|h,v|{assert_eq!(phase.get(),1);assert_eq!(h.ordinal,0);assert_eq!(v,expected);phase.set(2);Ok(())}).unwrap();
+ reader.service_released(&mut io,|p|{assert_eq!(phase.get(),0);read.set(read.get()+p.len());},|h,v,raw|{assert_eq!(phase.get(),1);assert_eq!(h.ordinal,0);assert_eq!(v,expected);assert!(raw.is_empty());phase.set(2);Ok(())}).unwrap();
  assert_eq!(phase.get(),2);assert_eq!(reader.read,1);assert!(io.m.full.iter().all(|&b|b==0xcc));
 }
 
@@ -97,7 +97,7 @@ fn view_only_wrap_and_short_after_long_survive_immediate_dma_reuse() {
   let expected=io.view.clone();
   io.snap.committed+=1;
   io.snap.reserved+=1;
-  reader.service_released(&mut io,|_,parts|{assert!(parts.is_empty());Ok(())},|header,data|{
+  reader.service_released(&mut io,|_|panic!("VIEW read of native bins"),|header,data,_|{
    assert_eq!(released.get(),ordinal+1);
    assert_eq!(header.ordinal,ordinal);
    assert_eq!(view::view_len(header),bins);
@@ -107,4 +107,38 @@ fn view_only_wrap_and_short_after_long_survive_immediate_dma_reuse() {
  }
  assert_eq!(reader.visited,4);
  assert_eq!(reader.read,0);
+}
+
+#[test]
+fn compact_tcp_sink_reads_the_owned_copy_only_after_release() {
+    struct Owned { dma:Vec<u8>, released:bool }
+    impl PairIo for Owned {
+        fn snapshot(&mut self)->R<continuous::Snapshot>{Ok(continuous::Snapshot{
+            cookie:3,committed:1,reserved:1,..Default::default()})}
+        fn owned_full_bytes(&self)->usize{obn3::COMPACT_BYTES}
+        fn copy_full(&mut self,_:usize,_:&mut[u8])->R<()>{unreachable!()}
+        fn copy_view(&mut self,_:usize,_:&mut[u8])->R<()>{unreachable!()}
+        fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(
+            &mut self,_:usize,full:&mut[u8],_:&mut[u8],sink:&mut F
+        )->R<()> {
+            full[..self.dma.len()].copy_from_slice(&self.dma);
+            sink(Header{first_seq:10,last_seq:11,epoch:1,first_tick:5,k:2,flags:1,ordinal:0},&[],&[])
+        }
+        fn release(&mut self,run:u32,tail:u64)->R<()>{
+            assert_eq!((run,tail),(3,1));
+            self.dma.fill(0);
+            self.released=true;
+            Ok(())
+        }
+    }
+    let mut io=Owned{dma:vec![42;obn3::COMPACT_BYTES],released:false};
+    let mut reader=view::PairReader::attach(io.snapshot().unwrap()).unwrap();
+    reader.service_released(&mut io,|_|panic!("full payload must not be processed while owned"),|_,view,raw|{
+        assert!(view.is_empty());
+        assert_eq!(raw.len(),obn3::COMPACT_BYTES);
+        assert!(raw.iter().all(|&value|value==42));
+        Ok(())
+    }).unwrap();
+    assert!(io.released);
+    assert!(io.dma.iter().all(|&value|value==0));
 }

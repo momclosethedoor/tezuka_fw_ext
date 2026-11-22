@@ -1,22 +1,19 @@
 //! Bench-only compact zoom transport. It never owns RF or a DMA slot.
-use super::{Header, R, Value, obn3, roi};
+use super::{Header, R, RoiRequest as Request, Value, histogram, obn3, roi, timing::Histogram};
 use serde_json::json;
 use std::{
     collections::VecDeque,
     io::{self, Write},
     net::{SocketAddr, TcpStream},
+    os::fd::AsRawFd,
     ops::Range,
     time::{Duration, Instant},
 };
 
 const CAPACITY: usize = 16;
 const FRAME_LIMIT: usize = 128 + obn3::COMPACT_BYTES;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Request {
-    pub center_hz: i64,
-    pub generation: u64,
-}
+const MAX_RANGES: usize = 12;
+const IO_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Visit {
@@ -54,7 +51,7 @@ impl Map {
     fn select(&mut self, request: Request) -> R<()> {
         for row in self.rows.iter_mut().flatten() {
             row.bins=roi::bin_ranges(request.center_hz,row.center_hz,row.side,&row.usable)
-                .filter(|bins| bins.len()<=12).ok_or("ROI bin selection bounds")?;
+                .filter(|bins| bins.len()<=MAX_RANGES).ok_or("ROI bin selection bounds")?;
         }
         Ok(())
     }
@@ -69,6 +66,7 @@ struct Packet {
 }
 
 pub(super) struct Stream {
+    full_scan: bool,
     request: Option<Request>,
     initial: Map,
     next: Option<Map>,
@@ -89,20 +87,21 @@ pub(super) struct Stream {
     queued_bytes: usize,
     peak_messages: usize,
     peak_bytes: usize,
-    max_send_ns: u64,
-    max_queue_ns: u64,
-    max_ready_ns: u64,
+    send: Histogram,
+    queue: Histogram,
+    ready: Histogram,
 }
 
 impl Stream {
-    pub(super) fn open(peer: SocketAddr, initial: Map, next: Option<Map>) -> R<Self> {
-        let socket=TcpStream::connect_timeout(&peer,Duration::from_secs(1)).map_err(|e|e.to_string())?;
+    pub(super) fn open(peer: SocketAddr, initial: Map, next: Option<Map>, full_scan: bool) -> R<Self> {
+        let socket=TcpStream::connect_timeout(&peer,IO_DEADLINE).map_err(|e|e.to_string())?;
         socket.set_nonblocking(true).map_err(|e|e.to_string())?;
-        Ok(Self{request:None,initial,next,socket:Some(socket),
+        Ok(Self{full_scan,request:None,initial,next,socket:Some(socket),
             free:(0..CAPACITY).map(|_|Vec::with_capacity(FRAME_LIMIT)).collect(),
             pending:VecDeque::with_capacity(CAPACITY),selected:0,selected_bins:0,prepared:0,
             sent:0,sent_bins:0,sent_bytes:0,accepted_bytes:0,rejected:0,abandoned:0,partial:0,
-            blocked:0,queued_bytes:0,peak_messages:0,peak_bytes:0,max_send_ns:0,max_queue_ns:0,max_ready_ns:0})
+            blocked:0,queued_bytes:0,peak_messages:0,peak_bytes:0,send:Histogram::default(),
+            queue:Histogram::default(),ready:Histogram::default()})
     }
 
     pub(super) fn update(&mut self, request: Option<Request>) -> R<()> {
@@ -117,12 +116,18 @@ impl Stream {
     }
 
     pub(super) fn prepare(&mut self, h: Header, raw: &[u8], anchor: u64, next_anchor: Option<u64>) -> R<()> {
-        let Some(request)=self.request else { return Ok(()); };
+        if !self.full_scan && self.request.is_none() {return Ok(());}
         let (map,anchor)=match (self.next.as_ref(),next_anchor) {
             (Some(next),Some(start)) if h.epoch>=start => (next,start),
             _ => (&self.initial,anchor),
         };
         let Some(relative)=h.epoch.checked_sub(anchor) else { return Ok(()); };
+        if self.full_scan {
+            let generation=map.generation;
+            self.prepare_full(h,raw,generation)?;
+            return Ok(());
+        }
+        let request=self.request.unwrap();
         let position=relative%map.rows.len() as u64;
         let Some(row)=map.rows[position as usize].as_ref() else { return Ok(()); };
         if row.bins.is_empty() { return Ok(()); }
@@ -147,18 +152,39 @@ impl Stream {
             frame.extend_from_slice(&range.end.to_le_bytes());
         }
         frame.extend_from_slice(raw);
+        self.enqueue(frame,bins);
+        Ok(())
+    }
+
+    fn prepare_full(&mut self, h: Header, raw: &[u8], generation: u64) -> R<()> {
+        if raw.len()!=obn3::COMPACT_BYTES {return Err("full compact TCP requires format 3".into());}
+        let bins=super::continuous::BINS as u64;
+        self.selected+=1;
+        self.selected_bins+=bins;
+        if self.socket.is_none() { self.rejected+=1;return Ok(()); }
+        let Some(mut frame)=self.free.pop() else { self.rejected+=1;return Ok(()); };
+        frame.clear();
+        frame.extend_from_slice(b"GCMP1\0\0\0");
+        for value in [h.ordinal,h.first_seq,h.epoch,h.first_tick,u64::from(h.k),u64::from(h.flags),generation] {
+            frame.extend_from_slice(&value.to_le_bytes());
+        }
+        frame.extend_from_slice(raw);
+        self.enqueue(frame,bins);
+        Ok(())
+    }
+
+    fn enqueue(&mut self, frame: Vec<u8>, bins: u64) {
         self.queued_bytes+=frame.len();
         self.pending.push_back(Packet{bytes:frame,offset:0,bins,ready:Instant::now(),first_send:None});
         self.prepared+=1;
         self.peak_messages=self.peak_messages.max(self.pending.len());
         self.peak_bytes=self.peak_bytes.max(self.queued_bytes);
-        Ok(())
     }
 
     pub(super) fn pump(&mut self) {
         let (Some(socket),Some(frame))=(self.socket.as_mut(),self.pending.front_mut()) else {return;};
         let now=Instant::now();
-        if now.duration_since(frame.ready)>Duration::from_secs(1) { self.close();return; }
+        if now.duration_since(frame.ready)>IO_DEADLINE { self.close();return; }
         let first=*frame.first_send.get_or_insert(now);
         match socket.write(&frame.bytes[frame.offset..]) {
             Ok(0)=>self.close(),
@@ -170,9 +196,9 @@ impl Stream {
                     self.sent+=1;
                     self.sent_bins+=frame.bins;
                     self.sent_bytes+=frame.offset as u64;
-                    self.max_send_ns=self.max_send_ns.max(first.elapsed().as_nanos() as u64);
-                    self.max_queue_ns=self.max_queue_ns.max(first.duration_since(frame.ready).as_nanos() as u64);
-                    self.max_ready_ns=self.max_ready_ns.max(frame.ready.elapsed().as_nanos() as u64);
+                    self.send.observe(first.elapsed());
+                    self.queue.observe(first.duration_since(frame.ready));
+                    self.ready.observe(frame.ready.elapsed());
                     self.free.push(self.pending.pop_front().unwrap().bytes);
                 }
             }
@@ -192,13 +218,18 @@ impl Stream {
     pub(super) fn pending(&self) -> bool { !self.pending.is_empty() }
 
     pub(super) fn stats(&self) -> Value {
-        json!({"generation":self.request.map(|r|r.generation),"selected":self.selected,
+        let socket_pending=self.socket.as_ref().and_then(|socket|{
+            let mut value=0i32;
+            (unsafe{libc::ioctl(socket.as_raw_fd(),libc::TIOCOUTQ,&mut value)}==0).then_some(value)
+        });
+        json!({"full_scan":self.full_scan,"generation":self.request.map(|r|r.generation),"selected":self.selected,
             "selected_bins":self.selected_bins,"prepared":self.prepared,"sent":self.sent,"sent_bins":self.sent_bins,
             "accepted_bytes":self.accepted_bytes,"sent_bytes":self.sent_bytes,"rejected":self.rejected,
             "abandoned":self.abandoned,"partial":self.partial,"blocked":self.blocked,
             "pending":self.pending.len(),"capacity":CAPACITY,"pending_bytes":self.queued_bytes,
             "peak_messages":self.peak_messages,"peak_bytes":self.peak_bytes,
             "oldest_ns":self.pending.front().map(|p|p.ready.elapsed().as_nanos() as u64),
-            "max_send_ns":self.max_send_ns,"max_queue_ns":self.max_queue_ns,"max_ready_ns":self.max_ready_ns})
+            "socket_pending_bytes":socket_pending,"send_ns":histogram(self.send),
+            "queue_ns":histogram(self.queue),"ready_to_api_complete_ns":histogram(self.ready)})
     }
 }

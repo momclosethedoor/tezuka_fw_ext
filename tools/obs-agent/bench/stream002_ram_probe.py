@@ -30,6 +30,11 @@ def main():
     parser.add_argument("--widths", type=int, nargs="+", choices=(0, 512, 1024, 2048), default=(0,))
     parser.add_argument("--seconds", type=int, choices=range(15, 31), default=20)
     parser.add_argument("--regression", action="store_true")
+    parser.add_argument("--field-counts", type=int, nargs="+", choices=(0, 1, 3, 5, 10), default=(0,))
+    parser.add_argument("--targets", type=Path)
+    parser.add_argument("--roi-center-hz", type=int)
+    parser.add_argument("--full-compact-tcp", action="store_true")
+    parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
     args = parser.parse_args()
     if not hasattr(hashlib, "file_digest"):
         hashlib.file_digest = file_digest
@@ -65,6 +70,8 @@ def main():
             b' test "$(devmem 0x7c460350)" = 0x314D4646',
             b' echo STREAM002_ABI_AND_MODULES_READY',
         ]) + b"\n")
+    if args.cached_dma:
+        loader.write_bytes(loader.read_bytes().replace(b"insmod ./obs_dma.ko cached=0",b"insmod ./obs_dma.ko cached=1"))
     prepare = log / "loader/prepare-r3.sh"
     prepare.write_bytes(prepare.read_bytes().replace(b"0x324E424F", b"0x334E424F")
                         .replace(b"0x7c4600e4)\" = 0x00000003", b"0x7c4600e4)\" = 0x00000004")
