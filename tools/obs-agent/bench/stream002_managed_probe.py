@@ -229,11 +229,15 @@ test "$(devmem 0x7c460284)" = 0x00000000
             generation = active["generation"]
             start = time.monotonic()
             snapshots = []
+            abort_ether = False
             arm_begin = stand.ssh(ARM_COUNTERS)
             host_begin = dict(receiver.view_stats(generation))
             while time.monotonic()-start < args.seconds:
                 sample = probe.request()
                 snapshots.append(summary(sample))
+                if transmitter and (snapshots[-1]["field_error"] or sample["phase"]=="failed"):
+                    abort_ether = True
+                    break
                 if sample["actual"]["running"] is not True or sample["actual"]["generation"] != generation:
                     break
                 target = start+len(snapshots)
@@ -245,7 +249,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
                        host_begin=host_begin, host_end=host_end, arm_begin=arm_begin, arm_end=arm_end)
             rows.append(row)
             probe.command(f"stop-{label}", dict(stopped, view_bins=width), seconds=12)
-            if transmitter and index + 1 == len(combinations):
+            if transmitter and (abort_ether or index + 1 == len(combinations)):
                 (log/"transmitter-done").touch()
                 print("TRANSMITTER_CAN_STOP",flush=True)
                 transmitter=False
@@ -262,6 +266,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
             stand.write_json(log / "windows.json", rows)
             print(json.dumps(dict(view=width, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
                 b=host_end["B"]-host_begin["B"])),flush=True)
+            if abort_ether:
+                break
     finally:
         if gated and (log/"transmitter-needed").exists() and not (log/"transmitter-done").exists():
             (log/"transmitter-done").touch()
