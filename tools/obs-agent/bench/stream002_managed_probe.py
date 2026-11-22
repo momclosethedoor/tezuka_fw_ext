@@ -17,6 +17,15 @@ SCAN = dict(op="scan", planner_version=2, path_ack_version=1, sweep_geometry="27
 FIELD_TIMEOUT_MS = 90
 ROI_PORT = 18011
 TRANSMITTER_WAIT_S = 90
+ARM_COUNTERS = """cat /proc/stat /proc/net/snmp
+printf 'uptime '
+cat /proc/uptime
+for name in maia-delivery obs-ffm1-iio; do
+    for pid in $(pidof "$name"); do
+        cat "/proc/$pid/stat" 2>/dev/null || continue
+        sed -n -e '/^VmRSS:/p' -e '/^VmHWM:/p' "/proc/$pid/status" 2>/dev/null || true
+    done
+done"""
 
 
 class BenchReceiver(Receiver):
@@ -195,7 +204,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
             if gated and num and not transmitter:
                 (log/"transmitter-needed").touch()
                 print("TRANSMITTER_READY_REQUIRED",flush=True)
-                deadline=time.monotonic()+TRANSMITTER_WAIT_S
+                deadline=time.monotonic()+(args.transmitter_wait_seconds or TRANSMITTER_WAIT_S)
                 while not (log/"transmitter-ready").exists():
                     if time.monotonic()>=deadline:
                         raise RuntimeError("transmitter ready signal timed out")
@@ -220,7 +229,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
             generation = active["generation"]
             start = time.monotonic()
             snapshots = []
-            arm_begin = stand.ssh("cat /proc/stat /proc/net/snmp; pidof maia-delivery | xargs -r -I{} cat /proc/{}/stat")
+            arm_begin = stand.ssh(ARM_COUNTERS)
             host_begin = dict(receiver.view_stats(generation))
             while time.monotonic()-start < args.seconds:
                 sample = probe.request()
@@ -231,7 +240,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
                 time.sleep(max(0,target-time.monotonic()))
             host_end = dict(receiver.view_stats(generation))
             elapsed = time.monotonic()-start
-            arm_end = stand.ssh("cat /proc/stat /proc/net/snmp; pidof maia-delivery | xargs -r -I{} cat /proc/{}/stat")
+            arm_end = stand.ssh(ARM_COUNTERS)
             row = dict(view=width, field=num, seconds=elapsed, generation=generation, samples=snapshots,
                        host_begin=host_begin, host_end=host_end, arm_begin=arm_begin, arm_end=arm_end)
             rows.append(row)

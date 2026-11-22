@@ -38,6 +38,8 @@ def main():
     parser.add_argument("--full-compact-tcp", action="store_true")
     parser.add_argument("--gate-transmitter", action="store_true",
                         help="pause before FIELD windows for the operator's ready signal")
+    parser.add_argument("--transmitter-wait-seconds", type=int,
+                        help="wait 30 to 150 seconds for transmitter readiness (default 90)")
     parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
     args = parser.parse_args()
     compact_tcp = args.full_compact_tcp or args.roi_center_hz is not None
@@ -48,6 +50,10 @@ def main():
     if args.roi_range_hz and (not args.managed or args.regression or
                               not 70_000_000 <= args.roi_range_hz[0] < args.roi_range_hz[1] <= 13_000_000_000):
         parser.error("packed ROI requires a managed scan and increasing RF limits")
+    if args.transmitter_wait_seconds is not None and (
+        not args.gate_transmitter or not 30 <= args.transmitter_wait_seconds <= 150
+    ):
+        parser.error("--transmitter-wait-seconds requires --gate-transmitter and 30 to 150 seconds")
     if not hasattr(hashlib, "file_digest"):
         hashlib.file_digest = file_digest
     sys.path.insert(0, str(args.stand.resolve()))
