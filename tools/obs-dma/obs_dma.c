@@ -23,21 +23,38 @@ static struct region regions[2] = { {.len=0x2000000}, {.len=0x200000} };
 static struct device *dev;
 static void __iomem *csr;
 static atomic_t opened=ATOMIC_INIT(0);
+static bool quarantine;
+static bool supported_spectrum(void)
+{
+ u32 id=readl(csr+0x50), revision=readl(csr+0xe4);
+ return (id==0x324e424f && revision==3) ||
+        (id==0x334e424f && revision==4 && (readl(csr+0xe0)&0x60)==0x60);
+}
+static bool engine_drained(u32 status)
+{
+ /* running, DMA busy and DRAINED are live in both supported revisions. */
+ return (status & 0x13)==0x10;
+}
 struct info { u64 full, view; u32 full_len, view_len, cached, cache_line, abi, reserved; };
 struct sync_range { u32 region, offset, len, for_cpu; };
 static int open_owner(struct inode *i, struct file *f)
 {
  if (!capable(CAP_SYS_RAWIO)) return -EPERM;
- return atomic_cmpxchg(&opened,0,1) ? -EBUSY : 0;
+ if (atomic_cmpxchg(&opened,0,1)) return -EBUSY;
+ if (READ_ONCE(quarantine)) { atomic_set(&opened,0); return -EIO; }
+ return 0;
 }
 static int close_owner(struct inode *i, struct file *f)
 {
  u32 status;
- if (readl(csr+0x50)==0x324e424f && readl(csr+0xe4)==3) {
+ if (supported_spectrum()) {
   writel(4,csr+0x54);
-  if (readl_poll_timeout(csr+0x64,status,!(status&3),100,500000))
-   pr_err("obs_dma: STOP timed out; allocations STILL PINNED until reboot\n");
+  if (readl_poll_timeout(csr+0x64,status,engine_drained(status),100,500000))
+   WRITE_ONCE(quarantine,true);
+ } else {
+  WRITE_ONCE(quarantine,true);
  }
+ if (READ_ONCE(quarantine)) pr_err("obs_dma: unconfirmed STOP/ABI; allocations pinned, reboot required\n");
  atomic_set(&opened,0);
  return 0;
 }
@@ -86,7 +103,7 @@ static int __init begin(void)
 {
  int i,err=-ENODEV;
  csr=ioremap(0x7c460000,0x1000); if(!csr) return -ENOMEM;
- if(readl(csr+0x50)!=0x324e424f || readl(csr+0xe4)!=3 || (readl(csr+0x64)&3)) goto fail;
+ if(!supported_spectrum() || !engine_drained(readl(csr+0x64))) goto fail;
  if(readl(csr+0x1c0)!=1024 || readl(csr+0x1c4)!=32768 || readl(csr+0x1c8)!=2048) { err=-EINVAL; goto fail; }
  dev=bus_find_device_by_name(&platform_bus_type,NULL,"7c460000.maia-sdr"); if(!dev) goto fail;
  err=dma_set_mask_and_coherent(dev,DMA_BIT_MASK(32)); if(err) goto fail;
