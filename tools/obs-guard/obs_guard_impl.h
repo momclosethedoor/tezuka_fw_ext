@@ -447,6 +447,7 @@ static int obs_thread(void *arg){int cmd,r,recovery;unsigned long flags;
 }
 static int obs_validate(struct obs_setup *c,u8 *tables,size_t stride){u32 i,j;
  bool cap2 = obs_r(OBS_CAP2_ID_REG) == OBS_CAP2_ID;
+ bool field_map = obs_r(0x350) == 0x314d4646; /* FFM1 */
  if(c->catalog_count<8||c->catalog_count>stride/32||!c->map_count||c->map_count>stride/32||!c->next_count||c->next_count>stride/32||!c->version||c->next_version==c->version||!c->next_version||c->reserved||c->restore_lo<70000000ULL||c->restore_lo>6000000000ULL||c->gpio_base!=512)return -EINVAL;
  if(c->tx_enable>1||c->tx_rf_on>1||c->tx_rf_on>c->tx_enable||c->tx_start_slot>7||c->tx_atten_mdb>89750||(c->extra_reserved && !(c->extra_reserved & OBS_GATE_OPT)))return -EINVAL;
  if(c->extra_reserved & OBS_GATE_OPT){
@@ -458,9 +459,13 @@ static int obs_validate(struct obs_setup *c,u8 *tables,size_t stride){u32 i,j;
  for(j=0;j<2;j++){u8 *p=tables+(1+j)*stride;u32 n=j?c->next_count:c->map_count;
   for(i=0;i<n;i++){u32 idx=get_unaligned_le32(p+i*32),flags=get_unaligned_le32(p+i*32+4);
    u32 job = get_unaligned_le32(p+i*32+12);
-   bool assigned = flags & BIT(3);
-   if(idx>=c->catalog_count||(flags & ~(0x00ff070fU | ((c->extra_reserved & OBS_GATE_OPT)?BIT(4):0)))||assigned!=!!job)return -EINVAL;
-   if(assigned&&!cap2)return -EOPNOTSUPP;
+   bool capture = flags & BIT(3);
+   bool field = flags & BIT(5);
+   if(idx>=c->catalog_count||(flags & ~(0x00ff072fU | ((c->extra_reserved & OBS_GATE_OPT)?BIT(4):0))))return -EINVAL;
+   if((capture&&!cap2)||(field&&!field_map))return -EOPNOTSUPP;
+   /* CAP2 owns the full word on a double mark. FIELD-only uses a 28-bit
+    * signed NCO word, where zero is a valid on-centre assignment. */
+   if(capture ? !job : field ? (job & 0xf0000000U) : job)return -EINVAL;
    /* Segment slots require a prepared TX bank; RF may still be off. */
    if((flags&0x704)&&!c->tx_enable)return -EINVAL;
   }
