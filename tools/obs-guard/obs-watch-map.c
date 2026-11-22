@@ -29,8 +29,8 @@ static void put32(uint8_t *dst, uint32_t value)
 
 int main(int argc, char **argv)
 {
-    uint8_t wat[WATCH_MAX_BYTES], rows[WATCH_MAX * 32u];
-    struct watch_map tasks;
+    static uint8_t wat[WATCH_HEADER+WATCH_RESIDENT_MAX*WATCH_RECORD], rows[WATCH_RESIDENT_MAX*32u];
+    struct watch_table tasks;
     size_t wat_size, row_size;
     if (argc != 5) return 2;
     char *end;
@@ -39,7 +39,7 @@ int main(int argc, char **argv)
     if (errno || *end || !version || version > UINT32_MAX) return 2;
     if (read_file(argv[1], wat, sizeof(wat), &wat_size) ||
         read_file(argv[2], rows, sizeof(rows), &row_size) ||
-        watch_parse(&tasks, wat, wat_size) || version != tasks.version ||
+        watch_table_read(&tasks, wat, wat_size, WATCH_RESIDENT_MAX, 13000000000ull) || version != tasks.version ||
         row_size != 32u * tasks.count) return 3;
     for (unsigned i = 0; i < tasks.count; ++i) {
         uint8_t *row = rows + 32u * i;
@@ -49,8 +49,9 @@ int main(int argc, char **argv)
         if (cap2 ? !word : (flags & 32u) ? word >= 0x10000000u : word != 0)
             return 3;
         flags &= ~32u;
-        if (tasks.target[i].enabled) flags |= 32u;
-        if (!cap2) put32(row + 12, tasks.target[i].enabled ? tasks.target[i].nco : 0);
+        struct watch_target target=watch_row(&tasks,i);
+        if (target.enabled) flags |= 32u;
+        if (!cap2) put32(row + 12, target.enabled ? target.nco : 0);
         put32(row + 4, flags);
     }
     int fd = open(argv[3], O_CREAT | O_EXCL | O_WRONLY | O_BINARY, 0600);

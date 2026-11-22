@@ -2,6 +2,7 @@
 #![allow(missing_docs)]
 mod calibration;
 mod field;
+mod resident_field;
 mod generated;
 mod guard_take;
 mod mixer_math;
@@ -62,6 +63,8 @@ struct Config {
     antenna_bands: AntennaBands,
     #[serde(default)]
     field_preview: Option<field::Config>,
+    #[serde(default)]
+    resident_field: Option<resident_field::Config>,
 }
 
 type AntennaBands = BTreeMap<u64, Vec<[u64; 2]>>;
@@ -269,6 +272,10 @@ fn view_mode(settings: &Value) -> Result<u32> {
 }
 
 fn validate(v: &Value) -> Result<()> {
+    if v.get("field_targets").is_some() {
+        ensure!(v["op"] == "scan" && v["planner_version"] == 2, "field_targets requires v2 scan");
+        resident_field::targets(&v["field_targets"])?;
+    }
     if v.get("view_bins").is_some() {
         ensure!(matches!(v["op"].as_str(), Some("scan" | "analysis")), "view_bins requires scan or analysis");
         view_mode(v)?;
@@ -1715,6 +1722,7 @@ fn worker(
         let applied_next = RefCell::new(None);
         let stall_sample = RefCell::new(Value::Null);
         let watch = RefCell::new(None);
+        let resident = RefCell::new(None);
         let result = (|| {
             let mut setup = config_result?;
             let mode = actual.borrow()["mode"].as_str().unwrap().to_owned();
@@ -1740,6 +1748,9 @@ fn worker(
             let mut sweep = None;
             let mut next_spectrum = None;
             let mut next_sweep = None;
+            let mut field_directory = None;
+            let targets = if mode=="scan" {resident_field::targets(&actual.borrow()["scan"]["field_targets"])?}
+                else {Vec::new()};
             if let Some(setup) = setup.as_mut() {
                 let mut a = actual.borrow_mut();
                 if a["spectrum"]["sweep_wire_version"] == 1 {
@@ -1757,6 +1768,29 @@ fn worker(
                         a["prepared_next_version"] = second["version"].clone();
                         next_spectrum = Some(second);
                     }
+                }
+                if !targets.is_empty() {
+                    ensure!(c.resident_field.is_some() && regs.read(0x350)==0x314d4646
+                        && a["spectrum"]["sweep_wire_version"]==1,
+                        "resident FIELD requires FLD2/FFM1 and the physical A/B map");
+                    let directory=c.output.join(format!("field-{generation}"));
+                    fs::create_dir(&directory)?;
+                    let stride=(setup.len()-200)/3;
+                    let count=word(setup,8) as usize;
+                    let start=40+stride;
+                    ensure!(count*32<=stride,"FIELD active map bounds");
+                    let plan=resident_field::Plan::compile(&mut setup[start..start+count*32],
+                        &a["spectrum"],&targets,generation)?;
+                    a["field_watch"]=plan.save(&directory)?;
+                    if let Some(desc)=next_spectrum.as_ref() {
+                        let count=word(setup,12) as usize;
+                        let start=40+2*stride;
+                        ensure!(count*32<=stride,"FIELD NEXT map bounds");
+                        let plan=resident_field::Plan::compile(&mut setup[start..start+count*32],
+                            desc,&targets,generation+1)?;
+                        a["field_watch"]["next"]=plan.save(&directory)?;
+                    }
+                    field_directory=Some(directory);
                 }
                 drop(a);
                 managed_tx = word(setup, setup.len() - 4) & 1 != 0;
@@ -1860,6 +1894,19 @@ fn worker(
                 actual.borrow_mut()["guard_tx"] =
                     json!({"executor":s[9]&4!=0,"powerdown":s[112],"attenuation_mdb":s[113],
                         "readback_scope":"take","per_visit":managed_tx});
+            }
+            if let Some(directory)=field_directory.as_ref() {
+                let mut renewed=Instant::now();
+                let session=resident_field::Session::start(c.resident_field.as_ref().unwrap(),
+                    directory,c.video,&regs,||{
+                        ensure!(!shared.switch.load(Ordering::Acquire),"FFM1 startup cancelled");
+                        if guard_rf && renewed.elapsed()>=Duration::from_millis(80) {
+                            guard_cmd(&guard_fd,0x4606)?;
+                            renewed=Instant::now();
+                        }
+                        Ok(())
+                    })?;
+                *resident.borrow_mut()=Some(session);
             }
             let scan = mode == "scan";
             let tx_active = actual.borrow()["tx"]["on"] == true;
@@ -2030,6 +2077,9 @@ fn worker(
                     generation:next_gen,version,sweep:s,anchor:&next_anchor,started:&next_started,
                 }),
                 check: &|| {
+                    if let Some(note)=resident.borrow_mut().as_mut().and_then(resident_field::Session::exit_note) {
+                        shared.inbox.lock().unwrap().actual["field_watch"]["error"]=json!(note);
+                    }
                     if let Some(note) = watch
                         .borrow_mut()
                         .as_mut()
@@ -2103,7 +2153,17 @@ fn worker(
         let field_stop = watch
             .into_inner()
             .map_or(Ok(()), |field| field.finish(&regs));
-        let result = result.and(field_stop);
+        let resident_stop=resident.into_inner().map_or(Ok(()),|field| {
+            let mut renewed=Instant::now();
+            field.finish(&regs,||{
+                if guard_rf && renewed.elapsed()>=Duration::from_millis(80) {
+                    guard_cmd(&guard_fd,0x4606)?;
+                    renewed=Instant::now();
+                }
+                Ok(())
+            })
+        });
+        let result = result.and(field_stop).and(resident_stop);
         let stalled = result.as_ref().is_err_and(|e| e.to_string()==crate::system_reader::PROGRESS_LOST);
         if stalled {
             let mut q = shared.inbox.lock().unwrap();
@@ -2281,6 +2341,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     if let Some(preview) = &c.field_preview {
         preview.validate()?;
     }
+    if let Some(field)=&c.resident_field {field.validate()?;}
+    ensure!(c.resident_field.is_none() || c.field_preview.is_none(),"only one FIELD collector may be configured");
     if c.scan.get("antenna_bands").is_none() && !c.antenna_bands.is_empty() {
         c.scan["antenna_bands"] = json!(c.antenna_bands);
     }
@@ -2366,12 +2428,18 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         );
     }
     let regs = Registers::open()?;
+    let stream002 = regs.read(0x50) == 0x334e424f && regs.read(0xe4) == 4
+        && regs.read(0xe0) & 0x60 == 0x60 && regs.read(0x280) == 0x32444c46
+        && regs.read(0x350) == 0x314d4646;
+    let legacy = regs.read(0x50) == 0x324e424f && regs.read(0xe4) == 3;
     ensure!(
-        regs.read(0x50) == 0x324e424f
-            && regs.read(0x224) == 0x31444c46
+        (stream002 || legacy) && regs.read(0x224) == 0x31444c46
             && Path::new("/dev/obs_cap2").exists(),
-        "row99 CAP2/OBN2/FIELD1 devices required"
+        "row99 CAP2 and compatible spectral ABI required"
     );
+    ensure!(!stream002 || !c.bench_split544, "OBN3 requires separate DMA regions");
+    ensure!(!stream002 || c.field_preview.is_none(), "legacy FIELD1 collector requires OBN2");
+    ensure!(stream002 || c.resident_field.is_none(), "resident FIELD collector requires OBN3/FLD2/FFM1");
     ensure!(
         regs.read(0x64) == 16
             && regs.read(0x1e0) == 0
@@ -2416,7 +2484,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         None => json!({"kind":"direct","antenna":0,"multiplier":1,"side":1}),
     };
     let pl_timing_only = c.scan["bench_timing_only"] == true;
-    ensure!(!pl_timing_only || (c.external_mixer.is_none() && c.field_preview.is_none()
+    ensure!(!pl_timing_only || (c.external_mixer.is_none() && c.field_preview.is_none() && c.resident_field.is_none()
             && c.scan["planner_version"] == 2), "PL timing fixture requires a v2 scan-only configuration");
     let guard_info = guard_cmd(&guard_fd, 0x4605)?;
     let xtg1 = if c.scan["xtg1_wait_ticks"].is_null() { None } else {
@@ -2453,7 +2521,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let (threshold, mult) = generated::environment()?;
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
-    let capabilities = json!({"tx_on":manual,"view_bins":[512,1024,2048],"view_delivery_reads_full":false,"ring_layout":if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some(),
+    let view_modes: &[u32] = if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
+    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":stream002,"ring_layout":if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
@@ -2564,6 +2633,7 @@ mod tests {
             scan_tx: vec![p; 8],
             antenna_bands: BTreeMap::new(),
             field_preview: None,
+            resident_field: None,
         };
         let input = json!({"scan":{"ranges":[
             {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},

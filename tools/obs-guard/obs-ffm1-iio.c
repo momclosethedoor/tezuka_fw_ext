@@ -32,6 +32,7 @@ static double monotonic(void)
     clock_gettime(CLOCK_MONOTONIC,&t);
     return t.tv_sec+t.tv_nsec*1e-9;
 }
+#include "obs-field-egress.h"
 static int iio_in_use(void)
 {
     glob_t paths={0};
@@ -111,32 +112,40 @@ static struct observation get_head(volatile uint32_t *reg)
     return (struct observation){words[0]|((uint64_t)words[1]<<32),words[2],
         words[3]&65535,(words[3]>>16)&15,(words[3]>>20)&1,words[4],words[5]};
 }
-static int load_version(const char *directory,uint32_t version,struct watch_map *wat)
+static int load_version(const char *directory,uint32_t version,struct watch_table *wat,uint8_t *data)
 {
     char path[1024];
     int n=snprintf(path,sizeof path,"%s/WAT1-%u.bin",directory,version);
     if(n<0 || (size_t)n>=sizeof path) return -1;
     FILE *f=fopen(path,"rb");
     if(!f) return -1;
-    uint8_t data[WATCH_MAX_BYTES+1];
-    size_t len=fread(data,1,sizeof data,f);
-    int bad=ferror(f) || len==sizeof data;
-    if(fclose(f) || bad || watch_parse(wat,data,len)) return -1;
+    size_t limit=WATCH_HEADER+WATCH_RECORD*WATCH_RESIDENT_MAX+1;
+    size_t len=fread(data,1,limit,f);
+    int bad=ferror(f) || len==limit;
+    if(fclose(f) || bad || watch_table_read(wat,data,len,WATCH_RESIDENT_MAX,13000000000ull)) return -1;
     return wat->version==version?0:-1;
 }
-static int report(const struct observation *o, const struct watch_map *wat,
-                  enum preview_result payload, size_t bytes)
+static int report(const struct observation *o, const struct watch_table *wat,
+                  enum preview_result status, const uint8_t *payload, size_t bytes,
+                  struct field_egress *egress, bool send_enabled, double receipt_time)
 {
-    bool known=o->version==wat->version && o->position<wat->count &&
-               wat->target[o->position].enabled;
-    const struct watch_target *task=known?&wat->target[o->position]:NULL;
-    return printf("{\"version\":%u,\"position\":%u,\"epoch\":%llu,\"started\":%u,"
+    struct watch_target task={0};
+    if(o->version==wat->version && o->position<wat->count) task=watch_row(wat,o->position);
+    bool known=task.enabled;
+    char metadata[FIELD_META];
+    double ready=monotonic();
+    int count=snprintf(metadata,sizeof metadata,
+        "{\"kind\":\"field\",\"version\":%u,\"position\":%u,\"epoch\":%llu,\"started\":%u,"
         "\"outcome\":%u,\"revision\":%llu,\"generation\":%llu,\"target_hz\":%llu,"
-        "\"first\":%u,\"end\":%u,\"payload_status\":%u,\"consumed_field_bytes\":%zu}\n",
+        "\"first\":%u,\"end\":%u,\"payload_status\":%u,\"consumed_field_bytes\":%zu,"
+        "\"receipt_arm_s\":%.9f,\"payload_ready_arm_s\":%.9f}",
         o->version,o->position,(unsigned long long)o->epoch,o->started,o->outcome,
         (unsigned long long)(known?wat->revision:0),
-        (unsigned long long)(known?task->generation:0),(unsigned long long)(known?task->hz:0),
-        o->first,o->end,(unsigned)payload,bytes)<0 || !known;
+        (unsigned long long)task.generation,(unsigned long long)task.hz,
+        o->first,o->end,(unsigned)status,bytes,receipt_time,ready);
+    if(count<0 || (size_t)count>=sizeof metadata) return -1;
+    if(send_enabled) field_queue(egress,metadata,(size_t)count,payload,bytes,ready);
+    return puts(metadata)<0 || !known;
 }
 
 int main(int argc,char **argv)
@@ -150,10 +159,15 @@ int main(int argc,char **argv)
     void *lib=NULL,*context=NULL,*buffer=NULL;
     struct iio_api io={0};
     volatile uint32_t *reg=MAP_FAILED;
-    struct watch_map wat={0};
+    struct watch_table wat={0};
+    uint8_t *watch_bytes=malloc(WATCH_HEADER+WATCH_RECORD*WATCH_RESIDENT_MAX+1);
     uint8_t *storage=malloc(RETAIN),*preview=malloc(FIELD_MAX);
+    struct field_egress egress={.fd=-1};
+    const char *host=getenv("OBS_FFM1_HOST"), *port=getenv("OBS_FFM1_PORT");
+    bool send_enabled=host && port;
     struct preview_history history;
-    if(!preview || preview_init(&history,storage,RETAIN)) goto done;
+    if(!watch_bytes || !preview || preview_init(&history,storage,RETAIN) ||
+       (!!host!=!!port) || (send_enabled && field_connect(&egress,host,port,FIELD_MAX))) goto done;
     lib=dlopen("libiio.so.0",RTLD_NOW);
     if(!lib || load_api(lib,&io)) goto done;
     owner=open("/run/obs-field1.lock",O_RDWR|O_CREAT|O_CLOEXEC,0600);
@@ -196,15 +210,16 @@ int main(int argc,char **argv)
     fprintf(stderr,"FFM1_READY block=%d history=%d\n",BLOCK,RETAIN);
     struct observation obs={0};
     uint64_t first64=0,end64=0;
+    double receipt_time=0;
     int pending=0,draining=0,failed=0;
     rc=0;
     for(;;) {
         if(stopping && !draining) {
             /* The map owner has stopped admission before signalling shutdown.
              * Keep IIO RUN asserted during the bounded suffix drain. */
-            write_reg(reg,SESSION,0);
+            write_reg(reg,COMMAND,2);
             draining=1;
-            deadline=monotonic()+((double)BLOCK*2/15360000.0)+0.25;
+            deadline=monotonic()+1.25;
         }
         ssize_t got=io.buffer_refill(buffer);
         if(got>0) {
@@ -215,7 +230,11 @@ int main(int argc,char **argv)
             enum preview_result status=PREVIEW_READY;
             if(!pending) {
                 obs=get_head(reg);
-                if(wat.version!=obs.version && load_version(argv[1],obs.version,&wat)) failed=1;
+                receipt_time=monotonic();
+                if(wat.version!=obs.version && load_version(argv[1],obs.version,&wat,watch_bytes)) {
+                    wat=(struct watch_table){0};
+                    failed=1;
+                }
                 if(!obs.outcome || obs.outcome>7 || (obs.outcome!=1 && (obs.first||obs.end))) failed=1;
                 if(obs.outcome==1) status=preview_bounds(&history,obs.first,obs.end,&first64,&end64);
                 write_reg(reg,POP,1);
@@ -226,26 +245,36 @@ int main(int argc,char **argv)
             if(status==PREVIEW_WAIT && !expired) break;
             if(status==PREVIEW_WAIT) status=PREVIEW_LOST;
             size_t extent=status==PREVIEW_READY && obs.outcome==1?(size_t)(end64-first64):0;
-            if(extent) __asm__ volatile ("" : : "r"(preview), "r"(extent) : "memory");
-            /* The product egress adapter takes a protected copy of this extent.
-             * This acceptance entry point measures consumed without networking. */
-            if(report(&obs,&wat,status,extent) || status!=PREVIEW_READY) failed=1;
+            if(report(&obs,&wat,status,preview,extent,&egress,send_enabled,receipt_time) ||
+               status!=PREVIEW_READY) failed=1;
             pending=0;
         }
-        if(expired || (draining && !pending && !(reg[STATUS/4]&0xc1) && !(reg[LEVEL/4]&0x1ff))) break;
+        field_pump(&egress);
+        if(expired || (draining && !pending && !egress.count && !(reg[STATUS/4]&0xc1) &&
+           !(reg[LEVEL/4]&0x1ff))) break;
         if(reg[STATUS/4]&16) {rc=4;break;}
         if(got>0) continue;
-        struct pollfd p={.fd=pollfd,.events=POLLIN};
+        struct pollfd p[2]={{.fd=pollfd,.events=POLLIN},{.fd=egress.count?egress.fd:-1,.events=POLLOUT}};
         /* The accepted FIELD timeout bounds receipt observation if the IIO
          * source goes quiet; admission itself is exclusively in hardware. */
         int wait_ms=draining?(int)((deadline-monotonic())*1000)+1:(int)ms;
         if(wait_ms<0) wait_ms=0;
-        if(poll(&p,1,wait_ms)<0 && errno!=EINTR) {rc=4;break;}
-        if(p.revents&(POLLHUP|POLLERR|POLLNVAL)) {rc=4;break;}
+        if(wait_ms>20) wait_ms=20;
+        if(poll(p,2,wait_ms)<0 && errno!=EINTR) {rc=4;break;}
+        if(p[0].revents&(POLLHUP|POLLERR|POLLNVAL)) {rc=4;break;}
     }
-    if(reg[LOST/4]!=lost_start || pending || failed) rc=4;
+    field_abandon(&egress);
+    if(reg[LOST/4]!=lost_start || pending || failed || reg[LEVEL/4]&0x1ff) rc=4;
     fprintf(stderr,"FFM1_STOP bytes=%llu receipt_lost=%u error=%d\n",
         (unsigned long long)history.consumed,reg[LOST/4]-lost_start,rc);
+    fprintf(stderr,"FFM1_EGRESS sent=%llu sent_bytes=%llu accepted_bytes=%llu rejected=%llu abandoned=%llu "
+        "partial=%llu blocked=%llu high=%u high_bytes=%zu socket_peak=%d "
+        "max_wait_s=%.9f max_send_s=%.9f max_total_s=%.9f\n",
+        (unsigned long long)egress.sent,(unsigned long long)egress.sent_bytes,
+        (unsigned long long)egress.accepted_bytes,(unsigned long long)egress.rejected,
+        (unsigned long long)egress.abandoned,(unsigned long long)egress.partial,
+        (unsigned long long)egress.blocked,egress.peak,egress.peak_bytes,egress.socket_peak,
+        egress.max_queue_s,egress.max_send_s,egress.max_ready_s);
 done:
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,2);write_reg(reg,RUN,0);}
     if(buffer) io.buffer_destroy(buffer);
@@ -259,6 +288,8 @@ done:
     if(guard>=0) close(guard);
     if(owner>=0) close(owner);
     if(lib) dlclose(lib);
-    free(preview);free(storage);
+    if(egress.fd>=0) close(egress.fd);
+    for(unsigned i=0;i<FIELD_QUEUE;++i) free(egress.packets[i].bytes);
+    free(watch_bytes);free(preview);free(storage);
     return rc;
 }

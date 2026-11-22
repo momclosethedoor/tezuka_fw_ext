@@ -75,12 +75,13 @@ jobs:
           mkdir agent-artifact
           cp tools/obs-agent/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd agent-artifact/
           $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -ldl -o agent-artifact/obs-field1
+          $OPENBLAS_CC -O2 -Wall -Wextra -Werror tools/obs-guard/obs-ffm1-iio.c -ldl -o agent-artifact/obs-ffm1-iio
           output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
           find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
           sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
           cp board/tezuka/nano/overlay_goofy/usr/sbin/goofy_lease.sh agent-artifact/
           cd agent-artifact
-          sha256sum maia-httpd obs-field1 goofy_lease.sh elf.txt source-sha256.txt > SHA256SUMS
+          sha256sum maia-httpd obs-field1 obs-ffm1-iio goofy_lease.sh elf.txt source-sha256.txt > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
           name: obs007c-main-agent
