@@ -3,7 +3,13 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#ifdef OBS_MULTI_WATCH_BENCH
+/* The checked direct 70–5900 MHz A/B map fits. One 512-entry watch file
+   occupies at most 16 KiB plus its 32-byte header. */
+#define WATCH_MAX 512u
+#else
 #define WATCH_MAX 128u
+#endif
 #define WATCH_HEADER 32u
 #define WATCH_RECORD 32u
 #define WATCH_MAX_BYTES (WATCH_HEADER+WATCH_MAX*WATCH_RECORD)
