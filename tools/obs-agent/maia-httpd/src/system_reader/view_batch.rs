@@ -1,4 +1,5 @@
 use std::{io,net::UdpSocket,time::{Duration,Instant}};
+use super::timing::Histogram;
 pub struct UdpBatch {
  pub bytes:Vec<u8>,pub pending:u64,pub sent:u64,pub dropped:u64,pub datagrams:u64,pub send_calls:u64,
  pub mtu:Option<u32>,pub ip_fragmentation:bool,
@@ -7,6 +8,7 @@ pub struct UdpBatch {
  pub sent_bytes:u64,pub high_records:u64,pub would_block:u64,pub send_errors:u64,
  pub last_errno:Option<i32>,pub notes_sent:u64,pub notes_lost:u64,pub transition:u64,
  pub rejected_before_queue:u64,pub suppressed:u64,
+ pub(super) api_send:Histogram,pub(super) oldest_to_send:Histogram,
  first:Option<Instant>,record_size:usize,
 }
 impl UdpBatch {
@@ -15,7 +17,8 @@ impl UdpBatch {
   Self{max_records,bytes:Vec::with_capacity(record_size*max_records),pending:0,sent:0,dropped:0,datagrams:0,
    phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,send_calls:0,mtu:None,ip_fragmentation:false,oldest_wait_bins:[0;32],
    sent_bytes:0,high_records:0,would_block:0,send_errors:0,last_errno:None,
-   notes_sent:0,notes_lost:0,transition:0,rejected_before_queue:0,suppressed:0}
+   notes_sent:0,notes_lost:0,transition:0,rejected_before_queue:0,suppressed:0,
+   api_send:Histogram::default(),oldest_to_send:Histogram::default()}
  }
  pub fn new(record_size:usize)->Self {
   let delay=std::env::var("OBS_VIEW_COALESCE_US").ok().and_then(|s|s.parse::<u64>().ok()).filter(|v|*v<=10000).unwrap_or(0);
@@ -65,8 +68,12 @@ impl UdpBatch {
   }
   for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
    self.send_calls+=1;
+   let before=self.phase_on.then(Instant::now);
    match s.send(packet){
-    Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;self.sent_bytes+=n as u64;},
+    Ok(n)if n==packet.len()=>{self.sent+=count;self.datagrams+=1;self.sent_bytes+=n as u64;
+     if let Some(before)=before {self.api_send.observe(before.elapsed());}
+     if self.phase_on && let Some(ready)=self.first {self.oldest_to_send.observe(ready.elapsed());}
+    },
     result=>{
      self.dropped+=count;
      let (blocked,errno)=send_error(result);

@@ -8,6 +8,7 @@ mod progress;
 mod obn3;
 mod roi;
 mod roi_stream;
+mod timing;
 pub(crate) use roi_stream::{Map as RoiMap, Request as RoiRequest};
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
@@ -493,6 +494,15 @@ fn view_idle_wait(k:u32)->Duration {
  Duration::from_micros((u64::from(k)*4096*1_000_000/(8*61_440_000)).min(64))
 }
 
+fn histogram(h:timing::Histogram)->Value {
+ json!({"bins_upper_ns_pow2":h.bins,"max_ns":h.max_ns})
+}
+
+fn udp_socket_queue(socket:&std::net::UdpSocket)->Option<i32> {
+ let mut value=0i32;
+ (unsafe{libc::ioctl(socket.as_raw_fd(),libc::TIOCOUTQ,&mut value)}==0).then_some(value)
+}
+
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
@@ -622,6 +632,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
    if let Ok(mut v)=mark(&mut io,&reader,start){
     v["network"]=network.borrow().counts();
+    v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
+    if io.phase_on {
+     v["observed_to_payload"]=histogram(reader.observed_to_payload);
+     v["release"]=histogram(reader.release);
+    }
     v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);
     *STATUS.lock().unwrap()=v;
    }status_due=Instant::now();
@@ -663,6 +678,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  if let Ok(mut v)=mark(&mut io,&reader,start){
   v["network"]=network.borrow().counts();
+  v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
+  if io.phase_on {
+   v["observed_to_payload"]=histogram(reader.observed_to_payload);
+   v["release"]=histogram(reader.release);
+  }
   v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);
   *STATUS.lock().unwrap()=v;
  }
@@ -697,5 +717,7 @@ impl UdpBatch {
   "rejected_before_queue":self.rejected_before_queue,"transition_records":self.transition,"suppressed_records":self.suppressed,
   "completion_sent":self.notes_sent,"completion_send_drop":self.notes_lost,
   "send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,
-  "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string(),"oldest_view_wait_ns_pow2":self.phase_on.then_some(self.oldest_wait_bins),})}
+  "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string(),"oldest_view_wait_ns_pow2":self.phase_on.then_some(self.oldest_wait_bins),
+  "api_send_ns":self.phase_on.then(||histogram(self.api_send)),
+  "batch_oldest_to_api_complete_ns":self.phase_on.then(||histogram(self.oldest_to_send)),})}
 }

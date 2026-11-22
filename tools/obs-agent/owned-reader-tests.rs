@@ -47,6 +47,7 @@ fn mock()->Mock{Mock{full:hex("tools/obs-agent/maia-httpd/tests/view/mode1/ordin
 }
 
 #[path="maia-httpd/src/system_reader/view_batch.rs"] mod view_batch;
+#[path="maia-httpd/src/system_reader/timing.rs"] mod timing;
 #[path="maia-httpd/src/system_reader/sweep_delivery.rs"] mod sweep_delivery;
 use continuous::Header;
 use view_batch::UdpBatch;
