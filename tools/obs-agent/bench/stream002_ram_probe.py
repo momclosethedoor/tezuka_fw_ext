@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--widths", type=int, nargs="+", choices=(0, 512, 1024, 2048), default=(0,))
     parser.add_argument("--seconds", type=int, choices=range(15, 31), default=20)
     parser.add_argument("--regression", action="store_true")
-    parser.add_argument("--field-counts", type=int, nargs="+", choices=(0, 1, 3, 5, 10), default=(0,))
+    parser.add_argument("--field-counts", type=int, nargs="+", choices=range(11), default=(0,))
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--roi-center-hz", type=int)
     parser.add_argument("--roi-range-hz", type=int, nargs=2, metavar=("LOW", "HIGH"))

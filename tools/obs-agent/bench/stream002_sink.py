@@ -21,7 +21,12 @@ def exact(conn, size, eof=False):
     out = bytearray(size)
     offset = 0
     while offset < size:
-        got = conn.recv_into(memoryview(out)[offset:])
+        try:
+            got = conn.recv_into(memoryview(out)[offset:])
+        except socket.timeout:
+            if eof and not offset:
+                raise
+            raise EOFError("partial frame timed out") from None
         if not got:
             if eof and not offset:
                 return None
@@ -139,7 +144,10 @@ def main():
                 conn.settimeout(2)
                 try:
                     while running():
-                        head = exact(conn, header.size, eof=True)
+                        try:
+                            head = exact(conn, header.size, eof=True)
+                        except socket.timeout:
+                            continue
                         if head is None:
                             break
                         if args.mode != "field":
