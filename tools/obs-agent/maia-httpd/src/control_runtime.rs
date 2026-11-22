@@ -65,6 +65,8 @@ struct Config {
     field_preview: Option<field::Config>,
     #[serde(default)]
     resident_field: Option<resident_field::Config>,
+    #[serde(default)]
+    bench_roi: Option<SocketAddr>,
 }
 
 type AntennaBands = BTreeMap<u64, Vec<[u64; 2]>>;
@@ -201,6 +203,9 @@ struct Inbox {
     worker_error: Option<String>,
     take_cancel: Option<(File, u32)>,
     next_map_request: Option<(Value, u64)>,
+    roi: Option<crate::system_reader::RoiRequest>,
+    roi_id: Value,
+    roi_generation: u64,
 }
 struct Shared {
     clock_session: String,
@@ -279,6 +284,10 @@ fn validate(v: &Value) -> Result<()> {
     if v.get("view_bins").is_some() {
         ensure!(matches!(v["op"].as_str(), Some("scan" | "analysis")), "view_bins requires scan or analysis");
         view_mode(v)?;
+    }
+    if v["op"]=="roi" {
+        if !v["center_hz"].is_null() { int(v,"center_hz",70_000_000,plan_math::MAX_RF)?; }
+        return Ok(());
     }
     match v["op"].as_str() {
         Some("scan") => {
@@ -416,6 +425,7 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
         "arm_now_ns":clock_ns().to_string(),"boot_id":q.actual["boot"],"clock_session":shared.clock_session,
         "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,
         "operation":q.operation,"progress":q.progress,"last_progress":q.last_progress,"progress_failure":q.progress_failure,
+        "roi":{"id":q.roi_id,"generation":q.roi_generation,"center_hz":q.roi.map(|r|r.center_hz)},
         "last_confirmed":q.last_confirmed,"worker_error":q.worker_error,
         "metrics":{"owner":q.metrics,"reader":reader}}),
     )
@@ -441,6 +451,18 @@ async fn submit(
     let mut q = shared.inbox.lock().unwrap();
     if let Some(error) = &q.worker_error {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
+    }
+    if cmd["op"]=="roi" {
+        if q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true {
+            return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan required"})));
+        }
+        if q.roi_id != *id {
+            q.roi_generation+=1;
+            let generation=q.roi_generation;
+            q.roi=cmd["center_hz"].as_i64().map(|center_hz|crate::system_reader::RoiRequest{center_hz,generation});
+            q.roi_id=id.clone();
+        }
+        return (StatusCode::ACCEPTED,Json(json!({"accepted_id":id,"roi_generation":q.roi_generation})));
     }
     if q.applied_id == *id
         || q.failed_id == *id
@@ -2046,6 +2068,16 @@ fn worker(
                 )
             };
             let last_renew = std::cell::Cell::new(Instant::now());
+            let roi_request=||shared.inbox.lock().unwrap().roi;
+            let roi=if let Some(peer)=c.bench_roi.filter(|_|scan) {
+                let a=actual.borrow();
+                let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
+                    .map_err(anyhow::Error::msg)?;
+                let next=next_spectrum.as_ref().zip(next_version).map(|(desc,version)|
+                    crate::system_reader::RoiMap::from_descriptor(desc,version,next_gen)).transpose()
+                    .map_err(anyhow::Error::msg)?;
+                Some(crate::system_reader::RoiControl{peer,initial,next,request:&roi_request})
+            }else{None};
             let q = crate::system_reader::RunControl {
                 generation,
                 version:initial_version,
@@ -2072,6 +2104,7 @@ fn worker(
                 stalled: &|sample| *stall_sample.borrow_mut()=sample,
                 bench_stall: scan && std::mem::take(&mut bench_stall),
                 bench_stall_after_next,
+                roi,
                 sweep: sweep.as_ref(),
                 next: next_sweep.as_ref().zip(next_version).map(|(s,version)|crate::system_reader::NextView {
                     generation:next_gen,version,sweep:s,anchor:&next_anchor,started:&next_started,
@@ -2440,6 +2473,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     ensure!(!stream002 || !c.bench_split544, "OBN3 requires separate DMA regions");
     ensure!(!stream002 || c.field_preview.is_none(), "legacy FIELD1 collector requires OBN2");
     ensure!(stream002 || c.resident_field.is_none(), "resident FIELD collector requires OBN3/FLD2/FFM1");
+    ensure!(stream002 || c.bench_roi.is_none(),"bench ROI requires OBN3");
     ensure!(
         regs.read(0x64) == 16
             && regs.read(0x1e0) == 0
@@ -2522,7 +2556,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
-    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":stream002,"ring_layout":if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),
+    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":stream002,"ring_layout":if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
@@ -2634,6 +2668,7 @@ mod tests {
             antenna_bands: BTreeMap::new(),
             field_preview: None,
             resident_field: None,
+            bench_roi: None,
         };
         let input = json!({"scan":{"ranges":[
             {"lo_hz":5_841_000_000u64,"hi_hz":5_889_000_000u64,"enabled":true,"tx_slot":5},

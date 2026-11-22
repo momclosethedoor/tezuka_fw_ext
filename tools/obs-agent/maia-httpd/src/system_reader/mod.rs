@@ -6,6 +6,9 @@ mod view_batch;
 mod sweep_delivery;
 mod progress;
 mod obn3;
+mod roi;
+mod roi_stream;
+pub(crate) use roi_stream::{Map as RoiMap, Request as RoiRequest};
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
 use view_batch::UdpBatch;
@@ -293,7 +296,7 @@ impl PairIo for Hardware{
    let payload=unsafe{std::slice::from_raw_parts(self.overview.ptr.add(view_offset),n)};
    self.copied_bytes+=length as u64;
    self.view_bytes+=n as u64;
-   return sink(header,&[],payload);
+   return sink(header,&[bytes],payload);
   }
   if self.managed_view_only {
    let (header_offset,region,view_offset)=view::delivery_offsets(slot,self.shift,self.previous_view);
@@ -384,6 +387,13 @@ pub(crate) struct RunControl<'a>{
  pub bench_stall_after_next:bool,
  pub sweep:Option<&'a SweepSpec>,
  pub next:Option<NextView<'a>>,
+ pub roi:Option<RoiControl<'a>>,
+}
+pub(crate) struct RoiControl<'a>{
+ pub peer:std::net::SocketAddr,
+ pub initial:RoiMap,
+ pub next:Option<RoiMap>,
+ pub request:&'a dyn Fn()->Option<RoiRequest>,
 }
 pub(crate) struct NextView<'a>{
  pub generation:u64,
@@ -407,6 +417,14 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c,control.is_some())?;
+ let stream002=io.stream_format.is_some();
+ let roi_control=control.and_then(|q|q.roi.as_ref());
+ let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
+  if !c.scan || !stream002 { return Err("ROI requires an active OBN3 scan".into()); }
+  let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone())?;
+  stream.update((config.request)())?;
+  Some(stream)
+ }else{None});
  let managed_view_only=io.managed_view_only;
  let empty_wait=if control.is_some(){view_idle_wait(c.k)}else{Duration::ZERO};
  io.idle_wait_us=empty_wait.as_micros() as u64;
@@ -452,6 +470,15 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
  }
  let initial_anchor=io.live64(0x238);
+ let prepare_full=|h:Header,parts:&[&[u8]]|->R<()>{
+  if !stream002 {
+   for part in parts{full_read_without_sum(part);}
+  }else if let Some(zoom)=zoom.borrow_mut().as_mut() {
+   zoom.prepare(h,parts.first().copied().ok_or("ROI compact payload missing")?,initial_anchor,
+    control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)()))?;
+  }
+  Ok(())
+ };
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
  let execution=std::cell::Cell::<Option<Execution>>::new(None);
@@ -461,6 +488,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
+  if let Some(zoom)=zoom.borrow_mut().as_mut(){zoom.pump();}
   if let Some(q)=control {
    if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if execution.get().is_none(){
@@ -500,6 +528,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
+   if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){zoom.update((config.request)())?;}
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
    if let Some(q)=control {
     let map=c.scan.then(||io.map_stamp());
@@ -509,11 +538,13 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
    if let Ok(mut v)=mark(&mut io,&reader,start){
     v["network"]=network.borrow().counts();
+    v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);
     *STATUS.lock().unwrap()=v;
    }status_due=Instant::now();
   }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
-  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+  let s=reader.service_released(&mut io,&prepare_full,&mut sink)?;
+  if let Some(zoom)=zoom.borrow_mut().as_mut(){zoom.pump();}
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow().as_ref(){sweep.poll(&mut net,sock);}else{net.flush_due(sock);}
@@ -528,7 +559,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
  if !draining.get(){draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}}
- let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+ let stop=Instant::now();loop{let s=reader.service_released(&mut io,&prepare_full,&mut sink)?;
   let drained=s.drained&&!s.running&&!s.dma_busy&&s.reserved==s.committed&&reader.next==s.committed;
   if drained{io.release(s.cookie,s.committed)?;}
   if let Some(sock)=&socket {
@@ -538,8 +569,17 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }else{net.flush(sock);}
   }
   if drained{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
+ if let Some(zoom)=zoom.borrow_mut().as_mut(){
+  let deadline=Instant::now()+Duration::from_secs(1);
+  while zoom.pending() && Instant::now()<deadline {
+   zoom.pump();
+   std::thread::sleep(Duration::from_millis(1));
+  }
+  zoom.close();
+ }
  if let Ok(mut v)=mark(&mut io,&reader,start){
   v["network"]=network.borrow().counts();
+  v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);
   *STATUS.lock().unwrap()=v;
  }
  if let Some(q)=control{(q.trace)("reader_drained");}

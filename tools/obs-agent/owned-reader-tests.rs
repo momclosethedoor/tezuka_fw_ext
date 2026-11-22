@@ -1,6 +1,7 @@
 #[path="maia-httpd/src/system_reader/continuous.rs"] mod continuous;
 #[path="maia-httpd/src/system_reader/view.rs"] mod view;
 #[path="maia-httpd/src/system_reader/obn3.rs"] mod obn3;
+#[path="maia-httpd/src/system_reader/roi.rs"] mod roi;
 #[path="maia-httpd/src/control_runtime/plan_math.rs"] mod scan_plan;
 use view::PairIo;
 struct Mock { full:Vec<u8>, view:Vec<u8>, released:usize, fail_view:bool }
@@ -41,7 +42,7 @@ fn mock()->Mock{Mock{full:hex("tools/obs-agent/maia-httpd/tests/view/mode1/ordin
  }
  let read=Rc::new(Cell::new(0));let phase=Rc::new(Cell::new(0));let m=mock();let expected=m.view.clone();
  let mut io=Direct{m,read:read.clone(),phase:phase.clone()};let mut reader=view::PairReader::attach(io.snapshot().unwrap()).unwrap();
- reader.service_released(&mut io,|p|{assert_eq!(phase.get(),0);read.set(read.get()+p.len());},|h,v|{assert_eq!(phase.get(),1);assert_eq!(h.ordinal,0);assert_eq!(v,expected);phase.set(2);Ok(())}).unwrap();
+ reader.service_released(&mut io,|_,parts|{assert_eq!(phase.get(),0);read.set(read.get()+parts.iter().map(|p|p.len()).sum::<usize>());Ok(())},|h,v|{assert_eq!(phase.get(),1);assert_eq!(h.ordinal,0);assert_eq!(v,expected);phase.set(2);Ok(())}).unwrap();
  assert_eq!(phase.get(),2);assert_eq!(reader.read,1);assert!(io.m.full.iter().all(|&b|b==0xcc));
 }
 
@@ -91,7 +92,7 @@ fn view_only_wrap_and_short_after_long_survive_immediate_dma_reuse() {
   let expected=io.view.clone();
   io.snap.committed+=1;
   io.snap.reserved+=1;
-  reader.service_released(&mut io,|_|panic!("VIEW read of native bins"),|header,data|{
+  reader.service_released(&mut io,|_,parts|{assert!(parts.is_empty());Ok(())},|header,data|{
    assert_eq!(released.get(),ordinal+1);
    assert_eq!(header.ordinal,ordinal);
    assert_eq!(view::view_len(header),bins);

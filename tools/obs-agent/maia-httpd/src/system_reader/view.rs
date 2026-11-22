@@ -72,7 +72,7 @@ pub struct PairReader{pub full_read_ns:u128,pub view_own_ns:u128,pub after_relea
 impl PairReader{
     /// Finish all DMA reads, release, then expose only the small owned VIEW.
     /// No full-spectrum queue or checksum is part of this path.
-    pub fn service_released<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
+    pub fn service_released<I:PairIo,Rd:FnMut(Header,&[&[u8]])->Result<(),String>,F:FnMut(Header,&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
         let phase=io.phase_timing();
         let s=io.fast_snapshot()?;
         if s.cookie!=self.run||s.released!=self.next||s.committed<self.next||s.committed>s.reserved||s.reserved-self.next>SLOTS as u64{return Err("r3 cursor/owner violation".into())}
@@ -88,7 +88,7 @@ impl PairReader{
                 n=v.len();owned_view[..n].copy_from_slice(v);header=Some(h);
                 if let Some(t)=t{self.view_own_ns+=t.elapsed().as_nanos();}
                 let t=phase.then(std::time::Instant::now);
-                for part in parts{read(part);}
+                read(h,parts)?;
                 if let Some(t)=t{self.full_read_ns+=t.elapsed().as_nanos();}
                 Ok(())
             })?;
