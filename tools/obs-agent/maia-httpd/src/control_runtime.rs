@@ -457,8 +457,8 @@ async fn submit(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
     }
     if cmd["op"]=="roi" {
-        if !cfg!(feature="scan-stream-bench") || q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true {
-            return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan required"})));
+        if !cfg!(feature="scan-stream-bench") || q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true || q.actual["view_bins"]!=0 {
+            return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan with VIEW OFF required"})));
         }
         if q.roi_id != *id {
             q.roi_generation+=1;
@@ -2075,7 +2075,7 @@ fn worker(
             #[cfg(feature="scan-stream-bench")]
             let roi_request=||shared.inbox.lock().unwrap().roi;
             #[cfg(feature="scan-stream-bench")]
-            let roi=if let Some(peer)=c.bench_roi.filter(|_|scan) {
+            let roi=if let Some(peer)=c.bench_roi.filter(|_| scan && mode_index == 0) {
                 let a=actual.borrow();
                 let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
                     .map_err(anyhow::Error::msg)?;

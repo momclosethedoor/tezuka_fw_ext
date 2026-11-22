@@ -133,7 +133,7 @@ def main():
                         summary["wire_bytes"] += length
                         summary["complete"] += 1
                         summary["processed"] += 1
-                except (EOFError, socket.timeout):
+                except (EOFError, socket.timeout, ConnectionResetError):
                     summary["incomplete"] += 1
                 except (ValueError, KeyError, struct.error):
                     summary["errors"] += 1

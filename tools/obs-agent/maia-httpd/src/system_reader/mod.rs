@@ -528,7 +528,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let roi_control=control.and_then(|q|q.roi.as_ref());
  #[cfg(feature="scan-stream-bench")]
  let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
-  if !c.scan || !stream002 { return Err("ROI requires an active OBN3 scan".into()); }
+  if !c.scan || !stream002 || c.mode != 0 { return Err("compact TCP requires an active OBN3 scan with VIEW OFF".into()); }
   let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),config.full_scan)?;
   stream.update((config.request)())?;
   Some(stream)

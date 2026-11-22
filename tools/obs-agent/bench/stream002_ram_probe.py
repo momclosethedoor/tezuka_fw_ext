@@ -34,8 +34,15 @@ def main():
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--roi-center-hz", type=int)
     parser.add_argument("--full-compact-tcp", action="store_true")
+    parser.add_argument("--gate-transmitter", action="store_true",
+                        help="pause before FIELD windows for the operator's ready signal")
     parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
     args = parser.parse_args()
+    compact_tcp = args.full_compact_tcp or args.roi_center_hz is not None
+    if args.full_compact_tcp and args.roi_center_hz is not None:
+        parser.error("choose full compact TCP or a 56 MHz ROI")
+    if compact_tcp and (not args.managed or args.regression or any(args.widths)):
+        parser.error("compact TCP requires a managed scan with VIEW OFF")
     if not hasattr(hashlib, "file_digest"):
         hashlib.file_digest = file_digest
     sys.path.insert(0, str(args.stand.resolve()))

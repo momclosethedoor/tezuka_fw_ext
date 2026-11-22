@@ -16,6 +16,7 @@ SCAN = dict(op="scan", planner_version=2, path_ack_version=1, sweep_geometry="27
             ranges=[dict(lo_hz=70_000_000, hi_hz=12_000_000_000, enabled=True)])
 FIELD_TIMEOUT_MS = 90
 ROI_PORT = 18011
+TRANSMITTER_WAIT_S = 90
 
 
 class BenchReceiver(Receiver):
@@ -38,6 +39,15 @@ class BenchReceiver(Receiver):
             outcomes = self.field_stats["outcomes"]
             code = str(meta["outcome"])
             outcomes[code] = outcomes.get(code, 0)+1
+
+
+class BenchProbe(Probe):
+    def save(self):
+        # Probe.command runs while the receivers are active. Serialize evidence at STOP.
+        pass
+
+    def save_after_stop(self):
+        super().save()
 
 
 def launch_roi(log, full):
@@ -86,29 +96,35 @@ def mode_regressions(stand, probe, receiver, log, analysis):
                               ("analysis","video","analysis")):
         stages = []
         previous = None
-        for index, mode in enumerate((start, middle, end)):
-            command = {"op":"return"} if index == 2 and middle == "video" else templates[mode]
-            active = probe.command(f"{start}-{middle}-{end}-{index}", command, seconds=45)
-            gen = active.get("generation")
-            if active["mode"] != mode or active["running"] is not True or gen == previous:
-                raise RuntimeError(f"{mode} was not applied with a new generation")
-            deadline = time.monotonic()+5
-            while time.monotonic() < deadline:
-                if mode == "video":
-                    record = receiver.video_stats.get(gen, {})
-                    count = record.get("packets", 0)
+        failure = None
+        try:
+            for index, mode in enumerate((start, middle, end)):
+                command = {"op":"return"} if index == 2 and middle == "video" else templates[mode]
+                active = probe.command(f"{start}-{middle}-{end}-{index}", command, seconds=45)
+                gen = active.get("generation")
+                if active["mode"] != mode or active["running"] is not True or gen == previous:
+                    state = probe.cases[-1]["status"]
+                    raise RuntimeError(f"{mode} did not apply: {state['error']} "
+                                       f"(egress: {state['metrics']['owner'].get('error')})")
+                deadline = time.monotonic()+5
+                while time.monotonic() < deadline:
+                    if mode == "video":
+                        record = receiver.video_stats.get(gen, {})
+                        count = record.get("packets", 0)
+                    else:
+                        count = receiver.view_stats(gen)["received"]
+                    if count >= 2:
+                        break
+                    time.sleep(.05)
                 else:
-                    count = receiver.view_stats(gen)["received"]
-                if count >= 2:
-                    break
-                time.sleep(.05)
-            else:
-                raise RuntimeError(f"{mode} has no fresh data in generation {gen}")
-            stages.append(dict(mode=mode,generation=gen,records=count,view_bins=active.get("view_bins"),
-                               tx=active["tx"],guard_tx=active.get("guard_tx")))
-            previous = gen
+                    raise RuntimeError(f"{mode} has no fresh data in generation {gen}")
+                stages.append(dict(mode=mode,generation=gen,records=count,view_bins=active.get("view_bins"),
+                                   tx=active["tx"],guard_tx=active.get("guard_tx")))
+                previous = gen
+        except RuntimeError as error:
+            failure = str(error)
         probe.command(f"stop-{start}-{middle}-{end}", dict(SCAN, run=False), seconds=12)
-        results.append(dict(sequence=[start,middle,end],stages=stages))
+        results.append(dict(sequence=[start,middle,end],stages=stages,error=failure))
         stand.write_json(log/"mode-regressions.json",results)
 
 
@@ -139,8 +155,6 @@ test "$(devmem 0x7c460284)" = 0x00000000
         control["resident_field"]=dict(collector=remote+"/obs-ffm1-iio",timeout_ms=FIELD_TIMEOUT_MS)
     roi_center=getattr(args,"roi_center_hz",None)
     full=getattr(args,"full_compact_tcp",False)
-    if full and roi_center is not None:
-        raise ValueError("choose full compact TCP or 56 MHz ROI for this run")
     if full or roi_center is not None:
         control["bench_roi"]=f"{HOST}:{ROI_PORT}"
         control["bench_full_compact_tcp"]=full
@@ -151,8 +165,10 @@ test "$(devmem 0x7c460284)" = 0x00000000
     halted, ready = threading.Event(), threading.Event()
     lease = threading.Thread(target=lease_loop, args=(halted, ready, log, threading.Event()), daemon=True)
     lease.start()
-    probe = Probe(stand, receiver, log)
+    probe = BenchProbe(stand, receiver, log)
     rows = []
+    transmitter = False
+    gated=getattr(args,"gate_transmitter",False)
     try:
         if not ready.wait(8):
             raise RuntimeError("accepted scanner lease/will unavailable")
@@ -173,6 +189,15 @@ test "$(devmem 0x7c460284)" = 0x00000000
             return
         combinations=((width,num) for width in args.widths for num in fields)
         for width, num in combinations:
+            if gated and num and not transmitter:
+                (log/"transmitter-needed").touch()
+                print("TRANSMITTER_READY_REQUIRED",flush=True)
+                deadline=time.monotonic()+TRANSMITTER_WAIT_S
+                while not (log/"transmitter-ready").exists():
+                    if time.monotonic()>=deadline:
+                        raise RuntimeError("transmitter ready signal timed out")
+                    time.sleep(.1)
+                transmitter=True
             label = f"wide-{width}-field-{num}"
             receiver.field_mode = bool(num)
             active = probe.command(label, dict(SCAN, view_bins=width, field_targets=targets[:num]), seconds=40)
@@ -212,6 +237,9 @@ test "$(devmem 0x7c460284)" = 0x00000000
             print(json.dumps(dict(view=width, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
                 b=host_end["B"]-host_begin["B"])),flush=True)
     finally:
+        if gated and (log/"transmitter-needed").exists():
+            (log/"transmitter-done").touch()
+            print("TRANSMITTER_CAN_STOP",flush=True)
         halted.set()
         lease.join(4)
         receiver.close()
@@ -222,4 +250,4 @@ test "$(devmem 0x7c460284)" = 0x00000000
             except subprocess.TimeoutExpired:
                 roi_process.terminate()
                 roi_process.wait(5)
-        probe.save()
+        probe.save_after_stop()
