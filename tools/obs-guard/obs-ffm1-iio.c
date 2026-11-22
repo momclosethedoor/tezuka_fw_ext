@@ -26,7 +26,8 @@ enum { FFM_ID=OBS_FFM1_ID_REG, SESSION=OBS_FFM1_SESSION, POP=OBS_FFM1_POP, LEVEL
        FIELD_CANCEL=1u<<1, FIELD_SOURCE_FAULT=1u<<4, FIELD_SOURCE_READY=1u<<5,
        FIELD_ACTIVE=(1u<<0)|(1u<<6)|(1u<<7),
        FFM_LEVEL_COUNT=0x1ffu, FFM_HEAD_AVAILABLE=1u<<16,
-       BLOCK=262144, FIELD_MAX=337924, HISTORY_BLOCKS=3, RETAIN=HISTORY_BLOCKS*BLOCK };
+       BLOCK=262144, FIELD_MAX=337924, IIO_BLOCKS=4,
+       HISTORY_BLOCKS=3, RETAIN=HISTORY_BLOCKS*BLOCK };
 static volatile sig_atomic_t stopping;
 static void stop_session(int sig) { (void)sig; stopping=1; }
 static double monotonic(void)
@@ -94,9 +95,6 @@ struct iio_api {
     void (*buffer_destroy)(void *);
     int (*buffer_set_blocking_mode)(void *,bool);
     int (*buffer_get_poll_fd)(void *);
-    ssize_t (*buffer_refill)(void *);
-    void *(*buffer_start)(void *);
-    void *(*buffer_end)(void *);
 };
 static int load_api(void *lib,struct iio_api *api)
 {
@@ -104,10 +102,83 @@ static int load_api(void *lib,struct iio_api *api)
     LOAD(create_local_context); LOAD(context_destroy); LOAD(context_find_device);
     LOAD(context_set_timeout); LOAD(device_find_channel); LOAD(channel_enable);
     LOAD(device_set_kernel_buffers_count); LOAD(device_create_buffer); LOAD(buffer_destroy);
-    LOAD(buffer_set_blocking_mode); LOAD(buffer_get_poll_fd); LOAD(buffer_refill);
-    LOAD(buffer_start); LOAD(buffer_end);
+    LOAD(buffer_set_blocking_mode); LOAD(buffer_get_poll_fd);
 #undef LOAD
     return 0;
+}
+
+/* ADI's legacy mmap block ABI, also used by libiio 0.26 local.c. Let libiio
+ * configure and tear down the session. Use its fd for explicit dequeue/enqueue
+ * so receipt handling and send never run with a block checked out. Do not
+ * mix this with iio_buffer_refill(), which maintains its own dequeued ID. */
+struct iio_block {
+    uint32_t id, size, bytes_used, type, flags, offset;
+    uint64_t timestamp;
+};
+_Static_assert(sizeof(struct iio_block)==32,"legacy IIO block ABI");
+#define IIO_QUERY_BLOCK _IOWR('i',0xa2,struct iio_block)
+#define IIO_ENQUEUE_BLOCK _IOWR('i',0xa3,struct iio_block)
+#define IIO_DEQUEUE_BLOCK _IOWR('i',0xa4,struct iio_block)
+
+struct iio_blocks {
+    void *maps[IIO_BLOCKS];
+    uint64_t dequeued, returned;
+    double max_checkout;
+};
+
+static int block_ioctl(int fd, unsigned long request, struct iio_block *block)
+{
+    int result;
+    do { result=ioctl(fd,request,block); } while(result<0 && errno==EINTR && !stopping);
+    return result<0 ? -errno : result;
+}
+
+static int map_blocks(int fd, struct iio_blocks *blocks)
+{
+    for(unsigned i=0;i<IIO_BLOCKS;++i) {
+        struct iio_block block={.id=i};
+        int result=block_ioctl(fd,IIO_QUERY_BLOCK,&block);
+        if(result<0) return result;
+        if(block.id!=i || block.size!=BLOCK) return -EINVAL;
+        void *map=mmap(NULL,BLOCK,PROT_READ,MAP_SHARED,fd,block.offset);
+        if(map==MAP_FAILED) return -errno;
+        blocks->maps[i]=map;
+    }
+    return 0;
+}
+
+static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
+                              struct preview_history *history, const char **problem)
+{
+    struct iio_block block={0};
+    int result=block_ioctl(fd,IIO_DEQUEUE_BLOCK,&block);
+    if(result<0) {
+        if(result!=-EAGAIN && result!=-EINTR) *problem="IIO block dequeue failed";
+        return result;
+    }
+    ++blocks->dequeued;
+    double start=monotonic();
+    if(block.id>=IIO_BLOCKS || block.size!=BLOCK) {
+        *problem="IIO block identity invalid";
+        return -EINVAL;
+    }
+    size_t bytes=block.bytes_used;
+    bool bad=bytes>BLOCK || preview_append(history,blocks->maps[block.id],bytes);
+    block.bytes_used=block.size;
+    result=block_ioctl(fd,IIO_ENQUEUE_BLOCK,&block);
+    if(result<0) {
+        history->retained=0;
+        *problem="IIO block return failed";
+        return result;
+    }
+    ++blocks->returned;
+    double elapsed=monotonic()-start;
+    if(elapsed>blocks->max_checkout) blocks->max_checkout=elapsed;
+    if(bad) {
+        *problem="IIO block length invalid";
+        return -EINVAL;
+    }
+    return (ssize_t)bytes;
 }
 struct observation {
     uint64_t epoch;
@@ -207,6 +278,7 @@ int main(int argc,char **argv)
     uint32_t oldmode=0,oldcode=0,oldtimeout=0,oldrun=0;
     void *lib=NULL,*context=NULL,*buffer=NULL;
     struct iio_api io={0};
+    struct iio_blocks blocks={0};
     volatile uint32_t *reg=MAP_FAILED;
     struct watch_table wat={0};
     uint8_t *watch_bytes=malloc(WATCH_HEADER+WATCH_RECORD*WATCH_RESIDENT_MAX+1);
@@ -251,17 +323,20 @@ int main(int argc,char **argv)
     problem="configure the IIO device and channels";
     context=io.create_local_context();
     void *dev=context?io.context_find_device(context,"cf-ad9361-lpc"):NULL;
-    if(!dev || io.context_set_timeout(context,250) || io.device_set_kernel_buffers_count(dev,4)) goto done;
+    if(!dev || io.context_set_timeout(context,250) || io.device_set_kernel_buffers_count(dev,IIO_BLOCKS)) goto done;
     void *i=io.device_find_channel(dev,"voltage0",false),*q=io.device_find_channel(dev,"voltage1",false);
     if(!i || !q) goto done;
     io.channel_enable(i);io.channel_enable(q);
     problem="create the nonblocking IIO buffer";
     buffer=io.device_create_buffer(dev,BLOCK/4,false);
     if(!buffer || io.buffer_set_blocking_mode(buffer,false)) goto done;
-    if((uint8_t*)io.buffer_end(buffer)-(uint8_t*)io.buffer_start(buffer)!=BLOCK ||
-       (pollfd=io.buffer_get_poll_fd(buffer))<0) goto done;
+    if((pollfd=io.buffer_get_poll_fd(buffer))<0) goto done;
+    problem="map legacy ADI IIO blocks for explicit return";
+    iio_result=map_blocks(pollfd,&blocks);
+    if(iio_result<0) goto done;
     problem="verify IIO is empty before real8 RUN";
-    iio_result=io.buffer_refill(buffer);
+    const char *probe_error=NULL;
+    iio_result=read_iio_block(pollfd,&blocks,&history,&probe_error);
     if(iio_result!=-EAGAIN) goto done;
     signal(SIGINT,stop_session);signal(SIGTERM,stop_session);
     problem="real8 source failed to become ready";
@@ -274,7 +349,7 @@ int main(int argc,char **argv)
     }
     uint32_t lost_start=reg[LOST/4];
     write_reg(reg,SESSION,1);
-    fprintf(stderr,"FFM1_READY block=%d history=%d\n",BLOCK,RETAIN);
+    fprintf(stderr,"FFM1_READY block=%d history=%d dma_blocks=%d explicit_return=1\n",BLOCK,RETAIN,IIO_BLOCKS);
     struct observation obs={0};
     struct field_live live={0};
     struct field_wire wire={0};
@@ -296,7 +371,7 @@ int main(int argc,char **argv)
         }
         ssize_t got=-EAGAIN;
         if(!source_failure) {
-            got=io.buffer_refill(buffer);
+            got=read_iio_block(pollfd,&blocks,&history,&source_failure);
             iio_result=got;
             if(got>0) {
                 double now=monotonic();
@@ -305,10 +380,8 @@ int main(int argc,char **argv)
                     if(refill_gap>max_refill_gap) max_refill_gap=refill_gap;
                 }
                 last_refill=now;
-                if(got>BLOCK || preview_append(&history,io.buffer_start(buffer),(size_t)got))
-                    source_failure="invalid IIO block";
-                else live=stable_live(reg,history.consumed);
-            } else if(got!=-EAGAIN && got!=-EINTR) source_failure="IIO refill failed";
+                live=stable_live(reg,history.consumed);
+            }
             if(!source_failure && reg[STATUS/4]&FIELD_SOURCE_FAULT)
                 source_failure="real8 hardware reported a source fault";
             if(source_failure) {
@@ -435,9 +508,12 @@ int main(int argc,char **argv)
         (unsigned long long)egress.complete[FIELD_BEGIN],(unsigned long long)egress.complete[FIELD_DATA],
         (unsigned long long)egress.complete[FIELD_END],(unsigned long long)early_data_sent,max_refill_gap,
         reg[FSB_CAUSES/4]);
+    fprintf(stderr,"FSB1_IIO dequeued=%llu returned=%llu max_checkout_s=%.9f\n",
+        (unsigned long long)blocks.dequeued,(unsigned long long)blocks.returned,blocks.max_checkout);
 done:
     if(rc && !source_failure) report_error(reg,problem?problem:"receipt, history or drain fault",iio_result);
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,FIELD_CANCEL);write_reg(reg,RUN,0);}
+    for(unsigned i=0;i<IIO_BLOCKS;++i) if(blocks.maps[i]) munmap(blocks.maps[i],BLOCK);
     if(buffer) io.buffer_destroy(buffer);
     if(context) io.context_destroy(context);
     if(stream_owned) {
