@@ -2,6 +2,7 @@
 //! UDP completion record for one executed pass.
 use super::{Header, R, UdpBatch, Value};
 use std::net::UdpSocket;
+use std::os::unix::net::UnixDatagram;
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
@@ -13,6 +14,7 @@ pub(crate) struct SweepSpec {
     last: [usize;2],
     count: [u64;2],
     mode: Mode,
+    bench: Option<BenchMap>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -56,7 +58,8 @@ impl SweepSpec {
             if let Some(p) = phase {next=*p;}
             route_to[i]=next;
         }
-        Ok(Some(Self {version,positions,route_to,first,last,count,mode}))
+        let bench=BenchMap::open(rows,&positions)?;
+        Ok(Some(Self {version,positions,route_to,first,last,count,mode,bench}))
     }
 }
 
@@ -70,6 +73,68 @@ struct Pass {
     drops_before: u64,
 }
 
+struct BenchMap {
+    endpoint: std::path::PathBuf,
+    targets: Vec<Option<(u64,u64)>>,
+    frequencies: Vec<u64>,
+}
+
+impl BenchMap {
+    fn open(rows:&[Value], phases:&[Option<usize>])->R<Option<Self>> {
+        let Some(endpoint)=std::env::var_os("OBS_PREVIEW_SYNTH_SOCKET") else { return Ok(None) };
+        let count_path=std::env::var_os("OBS_PREVIEW_SYNTH_COUNT_FILE").ok_or("synthetic target count path")?;
+        let text=std::fs::read_to_string(count_path).map_err(|e|e.to_string())?;
+        let count:usize=text.trim().parse().map_err(|_|"synthetic target count")?;
+        if !matches!(count,1|3|5|10) {return Err("synthetic target count must be 1, 3, 5 or 10".into())}
+        let nominal_mhz=[240,1212,2425,3500,4400,5865,6850,8050,9620,11250];
+        let mut targets=vec![None;rows.len()];
+        let mut frequencies=Vec::with_capacity(count);
+        for id in 0..count {
+            let center=nominal_mhz[id*nominal_mhz.len()/count]*1_000_000u64;
+            let (a,b,rf)=(0..=50).find_map(|step| {
+                let rf=center+step*100_000;
+                let has=|i:usize, phase| phases[i]==Some(phase) && targets[i].is_none()
+                    && rows[i]["rf_ranges"].as_array().is_some_and(|bands|bands.iter().any(|b|
+                        b[0].as_u64().zip(b[1].as_u64()).is_some_and(|(lo,hi)|lo<=rf&&rf<hi)));
+                Some(((0..rows.len()).find(|i|has(*i,0))?,(0..rows.len()).find(|i|has(*i,1))?,rf))
+            }).ok_or("synthetic RF lacks a shared A/B visit")?;
+            targets[a]=Some((id as u64,rf));
+            targets[b]=Some((id as u64,rf));
+            frequencies.push(rf);
+        }
+        Ok(Some(Self {endpoint:endpoint.into(),targets,frequencies}))
+    }
+}
+
+struct BenchOutput<'a> {
+    map: &'a BenchMap,
+    socket: UnixDatagram,
+    offered: u64,
+    dropped: u64,
+    first: Option<u64>,
+    last: Option<u64>,
+}
+
+impl<'a> BenchOutput<'a> {
+    fn open(map: &'a BenchMap) -> R<Self> {
+        let socket = UnixDatagram::unbound().map_err(|e| e.to_string())?;
+        socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+        Ok(Self { map, socket, offered:0, dropped:0, first:None, last:None })
+    }
+
+    fn send(&mut self, generation:u64, version:u64, pass:&Pass, position:usize) {
+        let Some((signal,rf))=self.map.targets[position] else {return};
+        self.offered += 1;
+        self.first.get_or_insert(pass.id);
+        self.last=Some(pass.id);
+        let arm_ns=(crate::delivery_runtime::mono()*1e9) as u64;
+        let words=[generation, version, pass.id, pass.phase as u64, pass.last_epoch, arm_ns, signal, rf, position as u64];
+        let mut message=[0u8;72];
+        for (slot,word) in message.chunks_exact_mut(8).zip(words) { slot.copy_from_slice(&word.to_le_bytes()); }
+        if self.socket.send_to(&message,&self.map.endpoint).ok()!=Some(message.len()) { self.dropped+=1; }
+    }
+}
+
 pub(super) struct Delivery<'a> {
     spec: &'a SweepSpec,
     anchor: u64,
@@ -79,6 +144,7 @@ pub(super) struct Delivery<'a> {
     pub notes_sent: u64,
     pub notes_lost: u64,
     pub peak_bytes: usize,
+    bench: Option<BenchOutput<'a>>,
 }
 
 impl<'a> Delivery<'a> {
@@ -90,7 +156,12 @@ impl<'a> Delivery<'a> {
             }
             net.bytes.reserve(bytes);
         }
-        Ok(Self{spec,anchor,generation,pass:None,completed:None,notes_sent:0,notes_lost:0,peak_bytes:0})
+        let bench=spec.bench.as_ref().map(BenchOutput::open).transpose()?;
+        Ok(Self{spec,anchor,generation,pass:None,completed:None,notes_sent:0,notes_lost:0,peak_bytes:0,bench})
+    }
+
+    pub(super) fn bench_counts(&self)->Option<Value> {
+        self.bench.as_ref().map(|b| serde_json::json!({"offered":b.offered,"dropped":b.dropped,"first":b.first,"last":b.last,"frequencies":b.map.frequencies}))
     }
 
     pub(super) fn accept(&mut self,h:Header,view:&[u8],net:&mut UdpBatch,sock:&UdpSocket) {
@@ -106,9 +177,13 @@ impl<'a> Delivery<'a> {
             last_tick:h.first_tick,observed:0,drops_before:net.dropped});
         if self.spec.positions[position].is_some() {
             if pass.observed == 0 {pass.first_epoch=h.epoch;}
-            if pass.observed == 0 || pass.last_epoch != h.epoch {pass.observed+=1;}
+            let first_visit=pass.observed == 0 || pass.last_epoch != h.epoch;
+            if first_visit {pass.observed+=1;}
             pass.last_epoch = h.epoch;
             pass.last_tick = h.first_tick;
+            if first_visit && let Some(worker)=&mut self.bench {
+                worker.send(self.generation,self.spec.version,pass,position);
+            }
         }
         if self.spec.positions[position].is_none() {net.transition+=1;}
         if net.bytes.len()+net.record_size() <= MAX_BYTES {

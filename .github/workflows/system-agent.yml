@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-view-opt-001-dual-bench]
+    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-view-opt-001-dual-bench, build/arm-view-opt-001-preview-bench]
     paths: ['tools/obs-agent/**', 'tools/obs-guard/obs-field1.c', '.github/workflows/system-agent.yml']
   workflow_dispatch:
 permissions:
@@ -77,7 +77,7 @@ jobs:
           $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -ldl -o agent-artifact/obs-field1
           output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
           find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
-          sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
+          sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-field-synthetic.h tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
           cp board/tezuka/nano/overlay_goofy/usr/sbin/goofy_lease.sh agent-artifact/
           cd agent-artifact
           sha256sum maia-httpd obs-field1 goofy_lease.sh elf.txt source-sha256.txt > SHA256SUMS

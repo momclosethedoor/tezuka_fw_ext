@@ -486,6 +486,8 @@ static int watch_session(int argc,char **argv){
  return rc;
 }
 
+#include "obs-field-synthetic.h"
+
 int main(int argc,char **argv){
  signal(SIGPIPE,SIG_IGN);
  managed_boot=getenv("OBS_FIELD1_BOOT");
@@ -493,6 +495,7 @@ int main(int argc,char **argv){
  cpu_phases=getenv("OBS_FIELD1_CPU_PHASES")&&!strcmp(getenv("OBS_FIELD1_CPU_PHASES"),"1");
  const char *pump=getenv("OBS_TCP_PUMP_BYTES");tcp_pump_bytes=pump?strtoul(pump,NULL,10):0;
  if(tcp_pump_bytes!=0&&tcp_pump_bytes!=16384&&tcp_pump_bytes!=32768&&tcp_pump_bytes!=65536&&tcp_pump_bytes!=131072)return 2;
+ if(argc>1&&!strcmp(argv[1],"--synthetic"))return synthetic_session(argc,argv);
  if(argc>1&&!strcmp(argv[1],"--watch"))return watch_session(argc,argv);
  if(argc==2&&!strcmp(argv[1],"--session")){
   reuse_context=getenv("OBS_FIELD1_REUSE_CONTEXT")&&!strcmp(getenv("OBS_FIELD1_REUSE_CONTEXT"),"1");
