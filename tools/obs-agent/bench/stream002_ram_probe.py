@@ -26,6 +26,10 @@ def main():
     parser.add_argument("--capture-layout", action="store_true")
     parser.add_argument("--view-mode", type=int, choices=range(4), default=1)
     parser.add_argument("--bench-obn3-layout", action="store_true")
+    parser.add_argument("--managed", action="store_true")
+    parser.add_argument("--widths", type=int, nargs="+", choices=(0, 512, 1024, 2048), default=(0,))
+    parser.add_argument("--seconds", type=int, choices=range(15, 31), default=20)
+    parser.add_argument("--regression", action="store_true")
     args = parser.parse_args()
     if not hasattr(hashlib, "file_digest"):
         hashlib.file_digest = file_digest
@@ -73,16 +77,22 @@ def main():
     try:
         stand.uart("load")
         stand.uart("scan-setup")
+        if args.managed:
+            from stream002_managed_probe import run
+            run(stand, args, log, boot)
+            return
         profiles = [bytes(map(int, row.split()[1].split(",")))
                     for row in stand.ssh(f"cat {remote}/profiles.txt").splitlines()]
         mapping = log / "map.bin"
         mapping.write_bytes(stand.make_map(profiles, 0, 7700))
         config = log / "reader.json"
-        stand.write_json(config, dict(setup=remote + "/map.bin", replay=None, reader=dict(
+        reader = dict(
             boot_id=boot, output=remote + "/probe", command="capture" if args.capture_layout else "rate",
             k=2, mode=args.view_mode, scan=True, hot=True, settling=0, seconds=.03 if args.capture_layout else 2.0,
-            bench_obn3_layout=args.bench_obn3_layout,
-            warmup=.5, batch_limit=64, trace_limit=50000)))
+            warmup=.5, batch_limit=64, trace_limit=50000)
+        if args.bench_obn3_layout:
+            reader["bench_obn3_layout"] = True
+        stand.write_json(config, dict(setup=remote + "/map.bin", replay=None, reader=reader))
         for path in (mapping, config):
             stand.upload(path, remote, path.name)
         stand.ssh(f"cd {remote}; mkdir probe; (OBS_PHASE_TIMING=1 timeout 25 ./maia-delivery "
@@ -96,15 +106,16 @@ def main():
             time.sleep(.25)
         else:
             raise RuntimeError("Reader did not report a terminal result")
+        status = json.loads(result)
+        (log / "agent-result.json").write_text(result, encoding="utf-8")
+        if "Ok" not in status["reader_outcome"] or status["guard_return"].get("state") != 3:
+            raise RuntimeError(f"Reader or RF return failed: {status}")
         if args.capture_layout:
             for name in ("agent-result.json", "memory.json", "unreleased.json"):
                 content = stand.ssh(f"cat {remote}/probe/{name}")
                 (log / name).write_text(content, encoding="utf-8")
         else:
             stand.fetch(log, remote + "/probe")
-        status = json.loads(result)
-        if "Ok" not in status["reader_outcome"] or status["guard_return"].get("state") != 3:
-            raise RuntimeError(f"Reader or RF return failed: {status}")
         if args.capture_layout:
             stand.ssh(f"cd {remote}/probe; set -e; dd if=full-ring.bin of=full-prefix.bin bs=32768 count=8; "
                       "dd if=full-ring.bin of=full-last.bin bs=32768 skip=1023 count=1; "
