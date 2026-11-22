@@ -122,8 +122,10 @@ _Static_assert(sizeof(struct iio_block)==32,"legacy IIO block ABI");
 
 struct iio_blocks {
     void *maps[IIO_BLOCKS];
+#ifdef OBS_SCAN_STREAM_BENCH
     uint64_t dequeued, returned;
     double max_checkout;
+#endif
 };
 
 static int block_ioctl(int fd, unsigned long request, struct iio_block *block)
@@ -156,8 +158,10 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
         if(result!=-EAGAIN && result!=-EINTR) *problem="IIO block dequeue failed";
         return result;
     }
+#ifdef OBS_SCAN_STREAM_BENCH
     ++blocks->dequeued;
     double start=monotonic();
+#endif
     if(block.id>=IIO_BLOCKS || block.size!=BLOCK) {
         *problem="IIO block identity invalid";
         return -EINVAL;
@@ -171,9 +175,11 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
         *problem="IIO block return failed";
         return result;
     }
+#ifdef OBS_SCAN_STREAM_BENCH
     ++blocks->returned;
     double elapsed=monotonic()-start;
     if(elapsed>blocks->max_checkout) blocks->max_checkout=elapsed;
+#endif
     if(bad) {
         *problem="IIO block length invalid";
         return -EINVAL;
@@ -508,8 +514,10 @@ int main(int argc,char **argv)
         (unsigned long long)egress.complete[FIELD_BEGIN],(unsigned long long)egress.complete[FIELD_DATA],
         (unsigned long long)egress.complete[FIELD_END],(unsigned long long)early_data_sent,max_refill_gap,
         reg[FSB_CAUSES/4]);
+#ifdef OBS_SCAN_STREAM_BENCH
     fprintf(stderr,"FSB1_IIO dequeued=%llu returned=%llu max_checkout_s=%.9f\n",
         (unsigned long long)blocks.dequeued,(unsigned long long)blocks.returned,blocks.max_checkout);
+#endif
 done:
     if(rc && !source_failure) report_error(reg,problem?problem:"receipt, history or drain fault",iio_result);
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,FIELD_CANCEL);write_reg(reg,RUN,0);}
