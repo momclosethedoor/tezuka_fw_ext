@@ -82,7 +82,8 @@ done
 
 def summary(status):
     reader = status["metrics"]["reader"]
-    return dict(phase=status["phase"], error=status["error"],
+    field_watch = status["actual"].get("field_watch") or {}
+    return dict(phase=status["phase"], error=status["error"], field_error=field_watch.get("error"),
                 generation=status["actual"]["generation"], progress=status["progress"], reader=reader)
 
 
@@ -202,6 +203,10 @@ test "$(devmem 0x7c460284)" = 0x00000000
             receiver.field_mode = bool(num)
             active = probe.command(label, dict(SCAN, view_bins=width, field_targets=targets[:num]), seconds=40)
             if active["running"] is not True or active.get("view_bins") != width:
+                if num:
+                    detail=stand.ssh(f"dir=$(ls -td {remote}/control/field-* | head -n 1); "
+                                     'test -z "$dir" || cat "$dir/collector.log"')
+                    (log/f"{label}-startup.log").write_text(detail,encoding="utf-8")
                 raise RuntimeError(f"{label} did not start: {probe.cases[-1]['status']['error']}")
             stand.write_json(log / f"{label}-descriptor.json", active["spectrum"])
             if roi_center is not None:
@@ -237,6 +242,9 @@ test "$(devmem 0x7c460284)" = 0x00000000
                 for name in ("collector.log","receipts.jsonl"):
                     content=stand.ssh(f"cat {directory}/{name}")
                     (log/f"{label}-{name}").write_text(content,encoding="utf-8")
+                if any(sample.get("field_error") for sample in snapshots):
+                    kernel=stand.ssh("dmesg | tail -n 80")
+                    (log/f"{label}-kernel.log").write_text(kernel,encoding="utf-8")
             stand.write_json(log / "windows.json", rows)
             print(json.dumps(dict(view=width, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
                 b=host_end["B"]-host_begin["B"])),flush=True)

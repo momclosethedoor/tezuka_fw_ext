@@ -160,6 +160,8 @@ int main(int argc,char **argv)
     unsigned long ms=strtoul(argv[2],&endptr,10);
     if(*endptr || !ms || ms>1000) return 2;
     int rc=1,owner=-1,guard=-1,mem=-1,stream_owned=0,pollfd=-1;
+    const char *problem="allocate history and connect FIELD transport";
+    ssize_t iio_result=0;
     uint32_t oldmode=0,oldcode=0,oldtimeout=0,oldrun=0;
     void *lib=NULL,*context=NULL,*buffer=NULL;
     struct iio_api io={0};
@@ -173,8 +175,10 @@ int main(int argc,char **argv)
     struct preview_history history;
     if(!watch_bytes || !preview || preview_init(&history,storage,RETAIN) ||
        (!!host!=!!port) || (send_enabled && field_connect(&egress,host,port,FIELD_MAX))) goto done;
+    problem="load libiio";
     lib=dlopen("libiio.so.0",RTLD_NOW);
     if(!lib || load_api(lib,&io)) goto done;
+    problem="acquire exclusive IIO ownership";
     owner=open("/run/obs-field1.lock",O_RDWR|O_CREAT|O_CLOEXEC,0600);
     if(owner<0 || flock(owner,LOCK_EX|LOCK_NB)) goto done;
     if(iio_in_use()!=0) goto done;
@@ -183,10 +187,12 @@ int main(int argc,char **argv)
     const char *authorization=getenv("OBS_FIELD1_TX_AUTHORIZED");
     unsigned expected_powerdown=!(authorization && !strcmp(authorization,"1"));
     /* Keep the accepted collector's per-series readback/ownership check. */
+    problem="verify RF guard ownership and TX readback";
     if(guard<0 || ioctl(guard,0x4605,guard_status) || guard_status[0]!=2 ||
        guard_status[1]!=2 || guard_status[2] || guard_status[112]!=expected_powerdown) goto done;
     mem=open("/dev/mem",O_RDWR|O_SYNC|O_CLOEXEC);
     if(mem<0) goto done;
+    problem="check FLD2/FFM1 ABI and idle session";
     reg=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,mem,0x7c460000);
     if(reg==MAP_FAILED || reg[FFM_ID/4]!=OBS_FFM1 || reg[0x280/4]!=OBS_FLD2 || reg[SESSION/4] ||
        reg[STATUS/4]&0xc1 || reg[LEVEL/4]&0x1ff) goto done;
@@ -194,17 +200,23 @@ int main(int argc,char **argv)
     oldrun=reg[RUN/4];stream_owned=1;
     write_reg(reg,RUN,0);write_reg(reg,0x38,1);write_reg(reg,0x40,24);
     write_reg(reg,0x28c,(uint32_t)ms*62500);
+    problem="configure the IIO device and channels";
     context=io.create_local_context();
     void *dev=context?io.context_find_device(context,"cf-ad9361-lpc"):NULL;
     if(!dev || io.context_set_timeout(context,250) || io.device_set_kernel_buffers_count(dev,4)) goto done;
     void *i=io.device_find_channel(dev,"voltage0",false),*q=io.device_find_channel(dev,"voltage1",false);
     if(!i || !q) goto done;
     io.channel_enable(i);io.channel_enable(q);
+    problem="create the nonblocking IIO buffer";
     buffer=io.device_create_buffer(dev,BLOCK/4,false);
     if(!buffer || io.buffer_set_blocking_mode(buffer,false)) goto done;
     if((uint8_t*)io.buffer_end(buffer)-(uint8_t*)io.buffer_start(buffer)!=BLOCK ||
-       (pollfd=io.buffer_get_poll_fd(buffer))<0 || io.buffer_refill(buffer)!=-EAGAIN) goto done;
+       (pollfd=io.buffer_get_poll_fd(buffer))<0) goto done;
+    problem="verify IIO is empty before real8 RUN";
+    iio_result=io.buffer_refill(buffer);
+    if(iio_result!=-EAGAIN) goto done;
     signal(SIGINT,stop_session);signal(SIGTERM,stop_session);
+    problem="real8 source failed to become ready";
     write_reg(reg,RUN,1);
     double deadline=monotonic()+0.25;
     while(!(reg[STATUS/4]&32)) {
@@ -218,6 +230,7 @@ int main(int argc,char **argv)
     double receipt_time=0;
     int pending=0,draining=0,failed=0;
     rc=0;
+    problem=NULL;
     for(;;) {
         if(stopping && !draining) {
             /* The map owner has stopped admission before signalling shutdown.
@@ -227,9 +240,12 @@ int main(int argc,char **argv)
             deadline=monotonic()+1.25;
         }
         ssize_t got=io.buffer_refill(buffer);
+        iio_result=got;
         if(got>0) {
-            if(got>BLOCK || preview_append(&history,io.buffer_start(buffer),(size_t)got)) {rc=4;break;}
-        } else if(got!=-EAGAIN && got!=-EINTR) {rc=4;break;}
+            if(got>BLOCK || preview_append(&history,io.buffer_start(buffer),(size_t)got)) {
+                problem="invalid IIO block";rc=4;break;
+            }
+        } else if(got!=-EAGAIN && got!=-EINTR) {problem="IIO refill failed";rc=4;break;}
         int expired=draining && monotonic()>=deadline;
         while(pending || reg[LEVEL/4]&(1u<<16)) {
             enum preview_result status=PREVIEW_READY;
@@ -257,7 +273,7 @@ int main(int argc,char **argv)
         field_pump(&egress);
         if(expired || (draining && !pending && !egress.count && !(reg[STATUS/4]&0xc1) &&
            !(reg[LEVEL/4]&0x1ff))) break;
-        if(reg[STATUS/4]&16) {rc=4;break;}
+        if(reg[STATUS/4]&16) {problem="real8 hardware reported a source fault";rc=4;break;}
         if(got>0) continue;
         struct pollfd p[2]={{.fd=pollfd,.events=POLLIN},{.fd=egress.count?egress.fd:-1,.events=POLLOUT}};
         /* The accepted FIELD timeout bounds receipt observation if the IIO
@@ -265,8 +281,8 @@ int main(int argc,char **argv)
         int wait_ms=draining?(int)((deadline-monotonic())*1000)+1:(int)ms;
         if(wait_ms<0) wait_ms=0;
         if(wait_ms>20) wait_ms=20;
-        if(poll(p,2,wait_ms)<0 && errno!=EINTR) {rc=4;break;}
-        if(p[0].revents&(POLLHUP|POLLERR|POLLNVAL)) {rc=4;break;}
+        if(poll(p,2,wait_ms)<0 && errno!=EINTR) {problem="IIO poll failed";rc=4;break;}
+        if(p[0].revents&(POLLHUP|POLLERR|POLLNVAL)) {problem="IIO poll reported a source fault";rc=4;break;}
     }
     field_abandon(&egress);
     if(reg[LOST/4]!=lost_start || pending || failed || reg[LEVEL/4]&0x1ff) rc=4;
@@ -281,6 +297,9 @@ int main(int argc,char **argv)
         (unsigned long long)egress.blocked,egress.peak,egress.peak_bytes,egress.socket_peak,
         egress.max_queue_s,egress.max_send_s,egress.max_ready_s);
 done:
+    if(rc) fprintf(stderr,"FFM1_ERROR stage=%s iio=%zd status=%08x session=%u level=%08x\n",
+        problem?problem:"receipt, history or drain fault",iio_result,
+        reg==MAP_FAILED?0:reg[STATUS/4],reg==MAP_FAILED?0:reg[SESSION/4],reg==MAP_FAILED?0:reg[LEVEL/4]);
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,2);write_reg(reg,RUN,0);}
     if(buffer) io.buffer_destroy(buffer);
     if(context) io.context_destroy(context);
