@@ -11,18 +11,22 @@ use std::{
 const SLOTS: usize = 16;
 type Buffer = Box<[u8]>;
 
-pub(super) fn settings() -> R<Option<(bool, Duration)>> {
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Load { View, Read, Worker }
+
+pub(super) fn settings() -> R<Option<(Load, Duration)>> {
     let Some(path) = std::env::var_os("OBS_VIEW_DUAL_BENCH_FILE") else { return Ok(None) };
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut words = text.split_whitespace();
     let full = match words.next() {
-        Some("view") => false,
-        Some("full") => true,
+        Some("view") => Load::View,
+        Some("read") => Load::Read,
+        Some("full") => Load::Worker,
         _ => return Err("dual bench mode".into()),
     };
     let us: u64 = words.next().and_then(|s| s.parse().ok()).ok_or("dual bench wait")?;
-    if !matches!(us, 5 | 8 | 10 | 16) || words.next().is_some() {
-        return Err("dual bench wait must be 5, 8, 10 or 16 us".into());
+    if !matches!(us, 0 | 5 | 8 | 10 | 16) || words.next().is_some() {
+        return Err("dual bench wait must be 0, 5, 8, 10 or 16 us".into());
     }
     Ok(Some((full, Duration::from_micros(us))))
 }

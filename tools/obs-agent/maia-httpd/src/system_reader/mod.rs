@@ -363,8 +363,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  // The managed control sink delivers VIEW. Full FFT ownership and diagnostic
  // captures use the separate local reader paths.
  let bench=if control.is_some(){dual_bench::settings()?}else{None};
- let full_bench=bench.is_some_and(|(full,_)|full);
- let managed_view_only=control.is_some()&&!full_bench;
+ let full_bench=bench.is_some_and(|(load,_)|load==dual_bench::Load::Worker);
+ let managed_view_only=control.is_some()&&bench.is_none_or(|(load,_)|load==dual_bench::Load::View);
  let mut io=Hardware::open(c,managed_view_only)?;
  let empty_wait=bench.map(|(_,wait)|wait).unwrap_or_else(||if managed_view_only{view_idle_wait(c.k)}else{Duration::ZERO});
  io.idle_wait_us=empty_wait.as_micros() as u64;
