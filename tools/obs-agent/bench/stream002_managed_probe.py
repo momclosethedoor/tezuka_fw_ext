@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from egress_probe import HOST, Probe, Receiver, lease_loop
-from stream002_sink import FIELD, exact, field_frame
+from stream002_sink import FIELD, FieldChunks, exact, field_frame
 
 
 SCAN = dict(op="scan", planner_version=2, path_ack_version=1, sweep_geometry="27/9",
@@ -30,23 +30,43 @@ done"""
 
 class BenchReceiver(Receiver):
     field_mode = False
+    fsb1 = False
 
     def real8(self, conn):
         if not self.field_mode:
             return super().real8(conn)
+        chunks = FieldChunks() if self.fsb1 else None
         while not self.stop.is_set():
-            header = exact(conn, FIELD.size, eof=True)
+            try:
+                header = exact(conn, FIELD.size, eof=True)
+            except TimeoutError:
+                continue
             if header is None:
+                if chunks and chunks.active is not None:
+                    self.protocol_errors.append("FSB1 TCP closed before END")
                 return
             try:
-                meta, length = field_frame(conn, header)
-            except (ValueError, KeyError) as error:
+                if chunks:
+                    meta, length, payload = chunks.read(conn, header)
+                else:
+                    meta, length = field_frame(conn, header)
+            except (ValueError, KeyError, EOFError) as error:
                 self.protocol_errors.append(str(error))
                 return
-            self.field_stats["end"] += 1
             self.field_stats["bytes"] += length
+            if chunks:
+                kind=meta["kind"]
+                self.field_stats[kind] += 1
+                self.field_stats["payload_bytes"] += payload
+                if kind!="end":
+                    continue
+                if meta["qualified_field"]:
+                    self.field_stats["successes"].append(meta)
+                code=str(meta["pl_outcome"])
+            else:
+                self.field_stats["end"] += 1
+                code=str(meta["outcome"])
             outcomes = self.field_stats["outcomes"]
-            code = str(meta["outcome"])
             outcomes[code] = outcomes.get(code, 0)+1
 
 
@@ -173,6 +193,9 @@ test "$(devmem 0x7c460284)" = 0x00000000
     stand.write_json(config,control)
     stand.upload(config, remote, config.name)
     receiver = BenchReceiver(log)
+    receiver.fsb1 = args.fsb1
+    if args.fsb1:
+        receiver.field_stats.update(payload_bytes=0,successes=[])
     roi_process = launch_roi(log,full) if roi_enabled else None
     halted, ready = threading.Event(), threading.Event()
     lease = threading.Thread(target=lease_loop, args=(halted, ready, log, threading.Event()), daemon=True)

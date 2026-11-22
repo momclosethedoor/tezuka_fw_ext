@@ -14,6 +14,21 @@ struct preview_history {
 };
 enum preview_result { PREVIEW_READY, PREVIEW_WAIT, PREVIEW_LOST, PREVIEW_INVALID };
 
+static inline int preview_position(const struct preview_history *h, uint32_t raw, uint64_t *absolute)
+{
+    uint32_t distance=raw-(uint32_t)h->consumed;
+    if (distance==UINT32_C(0x80000000)) return -1;
+    if (distance<UINT32_C(0x80000000)) {
+        if (h->consumed>UINT64_MAX-distance) return -1;
+        *absolute=h->consumed+distance;
+    } else {
+        uint32_t back=0u-distance;
+        if (back>h->consumed) return -1;
+        *absolute=h->consumed-back;
+    }
+    return 0;
+}
+
 static inline int preview_init(struct preview_history *h, uint8_t *bytes, size_t capacity)
 {
     if (!bytes || !capacity || capacity >= UINT32_C(0x80000000)) return -1;
@@ -44,37 +59,12 @@ static inline enum preview_result preview_bounds(const struct preview_history *h
     uint32_t first, uint32_t end, uint64_t *first64, uint64_t *end64)
 {
     uint32_t length = end-first;
-    uint32_t distance = end-(uint32_t)h->consumed;
-    if (!length || length > h->capacity || distance == UINT32_C(0x80000000))
-        return PREVIEW_INVALID;
     uint64_t e;
-    if (distance < UINT32_C(0x80000000)) {
-        if (h->consumed > UINT64_MAX-distance) return PREVIEW_INVALID;
-        e = h->consumed+distance;
-    } else {
-        uint32_t back = 0u-distance;
-        if (back > h->consumed) return PREVIEW_INVALID;
-        e = h->consumed-back;
-    }
-    if (e < length) return PREVIEW_INVALID;
+    if (!length || length>h->capacity || preview_position(h,end,&e) || e<length)
+        return PREVIEW_INVALID;
     *end64=e;
     *first64=e-length;
     return PREVIEW_READY;
 }
 
-static inline enum preview_result preview_copy(const struct preview_history *h,
-    uint64_t first, uint64_t end, uint8_t *out, size_t capacity)
-{
-    if (first >= end || end-first > capacity || end-first > h->capacity || !out)
-        return PREVIEW_INVALID;
-    if (first < h->consumed-h->retained) return PREVIEW_LOST;
-    if (end > h->consumed) return PREVIEW_WAIT;
-    size_t n = (size_t)(end-first);
-    size_t at = (size_t)(first % h->capacity);
-    size_t head = h->capacity-at;
-    if (head > n) head=n;
-    memcpy(out,h->bytes+at,head);
-    memcpy(out+head,h->bytes,n-head);
-    return PREVIEW_READY;
-}
 #endif

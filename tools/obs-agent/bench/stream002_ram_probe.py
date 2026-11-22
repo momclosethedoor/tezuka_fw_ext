@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--transmitter-wait-seconds", type=int,
                         help="wait 30 to 150 seconds for transmitter readiness (default 90)")
     parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
+    parser.add_argument("--fsb1", action="store_true", help="use the PL-FIELD-STREAM-001 RAM image and streaming sink")
     args = parser.parse_args()
     compact_tcp = args.full_compact_tcp or args.roi_center_hz is not None
     if sum((args.full_compact_tcp, args.roi_center_hz is not None, args.roi_range_hz is not None)) > 1:
@@ -59,9 +60,10 @@ def main():
     sys.path.insert(0, str(args.stand.resolve()))
     import run_live as stand
 
-    image_hash = "830d6a8268b96d2661b985eb767b247f7398ae67ffcf208cd297f52b68bd6159"
+    image_hash = ("0bd534f83e452fdce6e3c69ffb7acf82c10361000b107c25f9ec68a4ad140ce1" if args.fsb1 else
+                  "830d6a8268b96d2661b985eb767b247f7398ae67ffcf208cd297f52b68bd6159")
     if stand.digest(args.image) != image_hash:
-        raise ValueError("Expected the main PL-SCAN-STREAM-002 RAM image")
+        raise ValueError("Expected the verified main RAM image for the selected ABI")
     log = args.log.resolve()
     log.mkdir()
     (log / "uart").mkdir()
@@ -86,6 +88,7 @@ def main():
             b' test "$(devmem 0x7c46033c)" = 0x00000000',
             b' test "$(devmem 0x7c460280)" = 0x32444C46',
             b' test "$(devmem 0x7c460350)" = 0x314D4646',
+            *( [b' test "$(devmem 0x7c460388)" = 0x31425346'] if args.fsb1 else [] ),
             b' echo STREAM002_ABI_AND_MODULES_READY',
         ]) + b"\n")
     if args.cached_dma:

@@ -26,7 +26,7 @@ enum { FFM_ID=OBS_FFM1_ID_REG, SESSION=OBS_FFM1_SESSION, POP=OBS_FFM1_POP, LEVEL
        FIELD_CANCEL=1u<<1, FIELD_SOURCE_FAULT=1u<<4, FIELD_SOURCE_READY=1u<<5,
        FIELD_ACTIVE=(1u<<0)|(1u<<6)|(1u<<7),
        FFM_LEVEL_COUNT=0x1ffu, FFM_HEAD_AVAILABLE=1u<<16,
-       BLOCK=262144, FIELD_MAX=337924, RETAIN=2*BLOCK+2*FIELD_MAX };
+       BLOCK=262144, FIELD_MAX=337924, HISTORY_BLOCKS=3, RETAIN=HISTORY_BLOCKS*BLOCK };
 static volatile sig_atomic_t stopping;
 static void stop_session(int sig) { (void)sig; stopping=1; }
 static double monotonic(void)
@@ -82,13 +82,6 @@ static void report_error(volatile uint32_t *reg, const char *reason, ssize_t iio
         reason,iio_result,reg==MAP_FAILED?0:reg[STATUS/4],
         reg==MAP_FAILED?0:reg[SESSION/4],reg==MAP_FAILED?0:reg[LEVEL/4]);
 }
-static void quiesce_source(volatile uint32_t *reg, const char *reason, ssize_t iio_result)
-{
-    report_error(reg,reason,iio_result);
-    write_reg(reg,SESSION,0);
-    write_reg(reg,COMMAND,FIELD_CANCEL);
-    write_reg(reg,RUN,0);
-}
 struct iio_api {
     void *(*create_local_context)(void);
     void (*context_destroy)(void *);
@@ -120,6 +113,39 @@ struct observation {
     uint64_t epoch;
     uint32_t version,position,outcome,started,first,end;
 };
+#include "obs-fsb1-stream.h"
+
+static int wait_register(volatile uint32_t *reg, unsigned offset, uint32_t mask, uint32_t value)
+{
+    double deadline=monotonic()+0.1;
+    while ((reg[offset/4]&mask)!=value) {
+        if(monotonic()>=deadline) return -1;
+        usleep(1000);
+    }
+    return 0;
+}
+
+static void quiesce_source(volatile uint32_t *reg, const char *reason, ssize_t iio_result,
+                           uint64_t consumed, double refill_gap)
+{
+    uint32_t status=reg[STATUS/4], session=reg[SESSION/4], before=reg[FSB_CAUSES/4];
+    write_reg(reg,SESSION,0);
+    write_reg(reg,COMMAND,FIELD_CANCEL);
+    write_reg(reg,RUN,0);
+    int settled=wait_register(reg,STATUS,FIELD_ACTIVE|FIELD_SOURCE_READY,0)==0;
+    uint32_t after=reg[FSB_CAUSES/4];
+    /* Allow sticky sampling-domain bits to settle while IIO remains open. */
+    for(unsigned n=0;n<FSB_MAX_READS;++n) {
+        usleep(1000);
+        uint32_t next=reg[FSB_CAUSES/4];
+        if(next==after) break;
+        after=next;
+    }
+    fprintf(stderr,"FSB1_FAULT before=%02x after=%02x mask_before=%u mask_after=%u "
+        "status=%08x session=%u iio=%zd consumed=%llu refill_gap_s=%.9f settled=%d stage=%s\n",
+        before,after,before&FSB_CAUSE_MASK,after&FSB_CAUSE_MASK,status,session,iio_result,
+        (unsigned long long)consumed,refill_gap,settled,reason);
+}
 static struct observation get_head(volatile uint32_t *reg)
 {
     uint32_t words[6];
@@ -142,8 +168,7 @@ static int load_version(const char *directory,uint32_t version,struct watch_tabl
     return wat->version==version?0:-1;
 }
 static int report(const struct observation *o, const struct watch_table *wat,
-                  enum preview_result status, const uint8_t *payload, size_t bytes,
-                  struct field_egress *egress, bool send_enabled, double receipt_time)
+                  enum preview_result status, size_t bytes, bool send_enabled, double receipt_time)
 {
     struct watch_target task={0};
     if(o->version==wat->version && o->position<wat->count) task=watch_row(wat,o->position);
@@ -160,12 +185,12 @@ static int report(const struct observation *o, const struct watch_table *wat,
         (unsigned long long)task.generation,(unsigned long long)task.hz,
         o->first,o->end,(unsigned)status,bytes,receipt_time,ready);
     if(count<0 || (size_t)count>=sizeof metadata) return -1;
-    if(send_enabled) field_queue(egress,metadata,(size_t)count,payload,bytes,ready);
 #ifdef OBS_SCAN_STREAM_BENCH
     if (!send_enabled || getenv("OBS_FFM1_TRACE")) {
         if (puts(metadata)<0) return -1;
     }
 #endif
+    (void)send_enabled;
     return !known;
 }
 
@@ -185,13 +210,13 @@ int main(int argc,char **argv)
     volatile uint32_t *reg=MAP_FAILED;
     struct watch_table wat={0};
     uint8_t *watch_bytes=malloc(WATCH_HEADER+WATCH_RECORD*WATCH_RESIDENT_MAX+1);
-    uint8_t *storage=malloc(RETAIN),*preview=malloc(FIELD_MAX);
+    uint8_t *storage=malloc(RETAIN);
     struct field_egress egress={.fd=-1};
     const char *host=getenv("OBS_FFM1_HOST"), *port=getenv("OBS_FFM1_PORT");
     bool send_enabled=host && port;
     struct preview_history history;
-    if(!watch_bytes || !preview || preview_init(&history,storage,RETAIN) ||
-       (!!host!=!!port) || (send_enabled && field_connect(&egress,host,port,FIELD_MAX))) goto done;
+    if(!watch_bytes || preview_init(&history,storage,RETAIN) ||
+       (!!host!=!!port) || (send_enabled && field_connect(&egress,host,port,BLOCK))) goto done;
     problem="load libiio";
     lib=dlopen("libiio.so.0",RTLD_NOW);
     if(!lib || load_api(lib,&io)) goto done;
@@ -211,12 +236,18 @@ int main(int argc,char **argv)
     if(mem<0) goto done;
     problem="check FLD2/FFM1 ABI and idle session";
     reg=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,mem,0x7c460000);
-    if(reg==MAP_FAILED || reg[FFM_ID/4]!=OBS_FFM1 || reg[0x280/4]!=OBS_FLD2 || reg[SESSION/4] ||
+    if(reg==MAP_FAILED || reg[FFM_ID/4]!=OBS_FFM1 || reg[0x280/4]!=OBS_FLD2 ||
+       reg[FSB_ID/4]!=UINT32_C(0x31425346) || reg[SESSION/4] ||
        reg[STATUS/4]&FIELD_ACTIVE || reg[LEVEL/4]&FFM_LEVEL_COUNT) goto done;
     oldmode=reg[0x38/4];oldcode=reg[0x40/4];oldtimeout=reg[0x28c/4];
     oldrun=reg[RUN/4];stream_owned=1;
     write_reg(reg,RUN,0);write_reg(reg,0x38,1);write_reg(reg,0x40,24);
     write_reg(reg,0x28c,(uint32_t)ms*62500);
+    problem="arm FSB1 sticky causes";
+    write_reg(reg,FSB_DIAG,0);
+    if(wait_register(reg,FSB_CAUSES,FSB_DIAG_READY|FSB_CAUSE_MASK,0)) goto done;
+    write_reg(reg,FSB_DIAG,1);
+    if(wait_register(reg,FSB_CAUSES,FSB_DIAG_READY,FSB_DIAG_READY)) goto done;
     problem="configure the IIO device and channels";
     context=io.create_local_context();
     void *dev=context?io.context_find_device(context,"cf-ad9361-lpc"):NULL;
@@ -245,7 +276,12 @@ int main(int argc,char **argv)
     write_reg(reg,SESSION,1);
     fprintf(stderr,"FFM1_READY block=%d history=%d\n",BLOCK,RETAIN);
     struct observation obs={0};
+    struct field_live live={0};
+    struct field_wire wire={0};
     uint64_t first64=0,end64=0;
+    uint64_t last_terminal=0, early_data_sent=0;
+    double last_refill=0, refill_gap=0, max_refill_gap=0;
+    enum preview_result terminal_status=PREVIEW_READY;
     double receipt_time=0;
     int pending=0,draining=0,failed=0;
     rc=0;
@@ -263,21 +299,27 @@ int main(int argc,char **argv)
             got=io.buffer_refill(buffer);
             iio_result=got;
             if(got>0) {
+                double now=monotonic();
+                if(last_refill) {
+                    refill_gap=now-last_refill;
+                    if(refill_gap>max_refill_gap) max_refill_gap=refill_gap;
+                }
+                last_refill=now;
                 if(got>BLOCK || preview_append(&history,io.buffer_start(buffer),(size_t)got))
                     source_failure="invalid IIO block";
+                else live=stable_live(reg,history.consumed);
             } else if(got!=-EAGAIN && got!=-EINTR) source_failure="IIO refill failed";
             if(!source_failure && reg[STATUS/4]&FIELD_SOURCE_FAULT)
                 source_failure="real8 hardware reported a source fault";
             if(source_failure) {
                 /* Stop this generation of real8 before any new data can enter history.
                  * FFM1 still reports the marked visits; this remains its sole reader. */
-                quiesce_source(reg,source_failure,iio_result);
+                quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap);
                 rc=4;
             }
         }
         int expired=draining && monotonic()>=deadline;
         while(pending || reg[LEVEL/4]&FFM_HEAD_AVAILABLE) {
-            enum preview_result status=PREVIEW_READY;
             if(!pending) {
                 obs=get_head(reg);
                 receipt_time=monotonic();
@@ -285,21 +327,76 @@ int main(int argc,char **argv)
                     wat=(struct watch_table){0};
                     failed=1;
                 }
-                if(!obs.outcome || obs.outcome>7 || (obs.outcome!=1 && (obs.first||obs.end))) failed=1;
-                if(obs.outcome==1) status=preview_bounds(&history,obs.first,obs.end,&first64,&end64);
+                terminal_status=PREVIEW_READY;
+                first64=end64=0;
+                if(!obs.outcome || obs.outcome>7 || (obs.outcome!=1 && (obs.first||obs.end)))
+                    terminal_status=PREVIEW_INVALID;
+                if(obs.outcome==1) {
+                    terminal_status=preview_bounds(&history,obs.first,obs.end,&first64,&end64);
+                    if(end64-first64>FIELD_MAX) terminal_status=PREVIEW_INVALID;
+                }
                 write_reg(reg,POP,1);
                 pending=1;
             }
-            if(obs.outcome==1 && status==PREVIEW_READY)
-                status=preview_copy(&history,first64,end64,preview,FIELD_MAX);
-            if(status==PREVIEW_WAIT && !expired && !source_failure) break;
-            if(status==PREVIEW_WAIT) status=PREVIEW_LOST;
-            size_t extent=status==PREVIEW_READY && obs.outcome==1?(size_t)(end64-first64):0;
-            if(report(&obs,&wat,status,preview,extent,&egress,send_enabled,receipt_time) ||
-               status!=PREVIEW_READY) failed=1;
+            if(send_enabled && egress.fd>=0) {
+                int opened=wire.active && same_visit(&wire.visit,&obs) && obs.outcome!=1 ? 0 :
+                    stream_begin(&wire,&obs,first64,&wat,&egress);
+                if(opened>0 && !expired) break;
+                if(opened!=0) {
+                    field_abandon(&egress);
+                    terminal_status=PREVIEW_LOST;
+                } else {
+                    if(obs.outcome==1 && terminal_status==PREVIEW_READY) {
+                        enum preview_result sent=stream_data(&wire,end64,&history,&egress);
+                        if(sent==PREVIEW_WAIT && !expired && (!source_failure || end64<=history.consumed)) break;
+                        terminal_status=sent==PREVIEW_WAIT?PREVIEW_LOST:sent;
+                    }
+                    int closed=stream_end(&wire,&obs,&wat,terminal_status,&egress);
+                    if(closed>0 && !expired) break;
+                    if(closed!=0) {
+                        field_abandon(&egress);
+                        terminal_status=PREVIEW_LOST;
+                    }
+                }
+            } else if(send_enabled) terminal_status=PREVIEW_LOST;
+            else if(obs.outcome==1 && terminal_status==PREVIEW_READY) {
+                if(first64<history.consumed-history.retained) terminal_status=PREVIEW_LOST;
+                else if(end64>history.consumed) {
+                    if(!expired && !source_failure) break;
+                    terminal_status=PREVIEW_LOST;
+                }
+            }
+            size_t extent=terminal_status==PREVIEW_READY && obs.outcome==1?(size_t)(end64-first64):0;
+            if(report(&obs,&wat,terminal_status,extent,send_enabled,receipt_time) ||
+               terminal_status!=PREVIEW_READY) failed=1;
+            last_terminal=obs.epoch;
             pending=0;
         }
+        if(!pending && !source_failure && live.phase && live.identity.epoch>last_terminal && egress.fd>=0 &&
+                (!wire.active || same_visit(&wire.visit,&live.identity))) {
+            uint64_t first,through=live.iio_through;
+            bool valid=preview_position(&history,live.identity.first,&first)==0;
+            if(valid && live.phase==2) {
+                uint64_t end;
+                valid=preview_bounds(&history,live.identity.first,live.identity.end,&first,&end)==PREVIEW_READY;
+                if(valid && end<through) through=end;
+            }
+            if(valid && first<through && first>=history.consumed-history.retained &&
+                (wat.version==live.identity.version || !load_version(argv[1],live.identity.version,&wat,watch_bytes))) {
+                int opened=stream_begin(&wire,&live.identity,first,&wat,&egress);
+                if(opened<0 || (!opened && stream_data(&wire,through,&history,&egress)>PREVIEW_WAIT)) {
+                    field_abandon(&egress);
+                    failed=1;
+                }
+            }
+        }
+        uint64_t data_complete=egress.complete[FIELD_DATA];
+        uint64_t head_tag=egress.count?egress.packets[egress.head].tag:0;
         field_pump(&egress);
+        if(data_complete!=egress.complete[FIELD_DATA] && wire.active && head_tag==wire.tag) {
+            struct field_live at_send=stable_live(reg,history.consumed);
+            if(at_send.phase==1 && same_visit(&at_send.identity,&wire.visit)) ++early_data_sent;
+        }
         if(expired || (draining && !pending && !egress.count && !(reg[STATUS/4]&FIELD_ACTIVE) &&
            !(reg[LEVEL/4]&FFM_LEVEL_COUNT))) break;
         if(got>0) continue;
@@ -317,12 +414,12 @@ int main(int argc,char **argv)
             source_failure="IIO poll reported a source fault";
         }
         if(source_failure && p[0].fd>=0) {
-            quiesce_source(reg,source_failure,iio_result);
+            quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap);
             rc=4;
         }
     }
     field_abandon(&egress);
-    if(reg[LOST/4]!=lost_start || pending || failed || reg[LEVEL/4]&FFM_LEVEL_COUNT) rc=4;
+    if(reg[LOST/4]!=lost_start || pending || failed || egress.abandoned || reg[LEVEL/4]&FFM_LEVEL_COUNT) rc=4;
     fprintf(stderr,"FFM1_STOP bytes=%llu receipt_lost=%u error=%d\n",
         (unsigned long long)history.consumed,reg[LOST/4]-lost_start,rc);
     fprintf(stderr,"FFM1_EGRESS sent=%llu sent_bytes=%llu accepted_bytes=%llu rejected=%llu abandoned=%llu "
@@ -333,6 +430,10 @@ int main(int argc,char **argv)
         (unsigned long long)egress.abandoned,(unsigned long long)egress.partial,
         (unsigned long long)egress.blocked,egress.peak,egress.peak_bytes,egress.socket_peak,
         egress.max_queue_s,egress.max_send_s,egress.max_ready_s);
+    fprintf(stderr,"FSB1_EGRESS begin=%llu data=%llu end=%llu data_before_boundary=%llu max_refill_gap_s=%.9f causes=%02x\n",
+        (unsigned long long)egress.complete[FIELD_BEGIN],(unsigned long long)egress.complete[FIELD_DATA],
+        (unsigned long long)egress.complete[FIELD_END],(unsigned long long)early_data_sent,max_refill_gap,
+        reg[FSB_CAUSES/4]);
 done:
     if(rc && !source_failure) report_error(reg,problem?problem:"receipt, history or drain fault",iio_result);
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,FIELD_CANCEL);write_reg(reg,RUN,0);}
@@ -350,6 +451,6 @@ done:
     if(lib) dlclose(lib);
     if(egress.fd>=0) close(egress.fd);
     for(unsigned i=0;i<FIELD_QUEUE;++i) free(egress.packets[i].bytes);
-    free(watch_bytes);free(preview);free(storage);
+    free(watch_bytes);free(storage);
     return rc;
 }

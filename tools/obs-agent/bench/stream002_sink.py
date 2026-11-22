@@ -1,6 +1,7 @@
 """Bounded TCP sink for the ARM-SCAN-STREAM-002 bench protocols."""
 import argparse
 import json
+from hashlib import sha256
 import socket
 import struct
 import time
@@ -111,6 +112,54 @@ def field_frame(conn, header):
             length != (meta["end"] - meta["first"]) % (1 << 32)):
         raise ValueError("FIELD bytes differ from FFM1 extent")
     return meta, FIELD.size + meta_bytes + length
+
+
+class FieldChunks:
+    """Validate wire offsets and exact extents without storing a field."""
+
+    def __init__(self):
+        self.active = None
+        self.received = 0
+        self.digest = None
+
+    def read(self, conn, header):
+        magic, meta_bytes, length = FIELD.unpack(header)
+        if magic != b"R8P2" or not 0 < meta_bytes < 512 or length > 262144:
+            raise ValueError("invalid FSB1 frame size")
+        meta = json.loads(exact(conn, meta_bytes))
+        payload = exact(conn, length)
+        kind = meta["kind"]
+        if kind == "begin":
+            if self.active is not None or length:
+                raise ValueError("overlapping FSB1 attempts")
+            self.active = meta
+            self.received = 0
+            self.digest = sha256()
+        else:
+            if self.active is None or meta["stream_tag"] != self.active["stream_tag"]:
+                raise ValueError("FSB1 stream identity mismatch")
+            if kind == "data":
+                if not length or meta["offset"] != self.received:
+                    raise ValueError("FSB1 DATA gap or overlap")
+                self.digest.update(payload)
+                self.received += length
+            elif kind == "end":
+                for key in ("epoch", "map_version", "target_position", "target_hz", "watch_generation", "watch_revision"):
+                    if meta[key] != self.active[key]:
+                        raise ValueError("FSB1 END changed visit identity")
+                if length or meta["generation_bytes"] != self.received or not 1 <= meta["pl_outcome"] <= 7:
+                    raise ValueError("FSB1 END byte count or outcome")
+                if meta["qualified_field"]:
+                    expected = (meta["source_end"] - meta["source_first"]) % (1 << 32)
+                    if (meta["pl_outcome"] != 1 or meta["error"] or not expected or expected != self.received
+                            or meta["source_first"] != self.active["source_first"]
+                            or meta["first"] != 0 or meta["end"] != self.received):
+                        raise ValueError("FSB1 SUCCESS extent mismatch")
+                    meta["sha256"] = self.digest.hexdigest()
+                self.active = None
+            else:
+                raise ValueError("invalid FSB1 frame kind")
+        return meta, FIELD.size + meta_bytes + length, length
 
 
 def main():

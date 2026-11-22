@@ -8,10 +8,13 @@
 #include <sys/time.h>
 
 enum { FIELD_QUEUE = 4, FIELD_META = 512, FIELD_SEND_SLICE = 64*1024, FIELD_SEND_DEADLINE_S = 1 };
+enum field_message { FIELD_BEGIN, FIELD_DATA, FIELD_END };
 
 struct field_packet {
     uint8_t *bytes;
     size_t length, used;
+    enum field_message kind;
+    uint64_t tag;
     double ready, first_send;
 };
 
@@ -21,6 +24,7 @@ struct field_egress {
     size_t bytes, peak_bytes;
     int fd, socket_peak;
     uint64_t sent, rejected, abandoned, partial, accepted_bytes, sent_bytes, blocked;
+    uint64_t complete[3];
     double max_send_s, max_queue_s, max_ready_s;
 };
 
@@ -43,12 +47,13 @@ static int field_connect(struct field_egress *q, const char *host, const char *p
     return 0;
 }
 
-static void field_queue(struct field_egress *q, const char *meta, size_t meta_len,
+static int field_queue(struct field_egress *q, enum field_message kind, uint64_t tag, const char *meta,
     const uint8_t *payload, size_t length, double ready)
 {
+    size_t meta_len=strlen(meta);
     if (q->fd<0 || q->count==FIELD_QUEUE || meta_len>=FIELD_META) {
         ++q->rejected;
-        return;
+        return -1;
     }
     struct field_packet *p=&q->packets[(q->head+q->count)%FIELD_QUEUE];
     uint32_t header[3]={0x32503852, (uint32_t)meta_len, (uint32_t)length};
@@ -57,12 +62,15 @@ static void field_queue(struct field_egress *q, const char *meta, size_t meta_le
     if (length) memcpy(p->bytes+sizeof header+meta_len,payload,length);
     p->length=sizeof header+meta_len+length;
     p->used=0;
+    p->kind=kind;
+    p->tag=tag;
     p->ready=ready;
     p->first_send=0;
     ++q->count;
     q->bytes+=p->length;
     if (q->count>q->peak) q->peak=q->count;
     if (q->bytes>q->peak_bytes) q->peak_bytes=q->bytes;
+    return 0;
 }
 
 static void field_abandon(struct field_egress *q)
@@ -98,6 +106,7 @@ static void field_pump(struct field_egress *q)
     if (sending>q->max_send_s) q->max_send_s=sending;
     if (total>q->max_ready_s) q->max_ready_s=total;
     ++q->sent;
+    ++q->complete[p->kind];
     q->sent_bytes+=p->length;
     q->head=(q->head+1)%FIELD_QUEUE;
     --q->count;
