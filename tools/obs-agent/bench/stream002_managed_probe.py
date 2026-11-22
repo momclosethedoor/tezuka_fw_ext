@@ -1,4 +1,4 @@
-"""Measure full product-map, zero-FIELD managed validation windows."""
+"""Measure managed full-map VIEW, FIELD and standalone compact delivery."""
 import json
 import subprocess
 import sys
@@ -187,8 +187,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
         if getattr(args,"regression",False):
             mode_regressions(stand,probe,receiver,log,analysis)
             return
-        combinations=((width,num) for width in args.widths for num in fields)
-        for width, num in combinations:
+        combinations=[(width,num) for width in args.widths for num in fields]
+        for index, (width, num) in enumerate(combinations):
             if gated and num and not transmitter:
                 (log/"transmitter-needed").touch()
                 print("TRANSMITTER_READY_REQUIRED",flush=True)
@@ -226,6 +226,10 @@ test "$(devmem 0x7c460284)" = 0x00000000
                        host_begin=host_begin, host_end=host_end, arm_begin=arm_begin, arm_end=arm_end)
             rows.append(row)
             probe.command(f"stop-{label}", dict(stopped, view_bins=width), seconds=12)
+            if transmitter and index + 1 == len(combinations):
+                (log/"transmitter-done").touch()
+                print("TRANSMITTER_CAN_STOP",flush=True)
+                transmitter=False
             row["drained"]=summary(probe.request())
             if num:
                 row["assignments"]=active.get("field_watch")
@@ -237,7 +241,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
             print(json.dumps(dict(view=width, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
                 b=host_end["B"]-host_begin["B"])),flush=True)
     finally:
-        if gated and (log/"transmitter-needed").exists():
+        if gated and (log/"transmitter-needed").exists() and not (log/"transmitter-done").exists():
             (log/"transmitter-done").touch()
             print("TRANSMITTER_CAN_STOP",flush=True)
         halted.set()
