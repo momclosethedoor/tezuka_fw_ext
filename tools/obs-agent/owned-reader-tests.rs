@@ -1,5 +1,6 @@
 #[path="maia-httpd/src/system_reader/continuous.rs"] mod continuous;
 #[path="maia-httpd/src/system_reader/view.rs"] mod view;
+#[path="maia-httpd/src/system_reader/obn3.rs"] mod obn3;
 #[path="maia-httpd/src/control_runtime/plan_math.rs"] mod scan_plan;
 use view::PairIo;
 struct Mock { full:Vec<u8>, view:Vec<u8>, released:usize, fail_view:bool }

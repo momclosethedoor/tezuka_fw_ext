@@ -259,10 +259,11 @@ fn view_mode(settings: &Value) -> Result<u32> {
     match settings.get("view_bins") {
         None => Ok(1),
         Some(bins) => match bins.as_u64() {
+            Some(0) => Ok(0),
             Some(512) => Ok(1),
             Some(1024) => Ok(2),
             Some(2048) => Ok(3),
-            _ => bail!("view_bins must be 512, 1024 or 2048"),
+            _ => bail!("view_bins must be 0, 512, 1024 or 2048"),
         },
     }
 }

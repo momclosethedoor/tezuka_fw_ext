@@ -111,6 +111,9 @@ impl<'a> Delivery<'a> {
             pass.last_tick = h.first_tick;
         }
         if self.spec.positions[position].is_none() {net.transition+=1;}
+        if view.is_empty() {
+            return;
+        }
         if net.bytes.len()+net.record_size() <= MAX_BYTES {
             if net.pending==0 {net.start_record();}
             net.bytes.extend_from_slice(&self.header(h));
@@ -118,7 +121,6 @@ impl<'a> Delivery<'a> {
             net.pending+=1;
             self.peak_bytes=self.peak_bytes.max(net.bytes.len());
         } else {net.rejected_before_queue+=1;net.dropped+=1;}
-        if position == self.spec.last[phase] {self.finish(net,sock,true);}
     }
 
     fn header(&self,h:Header)->[u8;64] {
@@ -135,6 +137,14 @@ impl<'a> Delivery<'a> {
         if self.spec.mode == Mode::Stream {
             net.flush(sock);
         }
+    }
+
+    pub(super) fn finish_drained(&mut self, net: &mut UdpBatch, sock: &UdpSocket, final_epoch: u64) {
+        let executed = self.pass.as_ref().is_some_and(|pass| {
+            let base = self.anchor + (pass.id / 2) * self.spec.positions.len() as u64;
+            final_epoch >= base + self.spec.last[pass.phase] as u64
+        });
+        self.finish(net, sock, executed);
     }
 
     pub(super) fn finish(&mut self,net:&mut UdpBatch,sock:&UdpSocket,executed:bool) {
