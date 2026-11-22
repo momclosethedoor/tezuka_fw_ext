@@ -5,6 +5,7 @@ mod discard;
 mod view_batch;
 mod sweep_delivery;
 mod progress;
+mod dual_bench;
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
 use view_batch::UdpBatch;
@@ -315,7 +316,7 @@ fn full_read_without_sum(b:&[u8]){
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"sync_bytes":io.sync_bytes,
 "payload_read_bytes":io.copied_bytes,"metadata_span_bytes":if io.managed_view_only{reader.visited*512}else{0},
-"owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"managed_idle_wait_us":if io.managed_view_only{io.idle_wait_us}else{0},"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
+"owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"managed_idle_wait_us":io.idle_wait_us,"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
 pub(crate) fn view_bins(header: Header) -> usize {
  view::view_len(header)
@@ -361,9 +362,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  // The managed control sink delivers VIEW. Full FFT ownership and diagnostic
  // captures use the separate local reader paths.
- let managed_view_only=control.is_some();
+ let bench=if control.is_some(){dual_bench::settings()?}else{None};
+ let full_bench=bench.is_some_and(|(full,_)|full);
+ let managed_view_only=control.is_some()&&!full_bench;
  let mut io=Hardware::open(c,managed_view_only)?;
- let empty_wait=if managed_view_only{view_idle_wait(c.k)}else{Duration::ZERO};
+ let empty_wait=bench.map(|(_,wait)|wait).unwrap_or_else(||if managed_view_only{view_idle_wait(c.k)}else{Duration::ZERO});
  io.idle_wait_us=empty_wait.as_micros() as u64;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
@@ -415,7 +418,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut first_view_sent=false;
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
+ let full_worker=if full_bench{Some(dual_bench::Worker::start()?)}else{None};
+ let read_full=|part:&[u8]|{
+  if let Some(worker)=&full_worker{worker.copy_span(part);}else{full_read_without_sum(part);}
+ };
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
+  if let Some(worker)=&full_worker{worker.submit(h)?;}
   if let Some(q)=control {
    if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if draining.get(){network.borrow_mut().suppressed+=1;return Ok(())}
@@ -463,11 +471,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
    if let Ok(mut v)=mark(&mut io,&reader,start){
     v["network"]=network.borrow().counts();
+    if let Some(worker)=&full_worker{v["full_worker"]=worker.counts();}
     *STATUS.lock().unwrap()=v;
    }status_due=Instant::now();
   }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
-  let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+  let s=reader.service_released(&mut io,read_full,&mut sink)?;
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow().as_ref(){sweep.poll(&mut net,sock);}else{net.flush_due(sock);}
@@ -482,7 +491,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
  if !draining.get(){draining.set(control.is_some());io.stop();if let Some(q)=control{(q.trace)("admission_stop");}}
- let stop=Instant::now();loop{let s=reader.service_released(&mut io,full_read_without_sum,&mut sink)?;
+ let stop=Instant::now();loop{let s=reader.service_released(&mut io,read_full,&mut sink)?;
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow_mut().as_mut(){sweep.finish(&mut net,sock,false);}else{net.flush(sock);}
@@ -507,7 +516,14 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  if io.pressure_on{save(c,"pressure.json",&json!({"columns":["board_monotonic_ns","reserved","committed","physical_released"],"period_min_ms":2,"omitted":io.pressure_omitted,"samples":io.pressure}))?;}
  let sweep_network=sweeps.borrow().as_ref().map(|s|json!({"completion_datagrams":s.notes_sent,"completion_send_drop":s.notes_lost,"peak_payload_bytes":s.peak_bytes}));
- let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":if managed_view_only{"owned metadata and VIEW, release, then VIEW send"}else{"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
+ let mut result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":if managed_view_only{"owned metadata and VIEW, release, then VIEW send"}else{"ALL4096 then release and VIEW send"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});
+ if let Some(worker)=full_worker{result["full_worker"]=worker.finish()?;}
+ if io.pressure_on {
+  let mut bins=vec![0u32;view::SLOTS+1];
+  for &[_,reserved,_,released] in &io.pressure{bins[(reserved-released) as usize]+=1;}
+  result["pressure_bins"]=json!(bins);
+ }
+ save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
 static STATUS:std::sync::Mutex<Value>=std::sync::Mutex::new(Value::Null);
