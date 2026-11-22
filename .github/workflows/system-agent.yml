@@ -74,7 +74,7 @@ jobs:
           cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OPENBLAS_CC\""
           mkdir agent-artifact
           cp tools/obs-agent/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd agent-artifact/
-          $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -ldl -o agent-artifact/obs-field1
+          $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -pthread -ldl -o agent-artifact/obs-field1
           output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
           find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
           sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-field-synthetic.h tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt

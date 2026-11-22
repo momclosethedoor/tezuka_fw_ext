@@ -34,9 +34,9 @@ static uint64_t epoch(void){uint32_t h,l,b;do{h=rd(0x184);l=rd(0x180);b=rd(0x184
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 /* One TCP session carries many attempts; the IIO block remains owned until
  * local TCP accepts it, or it is copied to a bounded reusable transport block. */
-static int video_sock=-1;
-static uint64_t wire_bytes=0,wire_chunks=0,wire_accepted=0;
-static double wire_send_s=0,wire_send_cpu_s=0;
+static _Thread_local int video_sock=-1;
+static _Thread_local uint64_t wire_bytes=0,wire_chunks=0,wire_accepted=0;
+static _Thread_local double wire_send_s=0,wire_send_cpu_s=0;
 static int cpu_phases=0;
 static size_t tcp_pump_bytes=0;
 static const char *managed_boot=NULL;
@@ -56,7 +56,7 @@ static int connect_video(void){
 }
 /* One active packet references either IIO (direct variant) or a protected
  * transport block. Header and metadata storage are fixed. */
-static struct {uint32_t header[3];char meta[2048];struct iovec vec[3];
+static _Thread_local struct {uint32_t header[3];char meta[2048];struct iovec vec[3];
  struct msghdr msg;double started;size_t wire_size;int active;} tx;
 static void packet_abort(void){if(video_sock>=0)close(video_sock);video_sock=-1;tx.active=0;}
 static int packet_begin(const char *meta,const void *raw,size_t n){

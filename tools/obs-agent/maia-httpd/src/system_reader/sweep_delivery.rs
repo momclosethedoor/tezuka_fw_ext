@@ -127,7 +127,7 @@ impl<'a> BenchOutput<'a> {
         self.offered += 1;
         self.first.get_or_insert(pass.id);
         self.last=Some(pass.id);
-        let arm_ns=(crate::delivery_runtime::mono()*1e9) as u64;
+        let arm_ns=crate::delivery_runtime::mono_ns();
         let words=[generation, version, pass.id, pass.phase as u64, pass.last_epoch, arm_ns, signal, rf, position as u64];
         let mut message=[0u8;72];
         for (slot,word) in message.chunks_exact_mut(8).zip(words) { slot.copy_from_slice(&word.to_le_bytes()); }
