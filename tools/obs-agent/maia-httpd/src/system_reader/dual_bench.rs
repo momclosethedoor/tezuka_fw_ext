@@ -3,6 +3,7 @@ use super::{continuous, Header, R};
 use serde_json::{json, Value};
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     sync::{mpsc, Arc, atomic::{AtomicU32, Ordering::Relaxed}},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -38,6 +39,7 @@ struct Counts {
     admitted: AtomicU32,
     processed: AtomicU32,
     unavailable: AtomicU32,
+    evicted: AtomicU32,
     high: AtomicU32,
 }
 
@@ -54,22 +56,32 @@ struct Fill {
     data: Option<Buffer>,
 }
 
+struct Buffers {
+    free: Vec<Buffer>,
+    pending: VecDeque<Frame>,
+    in_worker: bool,
+    fill: Fill,
+}
+
 pub(super) struct Worker {
     counts: Arc<Counts>,
     input: mpsc::SyncSender<Frame>,
     available: mpsc::Receiver<Buffer>,
-    fill: RefCell<Fill>,
+    buffers: RefCell<Buffers>,
     worker: JoinHandle<Value>,
     time_queue: bool,
 }
 
 impl Worker {
     pub(super) fn start(reduce: bool, time_queue: bool) -> R<Self> {
-        let (input, incoming) = mpsc::sync_channel::<Frame>(SLOTS);
+        let (input, incoming) = mpsc::sync_channel::<Frame>(1);
         let (recycle, available) = mpsc::sync_channel(SLOTS);
-        for _ in 0..SLOTS {
-            recycle.try_send(vec![0; continuous::BYTES].into_boxed_slice()).unwrap();
-        }
+        let buffers = Buffers {
+            free: (0..SLOTS).map(|_| vec![0; continuous::BYTES].into_boxed_slice()).collect(),
+            pending: VecDeque::with_capacity(SLOTS),
+            in_worker: false,
+            fill: Fill::default(),
+        };
         let counts = Arc::new(Counts::default());
         let progress = counts.clone();
         let worker = thread::Builder::new().name("full4096-bench".into()).spawn(move || {
@@ -108,13 +120,38 @@ impl Worker {
                    "first_ordinal":first,"last_ordinal":last,"ordinal_gaps":gaps,"ordinal_reordered":reordered,
                    "wrong_identity":wrong_identity,"sampled_queue_ns_pow2":queue_ns_pow2})
         }).map_err(|e| e.to_string())?;
-        Ok(Self {counts, input, available, fill: RefCell::default(), worker, time_queue})
+        Ok(Self {counts, input, available, buffers: RefCell::new(buffers), worker, time_queue})
+    }
+
+    fn reclaim(&self, buffers: &mut Buffers) {
+        if buffers.in_worker && let Ok(data) = self.available.try_recv() {
+            buffers.free.push(data);
+            buffers.in_worker = false;
+        }
+    }
+
+    pub(super) fn service(&self) -> R<()> {
+        let mut buffers = self.buffers.borrow_mut();
+        self.reclaim(&mut buffers);
+        if !buffers.in_worker && let Some(frame) = buffers.pending.pop_front() {
+            self.input.try_send(frame).map_err(|e| e.to_string())?;
+            buffers.in_worker = true;
+        }
+        Ok(())
     }
 
     pub(super) fn copy_span(&self, span: &[u8]) {
-        let mut fill = self.fill.borrow_mut();
+        let mut buffers = self.buffers.borrow_mut();
+        if buffers.fill.bytes == 0 {
+            self.reclaim(&mut buffers);
+            buffers.fill.data = buffers.free.pop().or_else(|| {
+                let evicted = buffers.pending.pop_front()?;
+                self.counts.evicted.fetch_add(1, Relaxed);
+                Some(evicted.data)
+            });
+        }
+        let fill = &mut buffers.fill;
         let start = fill.bytes;
-        if start == 0 { fill.data = self.available.try_recv().ok(); }
         let end = start + span.len();
         if let Some(data) = fill.data.as_mut() {
             #[cfg(target_arch = "arm")]
@@ -126,24 +163,31 @@ impl Worker {
     }
 
     pub(super) fn submit(&self, header: Header) -> R<()> {
-        let fill = std::mem::take(&mut *self.fill.borrow_mut());
+        let mut buffers = self.buffers.borrow_mut();
+        let fill = std::mem::take(&mut buffers.fill);
         if fill.bytes != continuous::BYTES { return Err("dual bench native record length".into()) }
         let Some(data) = fill.data else {
             self.counts.unavailable.fetch_add(1, Relaxed);
             return Ok(());
         };
-        let processed = self.counts.processed.load(Relaxed);
-        let admitted = self.counts.admitted.fetch_add(1, Relaxed) + 1;
-        self.counts.high.fetch_max(admitted - processed, Relaxed);
+        self.counts.admitted.fetch_add(1, Relaxed);
         let queued = (self.time_queue && header.ordinal % 64 == 0).then(Instant::now);
-        self.input.try_send(Frame {ordinal:header.ordinal, epoch:header.epoch, data, queued})
-            .map_err(|e| e.to_string())
+        buffers.pending.push_back(Frame {ordinal:header.ordinal, epoch:header.epoch, data, queued});
+        let in_flight = buffers.pending.len() as u32 + u32::from(buffers.in_worker);
+        self.counts.high.fetch_max(in_flight, Relaxed);
+        drop(buffers);
+        self.service()
     }
 
     pub(super) fn counts(&self) -> Value { metrics(&self.counts) }
 
     pub(super) fn finish(self) -> R<Value> {
-        let Self {counts, input, available, worker, ..} = self;
+        let Self {counts, input, available, buffers, worker, ..} = self;
+        // STOP/DRAINED has already returned every DMA slot. Finish queued
+        // owned copies before collecting the final accounting.
+        for frame in buffers.into_inner().pending {
+            input.send(frame).map_err(|e| e.to_string())?;
+        }
         drop(input);
         let peak = worker.join().map_err(|_| "dual bench worker failed")?;
         drop(available);
@@ -153,7 +197,8 @@ impl Worker {
 
 fn metrics(counts: &Counts) -> Value {
     json!({"admitted":counts.admitted.load(Relaxed),"processed":counts.processed.load(Relaxed),
-           "unavailable":counts.unavailable.load(Relaxed),"in_flight_peak":counts.high.load(Relaxed)})
+           "unavailable":counts.unavailable.load(Relaxed),"evicted":counts.evicted.load(Relaxed),
+           "in_flight_peak":counts.high.load(Relaxed)})
 }
 
 fn peak(bytes: &[u8]) -> (u64, usize) {

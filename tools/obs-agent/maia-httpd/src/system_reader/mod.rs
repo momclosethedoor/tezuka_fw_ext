@@ -493,6 +493,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released {
+   if let Some(worker)=&full_worker{worker.service()?;}
    if empty_wait.is_zero(){std::hint::spin_loop();}
    else{std::thread::sleep(empty_wait);}
   }
