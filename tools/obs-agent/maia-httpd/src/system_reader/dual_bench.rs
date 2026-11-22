@@ -2,7 +2,7 @@
 use super::{continuous, Header, R};
 use serde_json::{json, Value};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::{mpsc, Arc, atomic::{AtomicU32, Ordering::Relaxed}},
     thread::{self, JoinHandle},
     time::Duration,
@@ -12,7 +12,7 @@ const SLOTS: usize = 16;
 type Buffer = Box<[u8]>;
 
 #[derive(Clone, Copy, PartialEq)]
-pub(super) enum Load { View, Read, Worker }
+pub(super) enum Load { View, Read, Inline, Worker }
 
 pub(super) fn settings() -> R<Option<(Load, Duration)>> {
     let Some(path) = std::env::var_os("OBS_VIEW_DUAL_BENCH_FILE") else { return Ok(None) };
@@ -21,6 +21,7 @@ pub(super) fn settings() -> R<Option<(Load, Duration)>> {
     let full = match words.next() {
         Some("view") => Load::View,
         Some("read") => Load::Read,
+        Some("inline") => Load::Inline,
         Some("full") => Load::Worker,
         _ => return Err("dual bench mode".into()),
     };
@@ -145,4 +146,34 @@ fn peak(bytes: &[u8]) -> (u64, usize) {
         if power > best.0 { best = (power, bin); }
     }
     best
+}
+
+#[derive(Default)]
+pub(super) struct Inline {
+    bins: Cell<usize>,
+    record_peak: Cell<(u64, usize)>,
+    winner: Cell<(u64, usize, u64, u64)>,
+    processed: Cell<u64>,
+}
+
+impl Inline {
+    pub(super) fn consume(&self, span: &[u8]) {
+        let offset = self.bins.get();
+        let (power, bin) = peak(span);
+        if power > self.record_peak.get().0 { self.record_peak.set((power, offset+bin)); }
+        self.bins.set(offset + span.len()/8);
+    }
+
+    pub(super) fn finish(&self, header: Header) -> R<()> {
+        if self.bins.replace(0) != continuous::BINS { return Err("inline bench bin count".into()) }
+        let (power, bin) = self.record_peak.replace((0,0));
+        if power > self.winner.get().0 { self.winner.set((power,bin,header.ordinal,header.epoch)); }
+        self.processed.set(self.processed.get()+1);
+        Ok(())
+    }
+
+    pub(super) fn result(&self) -> Value {
+        let (power,bin,ordinal,epoch)=self.winner.get();
+        json!({"processed":self.processed.get(),"peak":{"power":power,"bin":bin,"ordinal":ordinal,"epoch":epoch}})
+    }
 }

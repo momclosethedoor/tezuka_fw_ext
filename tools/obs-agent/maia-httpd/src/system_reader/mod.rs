@@ -419,11 +419,15 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
  let full_worker=if full_bench{Some(dual_bench::Worker::start()?)}else{None};
+ let inline=bench.is_some_and(|(load,_)|load==dual_bench::Load::Inline).then(dual_bench::Inline::default);
  let read_full=|part:&[u8]|{
-  if let Some(worker)=&full_worker{worker.copy_span(part);}else{full_read_without_sum(part);}
+  if let Some(worker)=&full_worker{worker.copy_span(part);}
+  else if let Some(consumer)=&inline{consumer.consume(part);}
+  else{full_read_without_sum(part);}
  };
  let mut sink=|h:Header,overview:&[u8]|->R<()>{
   if let Some(worker)=&full_worker{worker.submit(h)?;}
+  if let Some(consumer)=&inline{consumer.finish(h)?;}
   if let Some(q)=control {
    if overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if draining.get(){network.borrow_mut().suppressed+=1;return Ok(())}
@@ -518,6 +522,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let sweep_network=sweeps.borrow().as_ref().map(|s|json!({"completion_datagrams":s.notes_sent,"completion_send_drop":s.notes_lost,"peak_payload_bytes":s.peak_bytes,"synthetic":s.bench_counts()}));
  let mut result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":if managed_view_only{"owned metadata and VIEW, release, then VIEW send"}else{"ALL4096 then release and VIEW send"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});
  if let Some(worker)=full_worker{result["full_worker"]=worker.finish()?;}
+ if let Some(consumer)=inline{result["full_inline"]=consumer.result();}
  if io.pressure_on {
   let mut bins=vec![0u32;view::SLOTS+1];
   for &[_,reserved,_,released] in &io.pressure{bins[(reserved-released) as usize]+=1;}
