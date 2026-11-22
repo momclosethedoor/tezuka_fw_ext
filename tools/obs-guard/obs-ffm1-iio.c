@@ -381,10 +381,11 @@ int main(int argc,char **argv)
                 valid=preview_bounds(&history,live.identity.first,live.identity.end,&first,&end)==PREVIEW_READY;
                 if(valid && end<through) through=end;
             }
-            if(valid && first<through && first>=history.consumed-history.retained &&
+            if(valid && first>=history.consumed-history.retained &&
                 (wat.version==live.identity.version || !load_version(argv[1],live.identity.version,&wat,watch_bytes))) {
                 int opened=stream_begin(&wire,&live.identity,first,&wat,&egress);
-                if(opened<0 || (!opened && stream_data(&wire,through,&history,&egress)>PREVIEW_WAIT)) {
+                if(opened<0 || (!opened && first<=through &&
+                    stream_data(&wire,through,&history,&egress)>PREVIEW_WAIT)) {
                     field_abandon(&egress);
                     failed=1;
                 }
