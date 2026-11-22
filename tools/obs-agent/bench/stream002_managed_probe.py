@@ -61,7 +61,9 @@ class BenchReceiver(Receiver):
                 if kind!="end":
                     continue
                 if meta["qualified_field"]:
+                    self.field_stats["qualified"] += 1
                     self.field_stats["successes"].append(meta)
+                self.field_stats["error"] += int(bool(meta["error"]))
                 code=str(meta["pl_outcome"])
             else:
                 self.field_stats["end"] += 1
