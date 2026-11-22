@@ -5,14 +5,14 @@ use std::{
     cell::{Cell, RefCell},
     sync::{mpsc, Arc, atomic::{AtomicU32, Ordering::Relaxed}},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const SLOTS: usize = 16;
 type Buffer = Box<[u8]>;
 
 #[derive(Clone, Copy, PartialEq)]
-pub(super) enum Load { View, Read, Inline, Worker }
+pub(super) enum Load { View, Read, Inline, Worker, Copy }
 
 pub(super) fn settings() -> R<Option<(Load, Duration)>> {
     let Some(path) = std::env::var_os("OBS_VIEW_DUAL_BENCH_FILE") else { return Ok(None) };
@@ -23,6 +23,7 @@ pub(super) fn settings() -> R<Option<(Load, Duration)>> {
         Some("read") => Load::Read,
         Some("inline") => Load::Inline,
         Some("full") => Load::Worker,
+        Some("copy") => Load::Copy,
         _ => return Err("dual bench mode".into()),
     };
     let us: u64 = words.next().and_then(|s| s.parse().ok()).ok_or("dual bench wait")?;
@@ -44,6 +45,7 @@ struct Frame {
     ordinal: u64,
     epoch: u64,
     data: Buffer,
+    queued: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -58,10 +60,11 @@ pub(super) struct Worker {
     available: mpsc::Receiver<Buffer>,
     fill: RefCell<Fill>,
     worker: JoinHandle<Value>,
+    time_queue: bool,
 }
 
 impl Worker {
-    pub(super) fn start() -> R<Self> {
+    pub(super) fn start(reduce: bool, time_queue: bool) -> R<Self> {
         let (input, incoming) = mpsc::sync_channel::<Frame>(SLOTS);
         let (recycle, available) = mpsc::sync_channel(SLOTS);
         for _ in 0..SLOTS {
@@ -72,13 +75,26 @@ impl Worker {
         let worker = thread::Builder::new().name("full4096-bench".into()).spawn(move || {
             let mut winner = (0, 0, 0, 0);
             let mut last = None;
+            let mut first = None;
             let mut gaps = 0;
             let mut reordered = 0;
+            let mut wrong_identity = 0;
+            let mut queue_ns_pow2 = [0u64; 32];
             while let Ok(frame) = incoming.recv() {
-                let (power, bin) = peak(&frame.data);
-                if power > winner.0 {
-                    winner = (power, bin, frame.ordinal, frame.epoch);
+                if let Some(queued) = frame.queued {
+                    let elapsed = queued.elapsed().as_nanos().min(u32::MAX as u128) as u32;
+                    queue_ns_pow2[(31 - elapsed.max(1).leading_zeros()) as usize] += 1;
                 }
+                if reduce {
+                    let (power, bin) = peak(&frame.data);
+                    if power > winner.0 {
+                        winner = (power, bin, frame.ordinal, frame.epoch);
+                    }
+                } else if !continuous::header_prefix(&frame.data[..512], 3)
+                    .is_ok_and(|raw| raw.ordinal == frame.ordinal && raw.epoch == frame.epoch) {
+                    wrong_identity += 1;
+                }
+                first.get_or_insert(frame.ordinal);
                 if let Some(old) = last {
                     gaps += frame.ordinal.saturating_sub(old + 1);
                     reordered += u64::from(frame.ordinal <= old);
@@ -89,9 +105,10 @@ impl Worker {
                 if recycle.try_send(frame.data).is_err() { break }
             }
             json!({"power":winner.0,"bin":winner.1,"ordinal":winner.2,"epoch":winner.3,
-                   "last_ordinal":last,"ordinal_gaps":gaps,"ordinal_reordered":reordered})
+                   "first_ordinal":first,"last_ordinal":last,"ordinal_gaps":gaps,"ordinal_reordered":reordered,
+                   "wrong_identity":wrong_identity,"sampled_queue_ns_pow2":queue_ns_pow2})
         }).map_err(|e| e.to_string())?;
-        Ok(Self {counts, input, available, fill: RefCell::default(), worker})
+        Ok(Self {counts, input, available, fill: RefCell::default(), worker, time_queue})
     }
 
     pub(super) fn copy_span(&self, span: &[u8]) {
@@ -118,7 +135,8 @@ impl Worker {
         let processed = self.counts.processed.load(Relaxed);
         let admitted = self.counts.admitted.fetch_add(1, Relaxed) + 1;
         self.counts.high.fetch_max(admitted - processed, Relaxed);
-        self.input.try_send(Frame {ordinal:header.ordinal, epoch:header.epoch, data})
+        let queued = (self.time_queue && header.ordinal % 64 == 0).then(Instant::now);
+        self.input.try_send(Frame {ordinal:header.ordinal, epoch:header.epoch, data, queued})
             .map_err(|e| e.to_string())
     }
 

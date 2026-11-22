@@ -363,7 +363,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  // The managed control sink delivers VIEW. Full FFT ownership and diagnostic
  // captures use the separate local reader paths.
  let bench=if control.is_some(){dual_bench::settings()?}else{None};
- let full_bench=bench.is_some_and(|(load,_)|load==dual_bench::Load::Worker);
+ let full_worker_reduction=bench.and_then(|(load,_)|match load {
+  dual_bench::Load::Worker=>Some(true),
+  dual_bench::Load::Copy=>Some(false),
+  _=>None,
+ });
  let managed_view_only=control.is_some()&&bench.is_none_or(|(load,_)|load==dual_bench::Load::View);
  let mut io=Hardware::open(c,managed_view_only)?;
  let empty_wait=bench.map(|(_,wait)|wait).unwrap_or_else(||if managed_view_only{view_idle_wait(c.k)}else{Duration::ZERO});
@@ -418,7 +422,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut first_view_sent=false;
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
- let full_worker=if full_bench{Some(dual_bench::Worker::start()?)}else{None};
+ let full_worker=full_worker_reduction.map(|reduce|dual_bench::Worker::start(reduce,io.phase_on)).transpose()?;
  let inline=bench.is_some_and(|(load,_)|load==dual_bench::Load::Inline).then(dual_bench::Inline::default);
  let read_full=|part:&[u8]|{
   if let Some(worker)=&full_worker{worker.copy_span(part);}
