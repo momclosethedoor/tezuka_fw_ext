@@ -110,7 +110,10 @@ impl Plan {
 pub(super) struct Session {
     child: Child,
     reported_exit: bool,
+    reported_source_loss: bool,
 }
+
+const FFM1_SESSION: usize = 0x354;
 
 impl Session {
     pub(super) fn start(config: &Config, directory: &Path, peer: SocketAddr, regs: &Registers,
@@ -128,7 +131,7 @@ impl Session {
             let start=Instant::now();
             loop {
                 ensure!(child.try_wait()?.is_none(), "FFM1 collector exited before SESSION (see collector.log)");
-                if regs.read(0x354)==1 { return Ok(()); }
+                if regs.read(FFM1_SESSION)==1 { return Ok(()); }
                 ensure!(start.elapsed()<Duration::from_millis(1500), "FFM1 SESSION readiness timeout");
                 renew()?;
                 std::thread::sleep(Duration::from_millis(10));
@@ -138,12 +141,16 @@ impl Session {
             let _=terminate(&mut child,Duration::from_millis(1500));
             return Err(error);
         }
-        Ok(Self{child,reported_exit:false})
+        Ok(Self{child,reported_exit:false,reported_source_loss:false})
     }
 
-    pub(super) fn exit_note(&mut self) -> Option<String> {
+    pub(super) fn health_note(&mut self, regs: &Registers) -> Option<String> {
         if self.reported_exit { return None; }
         let note=match self.child.try_wait() {
+            Ok(None) if !self.reported_source_loss && regs.read(FFM1_SESSION)==0 => {
+                self.reported_source_loss=true;
+                return Some("real8 source stopped; collecting FFM1 outcomes until STOP".into());
+            }
             Ok(None)=>return None,
             Ok(Some(status))=>format!("FFM1 collector exited: {status}"),
             Err(error)=>format!("FFM1 collector readback: {error}"),
@@ -155,12 +162,12 @@ impl Session {
     pub(super) fn finish(mut self, regs: &Registers, renew: impl FnMut() -> Result<()>) -> Result<()> {
         let result=terminate_with(&mut self.child,Duration::from_millis(1600),renew);
         if result.is_err() {
-            regs.write(0x354,0);
+            regs.write(FFM1_SESSION,0);
             regs.write(0x290,2);
             regs.write(0x284,0);
         }
         result?;
-        ensure!(regs.read(0x354)==0 && regs.read(0x294)&0xc1==0 && regs.read(0x35c)&0x1ff==0,
+        ensure!(regs.read(FFM1_SESSION)==0 && regs.read(0x294)&0xc1==0 && regs.read(0x35c)&0x1ff==0,
             "FFM1 tail or session remains active");
         Ok(())
     }

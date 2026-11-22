@@ -2118,7 +2118,8 @@ fn worker(
                     generation:next_gen,version,sweep:s,anchor:&next_anchor,started:&next_started,
                 }),
                 check: &|| {
-                    if let Some(note)=resident.borrow_mut().as_mut().and_then(resident_field::Session::exit_note) {
+                    if let Some(note)=resident.borrow_mut().as_mut().and_then(|session| session.health_note(&regs)) {
+                        actual.borrow_mut()["field_watch"]["error"]=json!(&note);
                         shared.inbox.lock().unwrap().actual["field_watch"]["error"]=json!(note);
                     }
                     if let Some(note) = watch
