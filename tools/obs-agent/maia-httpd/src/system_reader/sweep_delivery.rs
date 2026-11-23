@@ -189,7 +189,7 @@ impl<'a> Delivery<'a> {
 
     pub(super) fn poll(&self,net:&mut UdpBatch,sock:&UdpSocket) {
         if self.spec.mode == Mode::Stream {
-            net.flush(sock);
+            net.stream_flush(sock);
         }
     }
 

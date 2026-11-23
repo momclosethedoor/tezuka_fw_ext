@@ -593,6 +593,25 @@ fn view_idle_wait(k:u32,bins:usize)->Duration {
  Duration::from_micros((u64::from(k)*bins as u64*1_000_000/(8*61_440_000)).min(64))
 }
 
+fn send_view_datagrams(socket: &std::net::UdpSocket, bytes: &[u8], record_size: usize)
+    -> std::io::Result<usize>
+{
+    let count = bytes.len() / record_size;
+    debug_assert!((1..=view_batch::MAX_SENDMMSG).contains(&count));
+    let mut iov: [libc::iovec; view_batch::MAX_SENDMMSG] = unsafe { std::mem::zeroed() };
+    let mut messages: [libc::mmsghdr; view_batch::MAX_SENDMMSG] = unsafe { std::mem::zeroed() };
+    for (index, packet) in bytes.chunks_exact(record_size).enumerate() {
+        iov[index].iov_base = packet.as_ptr().cast_mut().cast();
+        iov[index].iov_len = packet.len();
+        messages[index].msg_hdr.msg_iov = &mut iov[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+    let sent = unsafe {
+        libc::sendmmsg(socket.as_raw_fd(), messages.as_mut_ptr(), count as libc::c_uint, libc::MSG_DONTWAIT)
+    };
+    if sent < 0 { Err(std::io::Error::last_os_error()) } else { Ok(sent as usize) }
+}
+
 fn histogram(h:timing::Histogram)->Value {
  json!({"bins_upper_ns_pow2":h.bins,"max_ns":h.max_ns})
 }
@@ -671,6 +690,9 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  let initial_anchor=io.live64(0x238);
  let view_mute_file=std::env::var_os("OBS_DIAG_VIEW_MUTE_FILE").map(PathBuf::from);
+ let view_mmsg_file=std::env::var_os("OBS_DIAG_VIEW_MMSG_FILE").map(PathBuf::from)
+  .filter(|_|c.scan && control.is_some() && socket.is_some() && network.borrow().max_records==1);
+ if view_mmsg_file.is_some(){network.borrow_mut().enable_datagram_diagnostic(send_view_datagrams);}
  let view_muted=std::cell::Cell::new(false);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
@@ -753,6 +775,19 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
+    if let (Some(path),Some(sock))=(&view_mmsg_file,&socket){
+     let limit=std::fs::read_to_string(path).ok()
+      .and_then(|value|value.trim().parse::<usize>().ok())
+      .filter(|limit|matches!(*limit,1|2|4|8|16)).unwrap_or(1);
+     let mut net=network.borrow_mut();
+     if net.diagnostic.as_ref().is_some_and(|diag|diag.limit!=limit){
+      net.flush(sock);
+      if let Some(diag)=net.diagnostic.as_mut(){
+       diag.limit=limit;
+       diag.wait=timing::Histogram::default();
+      }
+     }
+    }
     if !view_muted.get() && view_mute_file.as_ref().is_some_and(|path|path.is_file()){
      view_muted.set(true);
     }
@@ -860,6 +895,9 @@ impl UdpBatch {
   "completion_sent":self.notes_sent,"completion_send_drop":self.notes_lost,
   "send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,
   "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string(),"oldest_view_wait_ns_pow2":self.phase_on.then_some(self.oldest_wait_bins),
+  "diag_mmsg_limit":self.diagnostic.as_ref().map(|diag|diag.limit),
+  "diag_mmsg_calls":self.diagnostic.as_ref().map(|diag|diag.calls),
+  "diag_batch_wait":self.diagnostic.as_ref().map(|diag|histogram(diag.wait)),
   "api_send_ns":self.phase_on.then(||histogram(self.api_send)),
   "batch_oldest_to_api_complete_ns":self.phase_on.then(||histogram(self.oldest_to_send)),})}
 }
