@@ -17,6 +17,9 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef OBS_SCAN_STREAM_BENCH
+#include <sys/resource.h>
+#endif
 #include "obs-field-preview.h"
 #include "obs-stream-002.h"
 #include "obs-watch-policy.h"
@@ -131,9 +134,21 @@ struct iio_blocks {
 #ifdef OBS_SCAN_STREAM_BENCH
     uint64_t dequeued, returned;
     double max_checkout, last_dequeue, last_return_begin, last_return_end;
+    double copy_cpu;
+    long copy_voluntary, copy_involuntary;
     unsigned last_id;
+    bool measure_cpu;
 #endif
 };
+
+#ifdef OBS_SCAN_STREAM_BENCH
+static double thread_cpu(void)
+{
+    struct timespec t;
+    if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t)) return -1;
+    return t.tv_sec+t.tv_nsec*1e-9;
+}
+#endif
 
 static int block_ioctl(int fd, unsigned long request, struct iio_block *block)
 {
@@ -168,6 +183,9 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
 #ifdef OBS_SCAN_STREAM_BENCH
     ++blocks->dequeued;
     double start=monotonic();
+    struct rusage usage_before;
+    bool usage_ok=blocks->measure_cpu && !getrusage(RUSAGE_THREAD,&usage_before);
+    double cpu_before=blocks->measure_cpu ? thread_cpu() : -1;
 #endif
     if(block.id>=blocks->count || block.size!=BLOCK) {
         *problem="IIO block identity invalid";
@@ -177,6 +195,16 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
     bool bad=bytes>BLOCK || preview_append(history,blocks->maps[block.id],bytes);
     block.bytes_used=block.size;
 #ifdef OBS_SCAN_STREAM_BENCH
+    if(blocks->measure_cpu) {
+        double cpu_after=thread_cpu();
+        struct rusage usage_after;
+        blocks->copy_cpu=cpu_before>=0 && cpu_after>=0 ? cpu_after-cpu_before : -1;
+        blocks->copy_voluntary=blocks->copy_involuntary=-1;
+        if(usage_ok && !getrusage(RUSAGE_THREAD,&usage_after)) {
+            blocks->copy_voluntary=usage_after.ru_nvcsw-usage_before.ru_nvcsw;
+            blocks->copy_involuntary=usage_after.ru_nivcsw-usage_before.ru_nivcsw;
+        }
+    }
     blocks->last_return_begin=monotonic();
 #endif
     result=block_ioctl(fd,IIO_ENQUEUE_BLOCK,&block);
@@ -213,6 +241,8 @@ enum {
 };
 struct dmac_sample {
     double begin, end, dequeue, enqueue_begin, enqueue_end;
+    double copy_cpu;
+    long copy_voluntary, copy_involuntary;
     uint32_t cause, status, control, next_id, submit, done, eot_id, progress;
     uint64_t returned;
     unsigned block;
@@ -220,6 +250,7 @@ struct dmac_sample {
 struct dmac_trace {
     volatile const uint32_t *reg;
     struct dmac_sample history[DMAC_HISTORY];
+    struct dmac_sample worst_checkout;
     unsigned next, count;
 };
 static struct dmac_trace dmac;
@@ -229,7 +260,8 @@ static struct dmac_sample dmac_read(const struct dmac_trace *trace, volatile con
 {
     volatile const uint32_t *reg=trace->reg;
     struct dmac_sample sample={.begin=monotonic(),.returned=blocks->returned,.block=blocks->last_id,
-        .dequeue=blocks->last_dequeue,.enqueue_begin=blocks->last_return_begin,.enqueue_end=blocks->last_return_end};
+        .dequeue=blocks->last_dequeue,.enqueue_begin=blocks->last_return_begin,.enqueue_end=blocks->last_return_end,
+        .copy_cpu=blocks->copy_cpu,.copy_voluntary=blocks->copy_voluntary,.copy_involuntary=blocks->copy_involuntary};
     sample.cause=field[FSB_CAUSES/4];
     sample.status=field[STATUS/4];
     sample.control=reg[DMAC_CONTROL/4];
@@ -245,7 +277,10 @@ static struct dmac_sample dmac_read(const struct dmac_trace *trace, volatile con
 static void dmac_remember(struct dmac_trace *trace, volatile const uint32_t *field,
                           const struct iio_blocks *blocks)
 {
-    trace->history[trace->next]=dmac_read(trace,field,blocks);
+    struct dmac_sample sample=dmac_read(trace,field,blocks);
+    trace->history[trace->next]=sample;
+    if(sample.enqueue_end-sample.dequeue > trace->worst_checkout.enqueue_end-trace->worst_checkout.dequeue)
+        trace->worst_checkout=sample;
     trace->next=(trace->next+1)%DMAC_HISTORY;
     if(trace->count<DMAC_HISTORY) ++trace->count;
 }
@@ -254,16 +289,17 @@ static void dmac_print(const struct dmac_sample *s, const char *stage)
 {
     fprintf(stderr,"FSB1_DMAC stage=%s t0=%.9f t1=%.9f cause=%02x fld=%08x "
         "ctrl=%08x submit=%u next=%u eot=%u done=%08x progress=%u returned=%llu iio_id=%u "
-        "dequeue=%.9f enqueue0=%.9f enqueue1=%.9f\n",
+        "dequeue=%.9f enqueue0=%.9f enqueue1=%.9f copy_cpu=%.9f nvcsw=%ld nivcsw=%ld\n",
         stage,s->begin,s->end,s->cause,s->status,s->control,s->submit,s->next_id,
         s->eot_id,s->done,s->progress,(unsigned long long)s->returned,s->block,
-        s->dequeue,s->enqueue_begin,s->enqueue_end);
+        s->dequeue,s->enqueue_begin,s->enqueue_end,s->copy_cpu,s->copy_voluntary,s->copy_involuntary);
 }
 
 static void dmac_dump(const struct dmac_trace *trace, const struct dmac_sample *fault)
 {
     unsigned first=(trace->next+DMAC_HISTORY-trace->count)%DMAC_HISTORY;
     for(unsigned n=0;n<trace->count;++n) dmac_print(&trace->history[(first+n)%DMAC_HISTORY],"after_return");
+    if(trace->worst_checkout.returned) dmac_print(&trace->worst_checkout,"max_checkout");
     if(fault) dmac_print(fault,"before_stop");
 }
 #endif
@@ -408,6 +444,7 @@ int main(int argc,char **argv)
         void *mapping=mmap(NULL,DMAC_PAGE,PROT_READ,MAP_SHARED,mem,DMAC_BASE);
         if(mapping==MAP_FAILED) goto done;
         dmac.reg=mapping;
+        blocks.measure_cpu=true;
         const char *depth=getenv("OBS_FSB1_IIO_BUFFERS");
         if(depth) {
             problem="invalid bench IIO buffer count";
