@@ -47,6 +47,8 @@ def row(lo, hi):
 
 
 class Receiver(Sinks):
+    obn5 = False
+
     def __init__(self, folder, capture_pal=False, window_s=30):
         self.capture_pal = capture_pal
         self.window_ns = window_s * 1_000_000_000
@@ -114,15 +116,26 @@ class Receiver(Sinks):
                 stats["sender_drops"] += flags >> 1
                 stats["A" if phase == 0 else "B"] += int(bool(flags & 1))
                 stats["partial_notes"] += int(not (flags & 1) or expected != observed)
-            elif magic == b"GVIEW4\x00\x00" and size in (576, 1088, 2112, 1152, 2176, 4224):
-                record = {1152:576, 2176:1088, 4224:2112}.get(size, size)
+            elif magic == b"GVIEW4\x00\x00":
+                widths = (128, 256, 512, 1024, 2048, 4096) if self.obn5 else (512, 1024, 2048)
+                records = [64+width for width in widths if size in (64+width, 2*(64+width))]
+                if len(records) != 1:
+                    self.malformed_udp += 1
+                    continue
+                record, = records
                 for at in range(0, size, record):
                     header = VIEW.unpack_from(buf, at)
                     if header[0] != b"GVIEW4\x00\x00":
                         self.malformed_udp += 1
                         continue
                     _, ordinal, _, _, tick, k, flags, gen = header
-                    if not (gen and 1 <= k <= 1023 and record == 64 + (0, 512, 1024, 2048)[(flags >> 3) & 3]):
+                    mode = (flags >> 3) & 3
+                    if self.obn5:
+                        mode |= (flags >> 5) & 4
+                        valid = mode in (1,2,3,4) and (record-64)*(8,4,2,1)[mode-1] in (1024,2048,4096)
+                    else:
+                        valid = record == 64 + (0,512,1024,2048)[mode]
+                    if not (gen and 1 <= k <= 1023 and valid):
                         self.malformed_udp += 1
                         continue
                     stats = self.view_stats(gen)
@@ -140,6 +153,9 @@ class Receiver(Sinks):
                     stats["received"] += 1
                     actual_k_counts = stats["actual_k_counts"]
                     actual_k_counts[k] = actual_k_counts.get(k, 0) + 1
+                    if self.obn5 and flags & 64:
+                        hold_k_counts = stats["hold_k_counts"]
+                        hold_k_counts[k] = hold_k_counts.get(k, 0) + 1
                     stats["view_wire_bytes"] += record
             else:
                 self.malformed_udp += 1
@@ -147,7 +163,7 @@ class Receiver(Sinks):
     def view_stats(self, generation):
         return self.views.setdefault(generation, dict(received=0, gaps=0, reordered=0, A=0, B=0,
             expected=0, observed=0, sender_drops=0, partial_notes=0, view_wire_bytes=0, sweep_wire_bytes=0,
-            last_pass_id=None, pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None, actual_k_counts={}))
+            last_pass_id=None, pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None, actual_k_counts={}, hold_k_counts={}))
 
     def real8(self, conn):
         from sdr.source.field1_stream import Field1Stream

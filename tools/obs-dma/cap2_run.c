@@ -120,7 +120,7 @@ static struct obs_cap2_receipt wait_job(uint32_t job, bool cancel_capture,
 {
 	const uint64_t end = now(CLOCK_MONOTONIC) + 4000000000;
 	uint64_t previous_begin = 0;
-	struct obs_cap2_receipt r;
+	struct obs_cap2_receipt r = {0};
 	while (now(CLOCK_MONOTONIC) < end) {
 		uint64_t begin = now(CLOCK_MONOTONIC);
 		check(!ioctl(cap_fd, OBS_CAP2_STATUS, &r) && r.job == job, "read job receipt");
@@ -169,7 +169,8 @@ static bool ranges_intersect(uint64_t a, uint64_t n, uint64_t b, uint64_t m)
 static void check_ranges(const struct obs_cap2_info *info, bool mapped_scan)
 {
 	check(!ranges_intersect(info->base, info->length, info->full, 33554432) &&
-	      !ranges_intersect(info->base, info->length, info->view, 2097152), "CAP2 vs spectra");
+	      !ranges_intersect(info->base, info->length, info->view,
+				(uint64_t)csr[0x1c0 / 4] * csr[0x1c8 / 4]), "CAP2 vs spectra");
 	if (mapped_scan) {
 		uint32_t guard[128];
 		int fd = open("/dev/obs_fl_guard", O_RDONLY | O_CLOEXEC);
@@ -218,6 +219,78 @@ static void dump(const char *path, const uint32_t *iq, uint32_t n, uint32_t fs)
 	      fwrite(iq, 4, n, f) == n && !fclose(f), "save CAP2 IQ");
 }
 
+static void joint_case(const char *mode, const char *config, const char *iq_path,
+		       struct obs_cap2_info info, uint32_t job, uint32_t n, uint32_t fs, uint32_t position)
+{
+	bool first = !strcmp(mode, "cap2-first");
+	bool cancel = !strcmp(mode, "field-cancel");
+	bool mismatch = !strcmp(mode, "field-mismatch");
+	check(csr[0x50 / 4] == 0x354e424f && csr[0xe4 / 4] == 1 &&
+	      (csr[0xe0 / 4] & 0x100) && csr[0x39c / 4] == 1023, "OBN5 joint ABI and handoff history");
+	struct obs_cap2_submit submit = {job, n, 187500, info.payload_offset, (n + 31) / 32, job};
+	struct obs_cap2_receipt r = {0};
+	uint64_t begin = now(CLOCK_MONOTONIC), submitted = 0, field_epoch = 0, field_seen = 0;
+	uint64_t field_done = 0, cap_ready = 0;
+	if (first) {
+		check(!ioctl(cap_fd, OBS_CAP2_SUBMIT, &submit), "submit CAP2 before starting the scan");
+		submitted = now(CLOCK_MONOTONIC);
+	}
+	launch(config);
+	while (now(CLOCK_MONOTONIC) - begin < 4000000000ULL) {
+		uint64_t rx = epoch();
+		bool active = (csr[0x294 / 4] & 1) && csr[0x234 / 4] == position;
+		uint64_t stamp = now(CLOCK_MONOTONIC);
+		if (active && !field_seen) {
+			field_epoch = rx;
+			field_seen = stamp;
+			if (!submitted) {
+				check(!ioctl(cap_fd, OBS_CAP2_SUBMIT, &submit), "submit during live FIELD");
+				submitted = now(CLOCK_MONOTONIC);
+			}
+		}
+		if (!submitted) { pause_us(30); continue; }
+		check(!ioctl(cap_fd, OBS_CAP2_STATUS, &r) && r.job == job, "joint CAP2 status");
+		if (field_seen && !field_done && (!active || rx != field_epoch)) field_done = stamp;
+		if (first && field_seen && !field_done)
+			check(r.captured == n, "FIELD started before CAP2 finished collecting IQ");
+		if (!first && field_seen && !field_done)
+			check(!r.captured, "CAP2 collected IQ while FIELD owned DDC");
+		if (cancel && active && !cap_ready && state(r) == 1) {
+			check(!ioctl(cap_fd, OBS_CAP2_CANCEL, &job), "cancel CAP2 waiting behind FIELD");
+			cap_ready = stamp;
+		}
+		if (mismatch && field_done && !cap_ready) {
+			check(!r.captured && state(r) == 1, "mismatched CAP2 must remain unbound");
+			check(!ioctl(cap_fd, OBS_CAP2_CANCEL, &job), "cancel unmatched CAP2");
+			cap_ready = stamp;
+		}
+		if (state(r) == 5 || state(r) == 6) {
+			if (!cap_ready) cap_ready = stamp;
+			if (field_done) break;
+		}
+		pause_us(30);
+	}
+	unsigned reason = (r.status >> 4) & 15;
+	uint64_t cap_epoch = (uint64_t)r.epoch_hi << 32 | r.epoch_lo;
+	printf("mode=%s field_epoch=%" PRIu64 " cap_epoch=%" PRIu64 " state=%u reason=%u captured=%u "
+	       "submitted_ns=%" PRIu64 " field_seen_ns=%" PRIu64 " field_done_ns=%" PRIu64
+	       " cap_terminal_or_cancel_ns=%" PRIu64 " first_tick=%u last_tick=%u release_tick=%u commit_tick=%u\n",
+	       mode, field_epoch, cap_epoch, state(r), reason, r.captured, submitted, field_seen, field_done,
+	       cap_ready, r.first, r.last, r.released, r.committed);
+	check(field_epoch && field_done && cap_ready, "FIELD and CAP2 observed in bounded window");
+	check_ranges(&info, true);
+	if (cancel || mismatch)
+		check(state(r) == 6 && reason == 3 && !r.captured, "deferred CAP2 cancellation");
+	else
+		check(state(r) == 5 && !reason && r.captured == n && cap_epoch == field_epoch,
+		      "CAP2 READY with FIELD epoch");
+	const unsigned char *arena = acquire(r, info);
+	canaries(arena, info.length, submit.offset, r.captured);
+	if (r.captured)
+		dump(iq_path, (const uint32_t *)(arena + submit.offset), r.captured, fs);
+	release_window(arena, info.length);
+}
+
 int main(int argc, char **argv)
 {
 	check(argc == 8, "cap2-run good|reuse|wait-cancel|close-wait|capture-cancel|miss|video N Fs job reader.json IQ|- epoch_delta");
@@ -227,7 +300,9 @@ int main(int argc, char **argv)
 	bool miss = !strcmp(argv[1], "miss") || !strcmp(argv[1], "video");
 	bool reuse = !strcmp(argv[1], "reuse");
 	bool good = !strcmp(argv[1], "good") || reuse;
-	check(good || cancel_wait || close_wait || cancel_capture || miss, "unknown mode");
+	bool joint = !strcmp(argv[1], "cap2-first") || !strcmp(argv[1], "field-first") ||
+		     !strcmp(argv[1], "field-cancel") || !strcmp(argv[1], "field-mismatch");
+	check(good || cancel_wait || close_wait || cancel_capture || miss || joint, "unknown mode");
 	uint32_t n = number(argv[2]), fs = number(argv[3]), job = number(argv[4]);
 	uint32_t epoch_delta = number(argv[7]);
 	check(n && n <= OBS_CAP2_MAX_N && fs && job < UINT32_MAX - 1, "runner job bounds");
@@ -242,6 +317,10 @@ int main(int argc, char **argv)
 	csr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, mem, 0x7c460000);
 	close(mem);
 	check(csr != MAP_FAILED && csr[OBS_CAP2_ID_REG / 4] == OBS_CAP2_ID, "CAP2 CSR ID");
+	if (joint) {
+		joint_case(argv[1], argv[5], argv[6], info, job, n, fs, epoch_delta);
+		return 0;
+	}
 	uint64_t expected_epoch = epoch_delta ? epoch() + epoch_delta : 0;
 	struct obs_cap2_submit submit = {job, n, 187500, info.payload_offset, (n + 31) / 32, job};
 	rejection_tests(submit);

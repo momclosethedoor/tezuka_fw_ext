@@ -17,7 +17,7 @@ SCAN = dict(op="scan", planner_version=2, path_ack_version=1, sweep_geometry="27
 FIELD_TIMEOUT_MS = 90
 ROI_PORT = 18011
 TRANSMITTER_WAIT_S = 90
-ARM_COUNTERS = """cat /proc/stat /proc/net/snmp
+ARM_COUNTERS = """cat /proc/stat /proc/net/snmp /proc/net/dev
 printf 'uptime '
 cat /proc/uptime
 for name in maia-delivery obs-ffm1-iio; do
@@ -120,6 +120,7 @@ def summary(status):
 def view_snapshot(receiver, generation):
     stats = dict(receiver.view_stats(generation))
     stats["actual_k_counts"] = dict(stats["actual_k_counts"])
+    stats["hold_k_counts"] = dict(stats["hold_k_counts"])
     return stats
 
 
@@ -202,8 +203,9 @@ test "$(devmem 0x7c460284)" = 0x00000000
     stand.write_json(config,control)
     stand.upload(config, remote, config.name)
     receiver = BenchReceiver(log)
-    receiver.fsb1 = args.fsb1
-    if args.fsb1:
+    receiver.obn5 = args.obn5
+    receiver.fsb1 = args.fsb1 or args.obn5
+    if receiver.fsb1:
         receiver.field_stats.update(payload_bytes=0,successes=[])
     roi_process = launch_roi(log,full) if roi_enabled else None
     halted, ready = threading.Event(), threading.Event()
@@ -250,7 +252,9 @@ test "$(devmem 0x7c460284)" = 0x00000000
             if len(args.integrations) > 1 or k != SCAN["k"]:
                 label += f"-k{k}"
             receiver.field_mode = bool(num)
-            active = probe.command(label, dict(SCAN, k=k, view_bins=width, field_targets=targets[:num]), seconds=40)
+            spectrum = dict(fft_bins=args.fft_bins, hold_k=args.hold_k) if args.obn5 else {}
+            active = probe.command(label, dict(SCAN, k=k, view_bins=width, field_targets=targets[:num],
+                                               **spectrum), seconds=40)
             if active["running"] is not True or active.get("view_bins") != width or active.get("k") != k:
                 if num:
                     detail=stand.ssh(f"dir=$(ls -td {remote}/control/field-* | head -n 1); "
@@ -284,9 +288,11 @@ test "$(devmem 0x7c460284)" = 0x00000000
             elapsed = time.monotonic()-start
             arm_end = stand.ssh(ARM_COUNTERS)
             row = dict(view=width, field=num, k=k, seconds=elapsed, generation=generation, samples=snapshots,
+                       fft_bins=active["spectrum"]["fft_bins"], hold_k=args.hold_k,
+                       roi_range_hz=roi_range, roi_view_bins=args.roi_view_bins if roi_range else None,
                        host_begin=host_begin, host_end=host_end, arm_begin=arm_begin, arm_end=arm_end)
             rows.append(row)
-            probe.command(f"stop-{label}", dict(stopped, k=k, view_bins=width), seconds=12)
+            probe.command(f"stop-{label}", dict(stopped, k=k, view_bins=width, **spectrum), seconds=12)
             if transmitter and (abort_ether or index + 1 == len(combinations)):
                 (log/"transmitter-done").touch()
                 print("TRANSMITTER_CAN_STOP",flush=True)

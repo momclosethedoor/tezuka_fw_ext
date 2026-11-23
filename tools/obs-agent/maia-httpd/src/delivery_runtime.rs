@@ -6,7 +6,32 @@ use serde::Deserialize;
 use serde_json::{Value,json};
 use std::{fs::{File,OpenOptions},os::fd::AsRawFd,path::{Path,PathBuf},net::{SocketAddr,TcpStream},io::Write,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::{Duration,Instant}};
 #[derive(Deserialize)]#[serde(deny_unknown_fields)]
-struct Config{setup:PathBuf,reader:Value,replay:Option<Replay>,#[serde(default)]tx_authorized:bool}
+struct Config{setup:PathBuf,reader:Value,replay:Option<Replay>,#[serde(default)]tx_authorized:bool,
+ #[cfg(feature="scan-stream-bench")] field:Option<FieldBench>}
+#[cfg(feature="scan-stream-bench")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FieldBench {collector:PathBuf, watch_directory:PathBuf}
+#[cfg(feature="scan-stream-bench")]
+fn start_field(config:&FieldBench, output:&Path)->Result<std::process::Child>{
+ use std::process::Command;
+ ensure!(config.collector.is_absolute() && config.watch_directory.is_absolute(),"FIELD bench paths");
+ let mut child=Command::new(&config.collector).arg(&config.watch_directory).arg("90")
+  .env("OBS_FFM1_TRACE","1").stdout(File::create(output.join("receipts.jsonl"))?)
+  .stderr(File::create(output.join("collector.log"))?).spawn()?;
+ let start=Instant::now();
+ let ready=(||->Result<()>{
+  while start.elapsed()<Duration::from_millis(1500) {
+   ensure!(child.try_wait()?.is_none(),"FIELD bench collector exited");
+   let read=Command::new("devmem").arg("0x7c460354").output()?;
+   if read.status.success() && read.stdout.starts_with(b"0x00000001"){return Ok(())}
+   std::thread::sleep(Duration::from_millis(5));
+  }
+  anyhow::bail!("FIELD bench SESSION timeout")
+ })();
+ if let Err(e)=ready {let _=child.kill();let _=child.wait();return Err(e)}
+ Ok(child)
+}
 #[derive(Deserialize,Clone)]#[serde(deny_unknown_fields)]
 struct Replay{file:PathBuf,metadata:PathBuf,destination:String,hz:u32,count:u32,#[serde(default="one")]targets:u32,#[serde(default)]burst:bool}
 fn one()->u32{1}
@@ -40,10 +65,10 @@ pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  let c:Config=serde_json::from_slice(&std::fs::read(path)?)?;
  let capture=c.reader["command"]=="capture";
  let view_mode=c.reader["mode"].as_u64();
- let bounded_obn3=c.reader["bench_obn3_layout"]==true || c.reader["stream_config"].is_number();
+ let bounded_compact=c.reader["bench_obn3_layout"]==true || c.reader["stream_config"].is_number();
  ensure!(c.reader["hot"]==true&&c.reader["scan"]==true&&c.reader["k"]==2&&
-        (view_mode==Some(1)||capture&&matches!(view_mode,Some(2|3))||bounded_obn3&&matches!(view_mode,Some(0|2|3))),
-        "guarded K2 VIEW512, or offline reference capture in VIEW1024/2048");
+        (view_mode==Some(1)||capture&&matches!(view_mode,Some(2|3))||bounded_compact&&matches!(view_mode,Some(0|2|3|4))),
+        "guarded K2 with reference VIEW geometry");
  ensure!(std::fs::read_to_string("/sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown")?.trim()=="1","TX must be off");
  ensure!(c.reader["boot_id"].as_str()==Some(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()),"boot mismatch");
  let guard=OpenOptions::new().read(true).write(true).open("/dev/obs_fl_guard")?;let mut setup=std::fs::read(&c.setup)?;
@@ -58,13 +83,31 @@ pub async fn run(path:&Path,listen:SocketAddr)->Result<()>{
  ensure!(unsafe{libc::ioctl(guard.as_raw_fd(),0x4601,setup.as_mut_ptr())}==0,"guard load");
  let taken=match guard_ioctl(&guard,0x4602){Ok(v)=>v,Err(e)=>{let _=guard_ioctl(&guard,0x4604);return Err(e)}};
  if taken["state"]!=2||(taken["control"]!=3&&taken["control"]!=7)||taken["tx_powerdown"]!=json!(if rf_on==1{0}else{1}){let _=guard_ioctl(&guard,0x4604);anyhow::bail!("guard take receipt: {taken}")}
+ let out=PathBuf::from(c.reader["output"].as_str().unwrap());
+ #[cfg(feature="scan-stream-bench")]
+ let field=match c.field.as_ref().map(|config|start_field(config,&out)).transpose() {
+  Ok(child)=>child,
+  Err(e)=>{let _=guard_ioctl(&guard,0x4604);return Err(e)}
+ };
  let state=Arc::new(Inner{running:AtomicBool::new(true),stop:AtomicBool::new(false),result:Mutex::new(json!({"guard_take":taken})),delivery:Mutex::new(json!({"sent":0,"replay":c.replay.is_some()})),tx_authorized:c.tx_authorized});
- let worker=state.clone();let data=serde_json::to_vec(&c.reader)?;let out=PathBuf::from(c.reader["output"].as_str().unwrap());let warmup=c.reader["warmup"].as_f64().unwrap_or(5.);
+ let worker=state.clone();let data=serde_json::to_vec(&c.reader)?;let warmup=c.reader["warmup"].as_f64().unwrap_or(5.);
  let replay_thread=c.replay.map(|q|{let s=state.clone();std::thread::spawn(move||replay(q,s,warmup))});
  let acquisition=std::thread::spawn(move||{
   let result=crate::system_reader::run_json(&data);worker.running.store(false,Ordering::Release);
+  #[cfg(feature="scan-stream-bench")]
+  let field_result=field.map(|mut child|{
+   unsafe{libc::kill(child.id() as i32,libc::SIGTERM);}
+   let start=Instant::now();
+   while start.elapsed()<Duration::from_millis(1500){
+    if let Ok(Some(s))=child.try_wait(){return s.success()}
+    std::thread::sleep(Duration::from_millis(5));
+   }
+   let _=child.kill();let _=child.wait();false
+  });
   let delivery=match replay_thread{Some(t)=>match t.join(){Ok(Ok(v))=>v,Ok(Err(e))=>json!({"error":e.to_string()}),Err(_)=>json!({"error":"replay panic"})},None=>json!({"sent":0,"bytes":0})};
-  let handback=guard_ioctl(&guard,0x4604);let v=json!({"reader_outcome":result,"delivery":delivery,"guard_return":match handback{Ok(v)=>v,Err(e)=>json!({"error":e.to_string()})}});
+  let handback=guard_ioctl(&guard,0x4604);let mut v=json!({"reader_outcome":result,"delivery":delivery,"guard_return":match handback{Ok(v)=>v,Err(e)=>json!({"error":e.to_string()})}});
+  #[cfg(feature="scan-stream-bench")]
+  if let Some(result)=field_result {v["field_stopped"]=json!(result);}
   let _=std::fs::write(out.join("agent-result.json"),serde_json::to_vec_pretty(&v).unwrap());*worker.result.lock().unwrap()=v;
  });
  let app=Router::new().route("/api/system/field",get(crate::field1_control::get).post(crate::field1_control::post)).route("/api/system/status",get(status)).route("/api/system/stop",post(stop)).with_state(state.clone());

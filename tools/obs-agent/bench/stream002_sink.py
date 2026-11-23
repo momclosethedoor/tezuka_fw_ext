@@ -13,7 +13,6 @@ ROI_RANGE = struct.Struct("<QHH")
 COMPACT = struct.Struct("<8s7Q")
 OBN3 = struct.Struct("<IHHQQQIIIIIIQ")
 FIELD = struct.Struct("<4sII")
-BIN_HZ = 15_000
 COMPACT_BYTES = 24_704
 COMPACT_PREFIX_BYTES = 128
 
@@ -39,21 +38,56 @@ def exact(conn, size, eof=False):
 def compact_header(slot):
     abi, revision, header_size, seq, epoch, tick, bins, k, tick_hz, flags, encoding, length, ordinal = (
         OBN3.unpack_from(slot))
-    if ((abi, revision, header_size, bins, encoding, length, tick_hz) !=
-            (0x334E424F, 4, 64, 4096, 3, COMPACT_BYTES, 62_500_000) or
-            not 1 <= k <= 1023 or flags & ~0x3f or flags & 3 != 1 or any(slot[64:128])):
-        raise ValueError("invalid OBN3 compact header")
-    return ordinal, seq, epoch, tick, k, flags
+    legacy = (abi, revision, bins) == (0x334E424F, 4, 4096)
+    obn5 = (abi, revision) == (0x354E424F, 1) and bins in (1024, 2048, 4096)
+    if (not (legacy or obn5) or (header_size, encoding, length, tick_hz) !=
+            (64, 3, COMPACT_PREFIX_BYTES + 6 * bins, 62_500_000) or
+            not 1 <= k <= 1023 or flags & ~(0xff if obn5 else 0x3f) or
+            flags & 3 != 1 or any(slot[64:128])):
+        raise ValueError("invalid compact spectrum header")
+    return (ordinal, seq, epoch, tick, k, flags), bins, length
 
 
 def compact_frame(conn, header):
     magic,*words,generation=COMPACT.unpack(header)
     if magic!=b"GCMP1\x00\x00\x00" or not generation:
         raise ValueError("invalid full compact frame")
-    observed=compact_header(exact(conn,COMPACT_BYTES))
+    observed,bins,length=compact_header(exact(conn,COMPACT_PREFIX_BYTES))
     if observed!=tuple(words):
-        raise ValueError("full compact envelope and OBN3 identity differ")
-    return observed[0],4096,COMPACT.size+COMPACT_BYTES
+        raise ValueError("full compact envelope and spectrum identity differ")
+    exact(conn,length-COMPACT_PREFIX_BYTES)
+    return observed[0],bins,COMPACT.size+length
+
+
+def verify_obn5_pairs(full_slots, view_slots, fft_bins, mode):
+    """Recompute every active VIEW bin directly from the captured M45E3 words."""
+    observations = []
+    divisors = (0, 8, 4, 2, 1)
+    for capture_slot in range(len(full_slots) // 32768):
+        slot = full_slots[capture_slot * 32768:(capture_slot + 1) * 32768]
+        if not any(slot[:COMPACT_PREFIX_BYTES]):
+            continue
+        if slot[:4] != b"OBN5":
+            raise ValueError("OBN5 header must be at the FULL slot base")
+        (ordinal, seq, epoch, tick, k, flags), bins, length = compact_header(slot)
+        physical_slot = 1023 if capture_slot == 8 else capture_slot
+        actual_mode = ((flags >> 3) & 3) | ((flags >> 5) & 4)
+        if ordinal % 1024 != physical_slot or bins != fft_bins or actual_mode != mode:
+            raise ValueError("OBN5 slot identity or active geometry mismatch")
+        if mode:
+            words = [int.from_bytes(slot[i:i + 6], "little") for i in range(128, length, 6)]
+            mask = (1 << 45) - 1
+            power = [(word & mask) << (2 * (word >> 45)) for word in words]
+            step = divisors[mode]
+            expected = bytes(max(power[i:i+step]).bit_length() for i in range(0, bins, step))
+            start = capture_slot * 4096
+            if view_slots[start:start+len(expected)] != expected:
+                raise ValueError(f"OBN5 VIEW power mismatch at ordinal {ordinal}")
+        observations.append(dict(ordinal=ordinal, seq=seq, epoch=epoch, tick=tick,
+                                 k=k, flags=flags, full_bytes=length, bins=bins, mode=mode))
+    if len(observations) < 4:
+        raise ValueError("fewer than four independently validated OBN5 records")
+    return observations
 
 
 def roi_frame(conn, header):
@@ -66,7 +100,7 @@ def roi_frame(conn, header):
     if packed:
         high, source_bins, display_bins = ROI_RANGE.unpack(exact(conn, ROI_RANGE.size))
         low = center_or_low
-        if (not low < high or source_bins not in (512, 1024, 2048, 4096) or
+        if (not low < high or source_bins not in (128, 256, 512, 1024, 2048, 4096) or
                 display_bins not in (512, 1024, 2048, 4096)):
             raise ValueError("invalid ROI grids")
     else:
@@ -76,7 +110,9 @@ def roi_frame(conn, header):
         source_bins = 4096
     ranges = tuple(struct.iter_unpack("<HH", exact(conn, 4 * count)))
     prefix_bytes = COMPACT_PREFIX_BYTES if packed else size
-    ordinal, _, epoch, _, _, _ = compact_header(exact(conn,prefix_bytes))
+    (ordinal, _, epoch, _, _, _), fft_bins, length = compact_header(exact(conn,prefix_bytes))
+    if not fft_bins // 8 <= source_bins <= fft_bins or not packed and length != size:
+        raise ValueError("ROI grids differ from the FFT record")
     if epoch<anchor:
         raise ValueError("ROI observation precedes map anchor")
     selected = 0
@@ -84,15 +120,15 @@ def roi_frame(conn, header):
     for lo, hi in ranges:
         if not prev <= lo < hi <= source_bins:
             raise ValueError("invalid or overlapping ROI intervals")
-        stride = 4096 // source_bins
+        stride = fft_bins // source_bins
         for index in (lo * stride, hi * stride - 1):
-            hz = profile + side * (index - 2048) * BIN_HZ
+            hz = profile + side * (index - fft_bins // 2) * (61_440_000 // fft_bins)
             if not low <= hz < high:
                 raise ValueError("bin outside the requested RF range")
         selected += hi-lo
         prev = hi
     if packed:
-        if size != selected * (6 if source_bins == 4096 else 1):
+        if size != selected * (6 if source_bins == fft_bins else 1):
             raise ValueError("packed ROI payload length differs from its intervals")
         exact(conn,size)
     return ordinal, selected, ROI.size + 4 * count + size + (

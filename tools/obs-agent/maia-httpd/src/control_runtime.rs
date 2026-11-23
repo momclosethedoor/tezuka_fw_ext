@@ -1618,7 +1618,10 @@ fn worker(
                 "scan" | "analysis" => {
                     if request.get("view_bins").is_none() {
                         let previous=pending[op]["view_bins"].as_u64().unwrap_or(512);
-                        request["view_bins"] = if request.get("fft_bins").is_some() {512} else {previous}.into();
+                        let fft=request["fft_bins"].as_u64().unwrap_or(4096);
+                        request["view_bins"] = if [0,fft/8,fft/4,fft/2,fft].contains(&previous) {
+                            previous
+                        } else {512}.into();
                     }
                     resume_scan = None;
                     pending["alternative"] = Value::Null;
