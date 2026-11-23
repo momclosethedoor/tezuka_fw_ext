@@ -120,11 +120,17 @@ _Static_assert(sizeof(struct iio_block)==32,"legacy IIO block ABI");
 #define IIO_ENQUEUE_BLOCK _IOWR('i',0xa3,struct iio_block)
 #define IIO_DEQUEUE_BLOCK _IOWR('i',0xa4,struct iio_block)
 
+#ifdef OBS_SCAN_STREAM_BENCH
+enum { IIO_BENCH_BLOCKS=8, IIO_MAX_BLOCKS=IIO_BENCH_BLOCKS };
+#else
+enum { IIO_MAX_BLOCKS=IIO_BLOCKS };
+#endif
 struct iio_blocks {
-    void *maps[IIO_BLOCKS];
+    void *maps[IIO_MAX_BLOCKS];
+    unsigned count;
 #ifdef OBS_SCAN_STREAM_BENCH
     uint64_t dequeued, returned;
-    double max_checkout;
+    double max_checkout, last_dequeue, last_return_begin, last_return_end;
     unsigned last_id;
 #endif
 };
@@ -138,7 +144,7 @@ static int block_ioctl(int fd, unsigned long request, struct iio_block *block)
 
 static int map_blocks(int fd, struct iio_blocks *blocks)
 {
-    for(unsigned i=0;i<IIO_BLOCKS;++i) {
+    for(unsigned i=0;i<blocks->count;++i) {
         struct iio_block block={.id=i};
         int result=block_ioctl(fd,IIO_QUERY_BLOCK,&block);
         if(result<0) return result;
@@ -163,13 +169,16 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
     ++blocks->dequeued;
     double start=monotonic();
 #endif
-    if(block.id>=IIO_BLOCKS || block.size!=BLOCK) {
+    if(block.id>=blocks->count || block.size!=BLOCK) {
         *problem="IIO block identity invalid";
         return -EINVAL;
     }
     size_t bytes=block.bytes_used;
     bool bad=bytes>BLOCK || preview_append(history,blocks->maps[block.id],bytes);
     block.bytes_used=block.size;
+#ifdef OBS_SCAN_STREAM_BENCH
+    blocks->last_return_begin=monotonic();
+#endif
     result=block_ioctl(fd,IIO_ENQUEUE_BLOCK,&block);
     if(result<0) {
         history->retained=0;
@@ -179,7 +188,9 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
 #ifdef OBS_SCAN_STREAM_BENCH
     ++blocks->returned;
     blocks->last_id=block.id;
-    double elapsed=monotonic()-start;
+    blocks->last_dequeue=start;
+    blocks->last_return_end=monotonic();
+    double elapsed=blocks->last_return_end-start;
     if(elapsed>blocks->max_checkout) blocks->max_checkout=elapsed;
 #endif
     if(bad) {
@@ -201,7 +212,7 @@ enum {
     DMAC_DONE=0x428, DMAC_EOT_ID=0x42c, DMAC_PROGRESS=0x448
 };
 struct dmac_sample {
-    double begin, end;
+    double begin, end, dequeue, enqueue_begin, enqueue_end;
     uint32_t cause, status, control, next_id, submit, done, eot_id, progress;
     uint64_t returned;
     unsigned block;
@@ -217,7 +228,8 @@ static struct dmac_sample dmac_read(const struct dmac_trace *trace, volatile con
                                     const struct iio_blocks *blocks)
 {
     volatile const uint32_t *reg=trace->reg;
-    struct dmac_sample sample={.begin=monotonic(),.returned=blocks->returned,.block=blocks->last_id};
+    struct dmac_sample sample={.begin=monotonic(),.returned=blocks->returned,.block=blocks->last_id,
+        .dequeue=blocks->last_dequeue,.enqueue_begin=blocks->last_return_begin,.enqueue_end=blocks->last_return_end};
     sample.cause=field[FSB_CAUSES/4];
     sample.status=field[STATUS/4];
     sample.control=reg[DMAC_CONTROL/4];
@@ -241,16 +253,18 @@ static void dmac_remember(struct dmac_trace *trace, volatile const uint32_t *fie
 static void dmac_print(const struct dmac_sample *s, const char *stage)
 {
     fprintf(stderr,"FSB1_DMAC stage=%s t0=%.9f t1=%.9f cause=%02x fld=%08x "
-        "ctrl=%08x submit=%u next=%u eot=%u done=%08x progress=%u returned=%llu iio_id=%u\n",
+        "ctrl=%08x submit=%u next=%u eot=%u done=%08x progress=%u returned=%llu iio_id=%u "
+        "dequeue=%.9f enqueue0=%.9f enqueue1=%.9f\n",
         stage,s->begin,s->end,s->cause,s->status,s->control,s->submit,s->next_id,
-        s->eot_id,s->done,s->progress,(unsigned long long)s->returned,s->block);
+        s->eot_id,s->done,s->progress,(unsigned long long)s->returned,s->block,
+        s->dequeue,s->enqueue_begin,s->enqueue_end);
 }
 
 static void dmac_dump(const struct dmac_trace *trace, const struct dmac_sample *fault)
 {
     unsigned first=(trace->next+DMAC_HISTORY-trace->count)%DMAC_HISTORY;
     for(unsigned n=0;n<trace->count;++n) dmac_print(&trace->history[(first+n)%DMAC_HISTORY],"after_return");
-    dmac_print(fault,"before_stop");
+    if(fault) dmac_print(fault,"before_stop");
 }
 #endif
 
@@ -355,7 +369,7 @@ int main(int argc,char **argv)
     uint32_t oldmode=0,oldcode=0,oldtimeout=0,oldrun=0;
     void *lib=NULL,*context=NULL,*buffer=NULL;
     struct iio_api io={0};
-    struct iio_blocks blocks={0};
+    struct iio_blocks blocks={.count=IIO_BLOCKS};
     volatile uint32_t *reg=MAP_FAILED;
     struct watch_table wat={0};
     uint8_t *watch_bytes=malloc(WATCH_HEADER+WATCH_RECORD*WATCH_RESIDENT_MAX+1);
@@ -394,6 +408,12 @@ int main(int argc,char **argv)
         void *mapping=mmap(NULL,DMAC_PAGE,PROT_READ,MAP_SHARED,mem,DMAC_BASE);
         if(mapping==MAP_FAILED) goto done;
         dmac.reg=mapping;
+        const char *depth=getenv("OBS_FSB1_IIO_BUFFERS");
+        if(depth) {
+            problem="invalid bench IIO buffer count";
+            if(strcmp(depth,"8")) goto done;
+            blocks.count=IIO_BENCH_BLOCKS;
+        }
     }
 #endif
     oldmode=reg[0x38/4];oldcode=reg[0x40/4];oldtimeout=reg[0x28c/4];
@@ -408,7 +428,7 @@ int main(int argc,char **argv)
     problem="configure the IIO device and channels";
     context=io.create_local_context();
     void *dev=context?io.context_find_device(context,"cf-ad9361-lpc"):NULL;
-    if(!dev || io.context_set_timeout(context,250) || io.device_set_kernel_buffers_count(dev,IIO_BLOCKS)) goto done;
+    if(!dev || io.context_set_timeout(context,250) || io.device_set_kernel_buffers_count(dev,blocks.count)) goto done;
     void *i=io.device_find_channel(dev,"voltage0",false),*q=io.device_find_channel(dev,"voltage1",false);
     if(!i || !q) goto done;
     io.channel_enable(i);io.channel_enable(q);
@@ -434,7 +454,7 @@ int main(int argc,char **argv)
     }
     uint32_t lost_start=reg[LOST/4];
     write_reg(reg,SESSION,1);
-    fprintf(stderr,"FFM1_READY block=%d history=%d dma_blocks=%d explicit_return=1\n",BLOCK,RETAIN,IIO_BLOCKS);
+    fprintf(stderr,"FFM1_READY block=%d history=%d dma_blocks=%u explicit_return=1\n",BLOCK,RETAIN,blocks.count);
     struct observation obs={0};
     struct field_live live={0};
     struct field_wire wire={0};
@@ -605,11 +625,12 @@ int main(int argc,char **argv)
 #ifdef OBS_SCAN_STREAM_BENCH
     fprintf(stderr,"FSB1_IIO dequeued=%llu returned=%llu max_checkout_s=%.9f\n",
         (unsigned long long)blocks.dequeued,(unsigned long long)blocks.returned,blocks.max_checkout);
+    if(dmac.reg && !source_failure) dmac_dump(&dmac,NULL);
 #endif
 done:
     if(rc && !source_failure) report_error(reg,problem?problem:"receipt, history or drain fault",iio_result);
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,FIELD_CANCEL);write_reg(reg,RUN,0);}
-    for(unsigned i=0;i<IIO_BLOCKS;++i) if(blocks.maps[i]) munmap(blocks.maps[i],BLOCK);
+    for(unsigned i=0;i<blocks.count;++i) if(blocks.maps[i]) munmap(blocks.maps[i],BLOCK);
     if(buffer) io.buffer_destroy(buffer);
     if(context) io.context_destroy(context);
     if(stream_owned) {
