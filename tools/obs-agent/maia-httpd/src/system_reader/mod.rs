@@ -646,7 +646,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    zoom.pump();
   }
   if let Some(q)=control {
-    if !header_only && overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
+    let view_bytes=if header_only{view::view_len(h)}else{overview.len()};
+    if view_bytes!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if execution.get().is_none(){
     let e=Execution{generation:q.generation,version:q.version,anchor:if c.scan{initial_anchor}else{h.epoch},run:initial.cookie};
     if h.epoch<e.anchor{network.borrow_mut().suppressed+=1;return Ok(())}
