@@ -670,6 +670,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
  }
  let initial_anchor=io.live64(0x238);
+ let view_mute_file=std::env::var_os("OBS_DIAG_VIEW_MUTE_FILE").map(PathBuf::from);
+ let view_muted=std::cell::Cell::new(false);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
  let execution=std::cell::Cell::<Option<Execution>>::new(None);
@@ -722,7 +724,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     if view::view_len(h)!=0{network.borrow_mut().suppressed+=1;}
    &[][..]
   }else{overview};
-  if let Some(sock)=&socket{
+  if view_muted.get(){
+   // Keep the same owned DDR reads and release path in the muted window.
+   std::hint::black_box(overview);
+  }else if let Some(sock)=&socket{
    if control.is_none() && !overview.is_empty() && overview.len()!=wire_view_bins{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
    if execution.get().is_some_and(|e|h.epoch<e.anchor){net.suppressed+=1;return Ok(())}
@@ -748,6 +753,9 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
+    if !view_muted.get() && view_mute_file.as_ref().is_some_and(|path|path.is_file()){
+     view_muted.set(true);
+    }
     if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){
     #[cfg(feature="scan-stream-bench")]
     let filtering=zoom.filters_view();
@@ -764,6 +772,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
    if let Ok(mut v)=mark(&mut io,&reader,start){
     v["network"]=network.borrow().counts();
+    if view_mute_file.is_some(){v["network"]["diag_view_muted"]=json!(view_muted.get());}
     v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
     if io.phase_on {
      v["observed_to_payload"]=histogram(reader.observed_to_payload);
@@ -776,7 +785,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
   let s=service(&mut reader,&mut io)?;
   if let Some(zoom)=zoom.borrow_mut().as_mut(){zoom.pump();}
-  if let Some(sock)=&socket {
+  if !view_muted.get() && let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow().as_ref(){sweep.poll(&mut net,sock);}else{net.flush_due(sock);}
    if let Some(q)=control && !first_view_sent && net.sent>0{first_view_sent=true;(q.trace)("first_view_sent");}
@@ -793,7 +802,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let stop=Instant::now();loop{let s=service(&mut reader,&mut io)?;
   let drained=s.drained&&!s.running&&!s.dma_busy&&s.reserved==s.committed&&reader.next==s.committed;
   if drained{io.release_drained(s.cookie,s.committed)?;}
-  if let Some(sock)=&socket {
+  if !view_muted.get() && let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow_mut().as_mut(){
     if drained{sweep.finish_drained(&mut net,sock,io.live64(0x180));}else{sweep.poll(&mut net,sock);}
@@ -810,6 +819,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  if let Ok(mut v)=mark(&mut io,&reader,start){
   v["network"]=network.borrow().counts();
+  if view_mute_file.is_some(){v["network"]["diag_view_muted"]=json!(view_muted.get());}
   v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
   if io.phase_on {
    v["observed_to_payload"]=histogram(reader.observed_to_payload);
