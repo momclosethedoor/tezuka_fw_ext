@@ -50,6 +50,7 @@ impl SweepSpec {
  #[serde(default)]mode:u32,#[serde(default)]peak:bool,#[serde(default)]scan:bool,
  #[serde(default)]stream_config:Option<u32>,
  #[serde(default)]bench_obn3_layout:bool,
+ #[serde(default)]bench_obn3_view_only:bool,
  #[serde(default="settledefault")]settling:u32,#[serde(default="secondsdefault")]seconds:f64,
  #[serde(default="warmdefault")]warmup:f64,#[serde(default)]shift544:bool,
  #[serde(default)]previous_mode:u32,#[serde(default)]discard_cold:bool,#[serde(default)]check:bool,
@@ -110,9 +111,13 @@ impl Hardware{
      return Err("OBN3 requires separate full and VIEW slots".into());
     }
     h.stream_format=Some(obn3::Format::from_config(h.r(0x34c))?);
-    h.managed_view_only=false;
+    if c.bench_obn3_view_only &&
+        !(cfg!(feature="scan-stream-bench") && managed_view_only && c.scan && c.mode!=0 && c.stream_config==Some(0)) {
+     return Err("OBN3 view-only bench configuration requires managed raw12 native scan with VIEW".into());
+    }
+    h.managed_view_only=c.bench_obn3_view_only;
    }
-   (continuous::ABI,3) if c.stream_config.is_none() && !c.bench_obn3_layout && !(managed_view_only && c.mode==0) => {}
+   (continuous::ABI,3) if c.stream_config.is_none() && !c.bench_obn3_layout && !c.bench_obn3_view_only && !(managed_view_only && c.mode==0) => {}
    _ => return Err("spectrum ABI/revision/configuration mismatch".into()),
   }
   Ok(h)
@@ -152,11 +157,11 @@ impl Hardware{
    let prefix=OBN3_RAM_SHIFT_BYTES-prev_view;
    let head=if shifted {previous*continuous::BYTES+self.previous_full_len-prefix} else {offset};
    let mut start=0;
-   let checked=if let Some(keep)=keep {
+   let checked=if self.managed_view_only || keep.is_some() {
     start=format.prefix_bytes();
     self.copy(0,head,&mut full[..start])?;
     let h=format.header(&full[..start])?;
-    if !keep(h) {
+    if keep.is_some_and(|accept| !accept(h)) {
      self.previous_view=view::view_len(h);
      self.previous_full_len=length;
      sink(h,&[],&[])?;
@@ -164,11 +169,14 @@ impl Hardware{
     }
     Some(h)
    }else{None};
-   if shifted {
-    self.copy(0,head+start,&mut full[start..prefix])?;
-    if prev_view!=0{self.copy(1,previous*view::VIEW_BYTES,&mut full[prefix..prefix+prev_view])?;}
-    self.copy(0,offset,&mut full[prefix+prev_view..length])?;
-   }else{self.copy(0,offset+start,&mut full[start..length])?;}
+   if !self.managed_view_only {
+    if shifted {
+     self.copy(0,head+start,&mut full[start..prefix])?;
+     if prev_view!=0{self.copy(1,previous*view::VIEW_BYTES,&mut full[prefix..prefix+prev_view])?;}
+     self.copy(0,offset,&mut full[prefix+prev_view..length])?;
+    }else{self.copy(0,offset+start,&mut full[start..length])?;}
+    self.copied_bytes+=length as u64;
+   }
    let header=if let Some(h)=checked {h}else{format.header(&full[..length])?};
    let n=view::view_len(header);
    let (region,view_offset,base)=if shifted {(0,offset+length-OBN3_RAM_SHIFT_BYTES,self.full.ptr)}
@@ -177,10 +185,9 @@ impl Hardware{
    let payload=unsafe{std::slice::from_raw_parts(base.add(view_offset),n)};
    self.previous_view=n;
    self.previous_full_len=length;
-   self.copied_bytes+=length as u64;
    self.view_bytes+=n as u64;
    sink(header,&[],payload)?;
-   Ok(length)
+   Ok(if self.managed_view_only {0} else {length})
   }
  fn prepare(&mut self,c:&Config)->R<()>{let s=self.snapshot()?;if s.running||s.dma_busy||!s.drained||s.committed!=s.released||s.reserved!=s.committed||s.fault{return Err("START needs STOP/DRAINED/released/nonfatal".into())}
   if self.stream_format.is_some(){
@@ -380,7 +387,9 @@ impl PairIo for Hardware{
  fn batch_limit(&self)->usize{self.batch_limit}
  fn phase_timing(&self)->bool{self.phase_on}
  fn full_read(&self)->bool{!self.release_only&&!self.managed_view_only}
- fn owned_full_bytes(&self)->usize{self.stream_format.map_or(0,obn3::Format::active_bytes)}
+ fn owned_full_bytes(&self)->usize{
+  if self.managed_view_only {0} else {self.stream_format.map_or(0,obn3::Format::active_bytes)}
+ }
  fn prepare_prefix(&mut self,first:u64,end:u64)->R<()>{
   self.covered.clear();if !self.batch_sync||self.release_only||self.managed_view_only||self.stream_format.is_some()||first==end{return Ok(())}
   let count=(end-first) as u32;let slot=(first&1023)as u32;

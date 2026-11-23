@@ -48,6 +48,8 @@ struct Config {
     #[serde(default)]
     bench_obn3_layout: bool,
     #[serde(default)]
+    bench_obn3_view_only: bool,
+    #[serde(default)]
     setup: PathBuf,
     output: PathBuf,
     view: SocketAddr,
@@ -1964,9 +1966,11 @@ fn worker(
             let work = c.output.join("reader");
             let k = actual.borrow()["k"].clone();
             let mode_index = view_mode(&actual.borrow()[&mode])?;
+            let view_only = scan && c.bench_obn3_view_only;
             let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":mode_index,
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
+                "stream_config":view_only.then_some(0u32),"bench_obn3_view_only":view_only,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
@@ -2403,8 +2407,11 @@ pub fn check_scan_tx_bank() -> Result<()> {
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
-    ensure!(cfg!(feature="scan-stream-bench") || (!c.bench_obn3_layout && c.bench_roi.is_none()),
+    ensure!(cfg!(feature="scan-stream-bench") ||
+        (!c.bench_obn3_layout && !c.bench_obn3_view_only && c.bench_roi.is_none()),
         "RAM layout and ROI require the scan-stream-bench feature");
+    ensure!(!c.bench_obn3_view_only || c.bench_roi.is_none(),
+        "OBN3 view-only bench configuration excludes compact delivery");
     ensure!(!c.bench_full_compact_tcp || c.bench_roi.is_some(),"full compact TCP requires a bench destination");
     let catalog_policy = c.scan["planner_version"] == 2 && c.scan["catalog_on_boot"] != false
         && c.external_mixer.is_none();
@@ -2509,6 +2516,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     );
     ensure!(!stream002 || !c.bench_split544, "OBN3 requires separate DMA regions");
     ensure!(stream002 || !c.bench_obn3_layout,"OBN3 RAM layout requires OBN3");
+    ensure!(stream002 || !c.bench_obn3_view_only,"OBN3 view-only bench configuration requires OBN3");
     ensure!(!stream002 || c.field_preview.is_none(), "legacy FIELD1 collector requires OBN2");
     ensure!(stream002 || c.resident_field.is_none(), "resident FIELD collector requires OBN3/FLD2/FFM1");
     ensure!(stream002 || c.bench_roi.is_none(),"bench ROI requires OBN3");
@@ -2687,6 +2695,7 @@ mod tests {
         let c = Config {
             bench_split544: false,
             bench_obn3_layout: false,
+            bench_obn3_view_only: false,
             boot_id: String::new(),
             setup: "setup".into(),
             output: "out".into(),

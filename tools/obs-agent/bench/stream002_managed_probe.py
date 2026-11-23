@@ -176,6 +176,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
     control = dict(boot_id=boot, output=remote+"/control", scan=stopped,
         analysis=analysis, view=f"{HOST}:18010", route=f"{HOST}:18008", video=f"{HOST}:18009",
         bench_obn3_layout=args.bench_obn3_layout)
+    if args.obn3_view_only:
+        control["bench_obn3_view_only"] = True
     fields = getattr(args,"field_counts",(0,))
     targets = json.loads(args.targets.read_text(encoding="utf-8-sig")) if max(fields) else []
     if len(targets)<max(fields):
@@ -228,8 +230,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
         if getattr(args,"regression",False):
             mode_regressions(stand,probe,receiver,log,analysis)
             return
-        combinations=[(width,num) for width in args.widths for num in fields]
-        for index, (width, num) in enumerate(combinations):
+        combinations = [(width, num, k) for width in args.widths for num in fields for k in args.integrations]
+        for index, (width, num, k) in enumerate(combinations):
             if gated and num and not transmitter:
                 (log/"transmitter-needed").touch()
                 print("TRANSMITTER_READY_REQUIRED",flush=True)
@@ -240,9 +242,11 @@ test "$(devmem 0x7c460284)" = 0x00000000
                     time.sleep(.1)
                 transmitter=True
             label = f"wide-{width}-field-{num}"
+            if len(args.integrations) > 1 or k != SCAN["k"]:
+                label += f"-k{k}"
             receiver.field_mode = bool(num)
-            active = probe.command(label, dict(SCAN, view_bins=width, field_targets=targets[:num]), seconds=40)
-            if active["running"] is not True or active.get("view_bins") != width:
+            active = probe.command(label, dict(SCAN, k=k, view_bins=width, field_targets=targets[:num]), seconds=40)
+            if active["running"] is not True or active.get("view_bins") != width or active.get("k") != k:
                 if num:
                     detail=stand.ssh(f"dir=$(ls -td {remote}/control/field-* | head -n 1); "
                                      'test -z "$dir" || cat "$dir/collector.log"')
@@ -274,10 +278,10 @@ test "$(devmem 0x7c460284)" = 0x00000000
             host_end = dict(receiver.view_stats(generation))
             elapsed = time.monotonic()-start
             arm_end = stand.ssh(ARM_COUNTERS)
-            row = dict(view=width, field=num, seconds=elapsed, generation=generation, samples=snapshots,
+            row = dict(view=width, field=num, k=k, seconds=elapsed, generation=generation, samples=snapshots,
                        host_begin=host_begin, host_end=host_end, arm_begin=arm_begin, arm_end=arm_end)
             rows.append(row)
-            probe.command(f"stop-{label}", dict(stopped, view_bins=width), seconds=12)
+            probe.command(f"stop-{label}", dict(stopped, k=k, view_bins=width), seconds=12)
             if transmitter and (abort_ether or index + 1 == len(combinations)):
                 (log/"transmitter-done").touch()
                 print("TRANSMITTER_CAN_STOP",flush=True)
@@ -293,7 +297,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
                     kernel=stand.ssh("dmesg | tail -n 80")
                     (log/f"{label}-kernel.log").write_text(kernel,encoding="utf-8")
             stand.write_json(log / "windows.json", rows)
-            print(json.dumps(dict(view=width, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
+            print(json.dumps(dict(view=width, field=num, k=k, elapsed_s=elapsed, a=host_end["A"]-host_begin["A"],
                 b=host_end["B"]-host_begin["B"])),flush=True)
             if abort_ether:
                 break

@@ -28,6 +28,10 @@ def main():
     parser.add_argument("--bench-obn3-layout", action="store_true")
     parser.add_argument("--managed", action="store_true")
     parser.add_argument("--widths", type=int, nargs="+", choices=(0, 512, 1024, 2048), default=(0,))
+    parser.add_argument("--integrations", type=int, nargs="+", choices=(2, 3), default=(2,),
+                        help="spectral accumulation K for managed scan windows")
+    parser.add_argument("--obn3-view-only", action="store_true",
+                        help="select raw12 native and read only the OBN3 header and VIEW")
     parser.add_argument("--seconds", type=int, choices=range(15, 31), default=20)
     parser.add_argument("--regression", action="store_true")
     parser.add_argument("--field-counts", type=int, nargs="+", choices=range(11), default=(0,))
@@ -59,6 +63,13 @@ def main():
     if args.fsb1_capture_worker and not args.fsb1_dmac_trace:
         parser.error("--fsb1-capture-worker requires --fsb1-dmac-trace")
     compact_tcp = args.full_compact_tcp or args.roi_center_hz is not None
+    if args.integrations != (2,) and (not args.managed or args.regression):
+        parser.error("--integrations requires managed scan windows")
+    if args.obn3_view_only and (not args.managed or args.regression or not all(args.widths) or
+                               compact_tcp or args.roi_range_hz):
+        parser.error("--obn3-view-only requires managed scan windows with VIEW and no compact delivery")
+    if max(args.field_counts) and not args.targets:
+        parser.error("FIELD windows require --targets")
     if sum((args.full_compact_tcp, args.roi_center_hz is not None, args.roi_range_hz is not None)) > 1:
         parser.error("choose one of full compact TCP, legacy ROI or packed ROI")
     if compact_tcp and (not args.managed or args.regression or any(args.widths)):
