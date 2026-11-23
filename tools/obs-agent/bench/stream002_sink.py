@@ -90,7 +90,7 @@ def verify_obn5_pairs(full_slots, view_slots, fft_bins, mode):
     return observations
 
 
-def roi_frame(conn, header):
+def roi_frame(conn, header, sample=None):
     magic, size, count, phase, side, generation, version, map_gen, anchor, position, turn, profile, center_or_low = (
         ROI.unpack(header))
     if (magic not in (b"GROI1\x00\x00\x00", b"GROI2\x00\x00\x00") or not 1 <= count <= 12 or
@@ -110,7 +110,7 @@ def roi_frame(conn, header):
         source_bins = 4096
     ranges = tuple(struct.iter_unpack("<HH", exact(conn, 4 * count)))
     prefix_bytes = COMPACT_PREFIX_BYTES if packed else size
-    (ordinal, _, epoch, _, _, _), fft_bins, length = compact_header(exact(conn,prefix_bytes))
+    (ordinal, _, epoch, tick, actual_k, flags), fft_bins, length = compact_header(exact(conn,prefix_bytes))
     if not fft_bins // 8 <= source_bins <= fft_bins or not packed and length != size:
         raise ValueError("ROI grids differ from the FFT record")
     if epoch<anchor:
@@ -130,7 +130,11 @@ def roi_frame(conn, header):
     if packed:
         if size != selected * (6 if source_bins == fft_bins else 1):
             raise ValueError("packed ROI payload length differs from its intervals")
-        exact(conn,size)
+        payload = exact(conn,size)
+        if sample is not None:
+            sample(dict(ordinal=ordinal, epoch=epoch, tick=tick, actual_k=actual_k, flags=flags,
+                        map_generation=map_gen, pass_index=turn*2+phase, profile_hz=profile, side=side,
+                        fft_bins=fft_bins, source_bins=source_bins, ranges=ranges, payload_hex=payload.hex()))
     return ordinal, selected, ROI.size + 4 * count + size + (
         ROI_RANGE.size + COMPACT_PREFIX_BYTES if packed else 0)
 
@@ -205,6 +209,7 @@ def main():
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--seconds", type=float, default=60)
     parser.add_argument("--done-file", type=Path)
+    parser.add_argument("--sample-file", type=Path, help="write the first 64 packed ROI records per connection")
     args = parser.parse_args()
     if not 0 < args.seconds <= 300:
         parser.error("--seconds must be in (0, 300]")
@@ -225,6 +230,7 @@ def main():
                 continue
             summary["connections"] += 1
             previous = None
+            seen = 0
             with conn:
                 conn.settimeout(2)
                 try:
@@ -236,7 +242,13 @@ def main():
                         if head is None:
                             break
                         if args.mode != "field":
-                            ordinal, bins, length = receive(conn, head)
+                            sample = None
+                            if args.mode == "roi" and args.sample_file and seen < 64:
+                                def sample(row):
+                                    with args.sample_file.open("a", encoding="utf-8") as stream:
+                                        stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+                            ordinal, bins, length = receive(conn, head, sample) if sample else receive(conn, head)
+                            seen += 1
                             if previous is not None and ordinal <= previous:
                                 raise ValueError("reordered or duplicate ordinal")
                             previous = ordinal

@@ -81,11 +81,14 @@ class BenchProbe(Probe):
         super().save()
 
 
-def launch_roi(log, full):
+def launch_roi(log, full, sample=False):
     output=(log/"roi-sink.log").open("w",encoding="utf-8")
     try:
-        return subprocess.Popen([sys.executable,"-B","-u",str(Path(__file__).with_name("stream002_sink.py")),
-            "compact" if full else "roi",str(ROI_PORT),"--bind",HOST,"--seconds","240","--done-file",str(log/"roi-done")],
+        command = [sys.executable,"-B","-u",str(Path(__file__).with_name("stream002_sink.py")),
+                   "compact" if full else "roi",str(ROI_PORT),"--bind",HOST,"--seconds","240","--done-file",str(log/"roi-done")]
+        if sample:
+            command += ["--sample-file",str(log/"roi-sample.jsonl")]
+        return subprocess.Popen(command,
             stdout=output,stderr=subprocess.STDOUT)
     finally:
         output.close()
@@ -124,9 +127,45 @@ def view_snapshot(receiver, generation):
     return stats
 
 
-def mode_regressions(stand, probe, receiver, log, analysis):
+def check_hold(stand, receiver, log, generation, args):
+    before = view_snapshot(receiver, generation)["hold_k_counts"]
+    held = stand.ssh(f'''set -e; trap 'devmem 0x7c460178 32 0' EXIT
+devmem 0x7c460178 32 2
+usleep 3000
+a=$(devmem 0x7c460180)
+usleep {args.hold_check_ms * 1000}
+b=$(devmem 0x7c460180)
+devmem 0x7c460178 32 0
+usleep 12000
+c=$(devmem 0x7c460180)
+printf '%s %s %s\n' "$a" "$b" "$c"
+''').split()
+    time.sleep(.5)
+    after = view_snapshot(receiver, generation)["hold_k_counts"]
+    counts = {k:n-before.get(k,0) for k,n in after.items() if n>before.get(k,0)}
+    good_epoch = len(held) == 3 and held[0] == held[1] and held[1] != held[2]
+    good_groups = counts.get(args.hold_k,0)>0 and all(1<=k<=args.hold_k for k in counts)
+    if args.hold_k>1:
+        good_groups = good_groups and any(k<args.hold_k for k in counts)
+    stand.write_json(log/"hold-check.json", dict(hold_k=args.hold_k, milliseconds=args.hold_check_ms,
+                    epoch_readback=held, actual_k_counts=counts, pass_check=good_epoch and good_groups))
+    if not good_epoch or not good_groups:
+        raise RuntimeError("antenna hold did not produce the expected epoch and FFT groups")
+
+
+def mode_regressions(stand, probe, receiver, log, analysis, obn5=False):
     scan = dict(SCAN, view_bins=512)
     analysis = dict(analysis, view_bins=1024)
+    if obn5:
+        scan.update(fft_bins=1024, view_bins=256)
+        analysis.update(fft_bins=2048, view_bins=2048)
+        before = stand.ssh("devmem 0x7c460398").strip()
+        for invalid in (0, 1024, 1025, 2047, 1 << 32):
+            probe.command(f"reject-hold-{invalid}", dict(scan, hold_k=invalid))
+            if probe.cases[-1]["http"] != 400:
+                raise RuntimeError(f"invalid hold threshold {invalid} reached the reader")
+        if stand.ssh("devmem 0x7c460398").strip() != before:
+            raise RuntimeError("a rejected hold threshold changed its CSR")
     video = dict(op="video", center_hz=5_865_000_000, width_hz=8_000_000)
     templates = {"scan":scan, "analysis":analysis, "video":video}
     results = []
@@ -157,6 +196,7 @@ def mode_regressions(stand, probe, receiver, log, analysis):
                 else:
                     raise RuntimeError(f"{mode} has no fresh data in generation {gen}")
                 stages.append(dict(mode=mode,generation=gen,records=count,view_bins=active.get("view_bins"),
+                                   fft_bins=active.get("spectrum", {}).get("fft_bins"),
                                    tx=active["tx"],guard_tx=active.get("guard_tx")))
                 previous = gen
         except RuntimeError as error:
@@ -207,7 +247,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
     receiver.fsb1 = args.fsb1 or args.obn5
     if receiver.fsb1:
         receiver.field_stats.update(payload_bytes=0,successes=[])
-    roi_process = launch_roi(log,full) if roi_enabled else None
+    roi_process = launch_roi(log,full,args.obn5 and roi_range is not None) if roi_enabled else None
     halted, ready = threading.Event(), threading.Event()
     lease = threading.Thread(target=lease_loop, args=(halted, ready, log, threading.Event()), daemon=True)
     lease.start()
@@ -235,7 +275,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
             raise RuntimeError(stand.ssh(f"cat {remote}/probe-agent.log"))
         probe.until(lambda s: isinstance(s["actual"].get("catalog"), dict), 100)
         if getattr(args,"regression",False):
-            mode_regressions(stand,probe,receiver,log,analysis)
+            mode_regressions(stand,probe,receiver,log,analysis,args.obn5)
             return
         combinations = [(width, num, k) for width in args.widths for num in fields for k in args.integrations]
         for index, (width, num, k) in enumerate(combinations):
@@ -269,6 +309,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
                                    view_bins=args.roi_view_bins))
             time.sleep(1)
             generation = active["generation"]
+            if args.hold_check_ms:
+                check_hold(stand,receiver,log,generation,args)
             start = time.monotonic()
             snapshots = []
             abort_ether = False

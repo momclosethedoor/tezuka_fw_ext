@@ -24,7 +24,7 @@ def run_joint_cap2(stand, args, log, boot, profiles):
     remote = stand.REMOTE
     stand.upload(args.cap2_probe, remote, "obn5-cap2-run")
     stand.upload(stand.member(args.reader, "obs-ffm1-iio"), remote, "obs-ffm1-iio")
-    stand.ssh(f"cd {remote}; set -e; chmod 700 obn5-cap2-run obs-ffm1-iio; sh ddc4.sh")
+    stand.ssh(f"cd {remote}; set -e; chmod 700 obn5-cap2-run obs-ffm1-iio; sh ddc4.sh; devmem 0x7c460284 32 0")
     for index, mode in enumerate(("cap2-first", "field-first", "field-cancel", "field-mismatch"), 1):
         name = f"joint-{mode}"
         case = log / name
@@ -87,6 +87,7 @@ def main():
     parser.add_argument("--widths", type=int, nargs="+", choices=(0, 128, 256, 512, 1024, 2048, 4096), default=(0,))
     parser.add_argument("--fft-bins", type=int, choices=(1024, 2048, 4096))
     parser.add_argument("--hold-k", type=int, choices=range(1, 1024), metavar="1..1023")
+    parser.add_argument("--hold-check-ms", type=int, choices=(40, 350), help="pulse the antenna hold in a VIEW-only window")
     parser.add_argument("--integrations", type=int, nargs="+", choices=(2, 3), default=(2,),
                         help="spectral accumulation K for managed scan windows")
     parser.add_argument("--obn3-view-only", action="store_true",
@@ -118,6 +119,8 @@ def main():
         parser.error("--obn5-layout-check requires a standalone OBN5 run")
     if args.cap2_probe and (not args.obn5 or args.managed or args.capture_layout or args.obn5_layout_check):
         parser.error("--cap2-probe requires a standalone OBN5 run")
+    if args.hold_check_ms and (not args.obn5 or not args.managed or max(args.field_counts) or not all(args.widths)):
+        parser.error("--hold-check-ms requires an OBN5 managed VIEW-only window")
     if args.obn5 and (args.fsb1 or args.bench_obn3_layout or args.obn3_view_only):
         parser.error("OBN5 uses the native layout and its own RAM image")
     if args.obn5:

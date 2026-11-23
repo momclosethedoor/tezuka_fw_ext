@@ -331,10 +331,10 @@ impl Hardware{
         "previous_active_bytes":length,"previous_view_bytes":view_width,
         "unrecoverable_cold_records":first-initial.released}));
    }
-   if s.committed-initial.released>=2 || start.elapsed()>OBN3_PREFIX_TIMEOUT{
+   if s.committed-initial.released>=2 || start.elapsed()>STREAM_PREFIX_TIMEOUT{
     return Err("could not bind the committed spectrum layout".into());
    }
-   std::thread::sleep(OBN3_PREFIX_POLL);
+   std::thread::sleep(STREAM_PREFIX_POLL);
   }
  }
  fn stream_header_at(&mut self,format:obn3::Format,slot:usize,offset:usize,ordinal:u64)->R<Option<Header>>{
@@ -567,10 +567,8 @@ pub(crate) struct RoiControl<'a>{
 }
 // RAM uses the observed 544-beat displacement. The ABI stride stays 32768 bytes.
 const OBN3_RAM_SHIFT_BYTES:usize=544*8;
-#[cfg(feature="scan-stream-bench")]
-const OBN3_PREFIX_TIMEOUT:Duration=Duration::from_secs(8);
-#[cfg(feature="scan-stream-bench")]
-const OBN3_PREFIX_POLL:Duration=Duration::from_micros(50);
+const STREAM_PREFIX_TIMEOUT:Duration=Duration::from_secs(8);
+const STREAM_PREFIX_POLL:Duration=Duration::from_micros(50);
 pub(crate) struct NextView<'a>{
  pub generation:u64,
  pub version:u32,
@@ -578,11 +576,11 @@ pub(crate) struct NextView<'a>{
  pub anchor:&'a dyn Fn()->Option<u64>,
  pub started:&'a dyn Fn(Header,Execution),
 }
-fn view_idle_wait(k:u32)->Duration {
- // At 61.44 MS/s one group spans K*4096 samples. Check the ring
+fn view_idle_wait(k:u32,bins:usize)->Duration {
+ // At 61.44 MS/s one group spans K*N samples. Check the ring
  // again after at most one eighth of a group (and at most 64 us).
  // This only applies after an empty snapshot, never to a ready prefix.
- Duration::from_micros((u64::from(k)*4096*1_000_000/(8*61_440_000)).min(64))
+ Duration::from_micros((u64::from(k)*bins as u64*1_000_000/(8*61_440_000)).min(64))
 }
 
 fn histogram(h:timing::Histogram)->Value {
@@ -626,7 +624,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   Some(stream)
  }else{None});
  let managed_view_only=io.managed_view_only;
- let empty_wait=if control.is_some(){view_idle_wait(c.k)}else{Duration::ZERO};
+ let empty_wait=if control.is_some(){view_idle_wait(c.k.min(c.hold_k.unwrap_or(c.k)),fft_bins)}else{Duration::ZERO};
  io.idle_wait_us=empty_wait.as_micros() as u64;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
