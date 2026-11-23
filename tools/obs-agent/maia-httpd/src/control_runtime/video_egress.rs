@@ -42,14 +42,16 @@ pub struct Counters {
 }
 
 pub struct Queue {
+    code: u8,
     pending: VecDeque<Packet>,
     buffers: Vec<Vec<u8>>,
     pub counts: Counters,
 }
 
 impl Queue {
-    pub fn new() -> Self {
+    pub fn new(code: u8) -> Self {
         Self {
+            code,
             pending: VecDeque::with_capacity(MAX_FRAMES),
             buffers: Vec::with_capacity(MAX_FRAMES),
             counts: Counters::default(),
@@ -80,8 +82,8 @@ impl Queue {
         buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         let pos = self.counts.packed_bytes;
         let seq = self.counts.packed_frames as u32;
-        write!(buffer, "{{\"generation\":{generation},\"pos\":{pos},\"seq\":{seq},\"code\":24,\"g\":1,\"reset\":{}}}",
-            self.counts.packed_frames == 0)?;
+        write!(buffer, "{{\"generation\":{generation},\"pos\":{pos},\"seq\":{seq},\"code\":{},\"g\":0,\"reset\":{}}}",
+            self.code, self.counts.packed_frames == 0)?;
         let meta = (buffer.len() - 12) as u32;
         buffer[4..8].copy_from_slice(&meta.to_le_bytes());
         buffer.extend_from_slice(payload);
@@ -158,7 +160,7 @@ mod tests {
 
     #[test]
     fn partial_writes_do_not_change_position_or_order() {
-        let mut q = Queue::new();
+        let mut q = Queue::new(24);
         q.push(9, &[1; 20], Instant::now()).unwrap();
         q.push(9, &[2; 12], Instant::now()).unwrap();
         let mut socket = Partial { blocked: false, result: Vec::new() };
@@ -179,7 +181,7 @@ mod tests {
 
     #[test]
     fn saturation_is_reported_without_eviction() {
-        let mut q = Queue::new();
+        let mut q = Queue::new(24);
         for _ in 0..MAX_FRAMES {
             q.push(3, &[9; 64], Instant::now()).unwrap();
         }

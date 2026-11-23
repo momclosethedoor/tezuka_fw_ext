@@ -1,11 +1,11 @@
-//! Bench-only compact zoom transport. It never owns RF or a DMA slot.
+//! Bounded compact zoom transport. It never owns RF or a DMA slot.
 use super::{Header, R, RoiRequest as Request, Value, histogram, obn3, roi, timing::Histogram};
 use serde_json::json;
 use std::{
     collections::VecDeque,
     io::{self, Write},
-    net::{SocketAddr, TcpStream},
-    os::fd::AsRawFd,
+    net::{SocketAddr, SocketAddrV4, TcpStream},
+    os::fd::{AsRawFd, FromRawFd},
     ops::Range,
     time::{Duration, Instant},
 };
@@ -68,6 +68,10 @@ struct Packet {
 }
 
 pub(super) struct Stream {
+    peer: SocketAddr,
+    production: bool,
+    connecting: bool,
+    retry_at: Instant,
     full_scan: bool,
     configured_view_bins: u16,
     source_bins: u16,
@@ -100,12 +104,17 @@ pub(super) struct Stream {
 
 impl Stream {
     pub(super) fn open(peer: SocketAddr, initial: Map, next: Option<Map>,
-                       full_scan: bool, configured_view_bins: usize, fft_bins: usize, obn5: bool) -> R<Self> {
-        let socket=TcpStream::connect_timeout(&peer,IO_DEADLINE).map_err(|e|e.to_string())?;
-        socket.set_nonblocking(true).map_err(|e|e.to_string())?;
-        Ok(Self{full_scan,configured_view_bins:configured_view_bins as u16,source_bins:fft_bins as u16,
+                       full_scan: bool, configured_view_bins: usize, fft_bins: usize, obn5: bool,
+                       production: bool) -> R<Self> {
+        let socket=if production {None} else {
+            let socket=TcpStream::connect_timeout(&peer,IO_DEADLINE).map_err(|e|e.to_string())?;
+            socket.set_nonblocking(true).map_err(|e|e.to_string())?;
+            Some(socket)
+        };
+        Ok(Self{peer,production,connecting:false,retry_at:Instant::now(),
+            full_scan,configured_view_bins:configured_view_bins as u16,source_bins:fft_bins as u16,
             fft_bins:fft_bins as u16,obn5,
-            request:None,initial,next,socket:Some(socket),
+            request:None,initial,next,socket,
             free:(0..CAPACITY).map(|_|Vec::with_capacity(FRAME_LIMIT)).collect(),
             pending:VecDeque::with_capacity(CAPACITY),selected:0,selected_bins:0,prepared:0,
             sent:0,sent_bins:0,sent_bytes:0,accepted_bytes:0,rejected:0,abandoned:0,partial:0,
@@ -121,7 +130,9 @@ impl Stream {
                 if request.legacy_full_record && self.fft_bins!=4096 {
                     return Err("legacy ROI requires FFT4096".into());
                 }
-                self.source_bins=if request.view_bins==self.configured_view_bins {
+                self.source_bins=if self.production {
+                    request.view_bins.min(self.fft_bins)
+                } else if request.view_bins==self.configured_view_bins {
                     self.configured_view_bins
                 } else { self.fft_bins };
                 self.initial.select(request,self.source_bins,self.fft_bins)?;
@@ -146,6 +157,7 @@ impl Stream {
 
     pub(super) fn keeps_record(&self, h: Header, anchor: u64, next_anchor: Option<u64>) -> bool {
         if self.obn5 && !self.full_scan && self.request.is_none() { return false; }
+        if self.production && (self.socket.is_none() || self.connecting) { return false; }
         if self.full_scan || !self.filters_view() { return true; }
         Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor).is_some_and(|(map,_,relative)| {
             map.rows[(relative%map.rows.len() as u64) as usize].as_ref().is_some_and(|row| !row.bins.is_empty())
@@ -174,10 +186,12 @@ impl Stream {
         if self.socket.is_none() {self.rejected+=1;return Ok(());}
         let Some(mut frame)=self.free.pop() else { self.rejected+=1;return Ok(()); };
         frame.clear();
-        let (payload, word_bytes)=if self.source_bins==self.fft_bins {
+        let reduction = self.production && self.source_bins < self.fft_bins;
+        let (payload, word_bytes)=if self.source_bins==self.fft_bins || reduction && self.configured_view_bins < self.source_bins {
             (&raw[obn3::COMPACT_PREFIX_BYTES..],obn3::M45E3_WORD_BYTES)
         } else { (view,1) };
-        if payload.len()!=usize::from(self.source_bins)*word_bytes {
+        let input_bins = if word_bytes == 1 { self.configured_view_bins } else {self.fft_bins};
+        if payload.len()!=usize::from(input_bins)*word_bytes {
             return Err("ROI source payload differs from its bin grid".into());
         }
         let wire_bytes=if request.legacy_full_record {
@@ -185,7 +199,7 @@ impl Stream {
             raw.len()
         } else {
             frame.extend_from_slice(b"GROI2\0\0\0");
-            bins as usize*word_bytes
+            bins as usize*if reduction {1} else {word_bytes}
         };
         frame.extend_from_slice(&(wire_bytes as u32).to_le_bytes());
         frame.extend_from_slice(&(row.bins.len() as u16).to_le_bytes());
@@ -213,7 +227,15 @@ impl Stream {
         } else {
             frame.extend_from_slice(&raw[..obn3::COMPACT_PREFIX_BYTES]);
             for range in &row.bins {
-                frame.extend_from_slice(&payload[usize::from(range.start)*word_bytes..usize::from(range.end)*word_bytes]);
+                let stride = usize::from(input_bins / self.source_bins) * word_bytes;
+                let selected = &payload[usize::from(range.start)*stride..usize::from(range.end)*stride];
+                if reduction {
+                    frame.extend(selected.chunks_exact(stride).map(|group|
+                        if word_bytes == 1 { *group.iter().max().unwrap() }
+                        else { group.chunks_exact(6).map(compact_code).max().unwrap() }));
+                } else {
+                    frame.extend_from_slice(selected);
+                }
             }
         }
         self.enqueue(frame,bins);
@@ -248,6 +270,24 @@ impl Stream {
     }
 
     pub(super) fn pump(&mut self) {
+        if self.production && self.request.is_some() {
+            if self.socket.is_none() && Instant::now() >= self.retry_at {
+                self.retry_at=Instant::now()+Duration::from_millis(250);
+                if let SocketAddr::V4(peer)=self.peer && let Ok(socket)=connect_nonblocking(peer) {
+                    self.socket=Some(socket);
+                    self.connecting=true;
+                }
+            }
+            if self.connecting {
+                let socket=self.socket.as_ref().unwrap();
+                if socket.take_error().is_ok_and(|error| error.is_none()) {
+                    if socket.peer_addr().is_err() { return; }
+                    self.connecting=false;
+                } else {
+                    self.close();
+                }
+            }
+        }
         let (Some(socket),Some(frame))=(self.socket.as_mut(),self.pending.front_mut()) else {return;};
         let now=Instant::now();
         if now.duration_since(frame.ready)>IO_DEADLINE { self.close();return; }
@@ -275,6 +315,7 @@ impl Stream {
 
     pub(super) fn close(&mut self) {
         self.socket.take();
+        self.connecting=false;
         self.partial+=u64::from(self.pending.front().is_some_and(|packet|packet.offset!=0));
         self.abandoned+=self.pending.len() as u64;
         self.free.extend(self.pending.drain(..).map(|p|p.bytes));
@@ -298,4 +339,31 @@ impl Stream {
             "socket_pending_bytes":socket_pending,"send_ns":histogram(self.send),
             "queue_ns":histogram(self.queue),"ready_to_api_complete_ns":histogram(self.ready)})
     }
+}
+
+fn compact_code(word: &[u8]) -> u8 {
+    let mut bytes = [0u8; 8];
+    bytes[..6].copy_from_slice(word);
+    let value = u64::from_le_bytes(bytes);
+    let mantissa = value & ((1u64 << 45) - 1);
+    if mantissa == 0 { 0 } else { (64 - mantissa.leading_zeros() + 2 * (value >> 45) as u32) as u8 }
+}
+
+fn connect_nonblocking(peer: SocketAddrV4) -> io::Result<TcpStream> {
+    let fd=unsafe { libc::socket(libc::AF_INET,libc::SOCK_STREAM|libc::SOCK_NONBLOCK|libc::SOCK_CLOEXEC,0) };
+    if fd < 0 { return Err(io::Error::last_os_error()); }
+    let socket=unsafe { TcpStream::from_raw_fd(fd) };
+    let address=libc::sockaddr_in {
+        sin_family:libc::AF_INET as libc::sa_family_t,
+        sin_port:peer.port().to_be(),
+        sin_addr:libc::in_addr{s_addr:u32::from_ne_bytes(peer.ip().octets())},
+        sin_zero:[0; 8],
+    };
+    let result=unsafe { libc::connect(fd,(&address as *const libc::sockaddr_in).cast(),
+        std::mem::size_of_val(&address) as libc::socklen_t) };
+    if result != 0 {
+        let error=io::Error::last_os_error();
+        if error.raw_os_error()!=Some(libc::EINPROGRESS) {return Err(error);}
+    }
+    Ok(socket)
 }

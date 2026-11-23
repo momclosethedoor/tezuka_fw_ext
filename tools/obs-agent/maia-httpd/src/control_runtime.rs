@@ -9,6 +9,7 @@ mod mixer_math;
 mod plan_math;
 mod tx;
 mod video_egress;
+mod video_profile;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
@@ -69,6 +70,8 @@ struct Config {
     field_preview: Option<field::Config>,
     #[serde(default)]
     resident_field: Option<resident_field::Config>,
+    #[serde(default)]
+    roi: Option<SocketAddr>,
     #[serde(default)]
     bench_roi: Option<SocketAddr>,
     #[serde(default)]
@@ -396,7 +399,7 @@ fn validate(v: &Value) -> Result<()> {
                 if v["op"] == "video" {
                     12_000_000
                 } else {
-                    48_000_000
+                    56_000_000
                 },
             )?;
             if v["op"] == "analysis" {
@@ -490,14 +493,18 @@ async fn submit(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
     }
     if cmd["op"]=="roi" {
-        if !cfg!(feature="scan-stream-bench") || q.capabilities["bench_roi"]!=true || q.actual["mode"]!="scan" || q.actual["running"]!=true {
-            return (StatusCode::CONFLICT, Json(json!({"error":"active bench ROI scan required"})));
+        let bench = cfg!(feature="scan-stream-bench") && q.capabilities["bench_roi"]==true;
+        if (!bench && q.capabilities["roi"]!=true) || q.actual["mode"]!="scan" || q.actual["running"]!=true {
+            return (StatusCode::CONFLICT, Json(json!({"error":"active ROI scan required"})));
         }
         if q.roi_id != *id {
             let generation=q.roi_generation+1;
             let Ok(request)=roi_request(&cmd,generation) else {
                 return (StatusCode::BAD_REQUEST,Json(json!({"error":"invalid ROI configuration"})));
             };
+            if !bench && request.is_some_and(|r|r.legacy_full_record) {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":"ROI requires explicit RF limits and bin count"})));
+            }
             if q.actual["view_bins"]!=0 && request.is_some_and(|r|r.legacy_full_record) {
                 return (StatusCode::CONFLICT,Json(json!({"error":"full-record ROI requires VIEW OFF"})));
             }
@@ -509,6 +516,12 @@ async fn submit(
             q.roi_id=id.clone();
         }
         return (StatusCode::ACCEPTED,Json(json!({"accepted_id":id,"roi_generation":q.roi_generation})));
+    }
+    if cmd["op"]=="analysis" && cmd["width_hz"].as_u64()>q.capabilities["analysis_max_width_hz"].as_u64() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"analysis width exceeds the spectral ABI limit"})));
+    }
+    if cmd["op"]=="video" && let Err(error)=video_profile::Profile::parse(&cmd,q.capabilities["video_profiles"]==true) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()})));
     }
     if q.applied_id == *id
         || q.failed_id == *id
@@ -1190,7 +1203,7 @@ fn tune(state: &mut Value) -> Result<()> {
     let video = state["mode"] == "video";
     let settings = &state[if video { "video" } else { "analysis" }];
     let center = int(settings, "center_hz", 70_000_000, 18_000_000_000)?;
-    let width = int(settings, "width_hz", 120_000, 48_000_000)?;
+    let width = int(settings, "width_hz", 120_000, 56_000_000)?;
     let mixer = state["route"]["kind"] == "mixer";
     let side = state["route"]["side"].as_i64().unwrap_or(1);
     let offset = if mixer {
@@ -1274,13 +1287,14 @@ fn continuous(
     state: &Value,
     id: &Value,
     regs: &Registers,
+    profile: &video_profile::Profile,
 ) -> Result<()> {
     ensure!(
         regs.read(0x64) == 16 && regs.read(0x1e0) == 0 && regs.read(0x284) == 0,
         "video needs STOP/DRAINED and released DDC"
     );
     let generation = state["generation"].as_u64().unwrap();
-    let mut queue = video_egress::Queue::new();
+    let mut queue = video_egress::Queue::new(profile.code);
     shared.inbox.lock().unwrap().metrics = video_counters(generation, &queue, false, None);
     // Connect before admitting samples. A slow or absent receiver cannot fill
     // IIO during connection setup.
@@ -1296,11 +1310,14 @@ fn continuous(
         }
     };
     let saved = [regs.read(0x30), regs.read(0x38), regs.read(0x40)];
+    if profile.division == 2 {
+        video_profile::select_ddc2(regs)?;
+    }
     let nco = state["ddc_hz"].as_i64().unwrap();
     let phase = ((nco * (1i64 << 28)) / FS as i64) as u32 & 0x0fff_ffff;
     regs.write(0x30, phase);
+    regs.write(0x40, profile.control);
     regs.write(0x38, 1);
-    regs.write(0x40, 24);
     let mut reader = Command::new("iio_readdev");
     reader
         .args(["-b", "8192", "cf-ad9361-lpc", "voltage0", "voltage1"])
@@ -1310,6 +1327,7 @@ fn continuous(
     let result = match reader.spawn() {
         Ok(mut child) => {
             let result = (|| {
+                ensure!(regs.read(0x40)&0x17f == profile.control, "video settings readback mismatch");
                 let mut stdout = child
                     .stdout
                     .take()
@@ -1383,6 +1401,9 @@ fn continuous(
                         } else {
                             "waiting_first_read"
                         });
+                        let video_status=regs.read(0x44);
+                        stats["video_sync"]=json!({"locked":video_status&8!=0,"polarity":if video_status&4==0{"negative"}else{"positive"},
+                            "flushing":video_status&16!=0,"overrun":video_status&64!=0,"marks_per_s":regs.read(0x48)&0x3ffff});
                         shared.inbox.lock().unwrap().metrics = stats;
                         status_due = now;
                     }
@@ -1407,11 +1428,17 @@ fn continuous(
         Err(e) => (Err(e.into()), Ok(())),
     };
     regs.write(0x38, 0);
+    if profile.division == 2 {
+        video_profile::restore_ddc4(regs);
+    }
     regs.write(0x30, saved[0]);
     regs.write(0x40, saved[2]);
     regs.write(0x38, saved[1]);
     let (result, cleanup) = result;
     let cleanup = cleanup.and_then(|()| {
+        if profile.division == 2 {
+            ensure!(regs.read(0x2c)==4, "DDC4 restore readback mismatch");
+        }
         let deadline = Instant::now() + Duration::from_millis(500);
         while capture_enabled()? {
             ensure!(Instant::now() < deadline, "IIO buffer remained enabled after real8 cleanup");
@@ -1545,6 +1572,7 @@ fn worker(
         pending["if_hz"] = Value::Null;
         pending["ddc_hz"] = Value::Null;
         pending["ddc_fs_hz"] = Value::Null;
+        pending["video_format"] = Value::Null;
         pending["waiting"] = Value::Null;
         pending["guard_tx"] = Value::Null;
         pending["bank_apply"] = Value::Null;
@@ -1566,7 +1594,7 @@ fn worker(
                         "PL timing fixture accepts v2 scan commands only");
             }
             ensure!(
-                previous_mode != "video" || matches!(op, "return" | "tx" | "scan"),
+                previous_mode != "video" || matches!(op, "return" | "tx" | "scan" | "video"),
                 "close video before changing mode"
             );
             match op {
@@ -1665,7 +1693,9 @@ fn worker(
                     pending[op] = request;
                 }
                 "video" => {
-                    pending["return_mode"] = previous_mode.clone();
+                    if previous_mode != "video" {
+                        pending["return_mode"] = previous_mode.clone();
+                    }
                     pending["mode"] = json!("video");
                     pending["video"] = request;
                 }
@@ -1762,7 +1792,9 @@ fn worker(
                 return Ok(None);
             }
             if mode == "video" {
-                pending["ddc_fs_hz"] = json!(FS / 4);
+                let profile=video_profile::Profile::parse(&pending["video"],regs.read(0x50)==0x354e424f)?;
+                pending["ddc_fs_hz"] = json!(profile.rate);
+                pending["video_format"] = profile.actual();
             }
             if mode == "scan" {
                 if pending["running"] != true {
@@ -1815,7 +1847,9 @@ fn worker(
                 } else {
                     None
                 };
-                return continuous(&c, &shared, &actual.borrow(), id, &regs);
+                let a=actual.borrow();
+                let profile=video_profile::Profile::parse(&a["video"],regs.read(0x50)==0x354e424f)?;
+                return continuous(&c, &shared, &a, id, &regs, &profile);
             }
             let mut sweep = None;
             let mut next_spectrum = None;
@@ -2082,6 +2116,9 @@ fn worker(
                 a["dma_run"]=json!(execution.run);
                 a["scan"]["ranges"]=s["requested_ranges"].clone();
                 a["scan"].as_object_mut().unwrap().remove("next_ranges");
+                if let Some(watch)=a["field_watch"].get_mut("next") {
+                    a["field_watch"]=watch.take();
+                }
                 a["spectrum"]=s;
                 a["prepared_next_version"]=Value::Null;
                 a["tx"]["on"]=Value::Null;
@@ -2127,10 +2164,8 @@ fn worker(
                 )
             };
             let last_renew = std::cell::Cell::new(Instant::now());
-            #[cfg(feature="scan-stream-bench")]
             let roi_request=||shared.inbox.lock().unwrap().roi;
-            #[cfg(feature="scan-stream-bench")]
-            let roi=if let Some(peer)=c.bench_roi.filter(|_| scan && (obn5 || !c.bench_full_compact_tcp || mode_index == 0)) {
+            let roi=if let Some(peer)=c.roi.or(c.bench_roi).filter(|_| scan && (obn5 || !c.bench_full_compact_tcp || mode_index == 0)) {
                 let a=actual.borrow();
                 let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
                     .map_err(anyhow::Error::msg)?;
@@ -2138,7 +2173,7 @@ fn worker(
                     crate::system_reader::RoiMap::from_descriptor(desc,version,next_gen)).transpose()
                     .map_err(anyhow::Error::msg)?;
                 Some(crate::system_reader::RoiControl{peer,initial,next,request:&roi_request,
-                    full_scan:c.bench_full_compact_tcp})
+                    full_scan:c.bench_full_compact_tcp, production:c.roi.is_some()})
             }else{None};
             let q = crate::system_reader::RunControl {
                 generation,
@@ -2166,7 +2201,6 @@ fn worker(
                 stalled: &|sample| *stall_sample.borrow_mut()=sample,
                 bench_stall: scan && std::mem::take(&mut bench_stall),
                 bench_stall_after_next,
-                #[cfg(feature="scan-stream-bench")]
                 roi,
                 sweep: sweep.as_ref(),
                 next: next_sweep.as_ref().zip(next_version).map(|(s,version)|crate::system_reader::NextView {
@@ -2439,6 +2473,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     ensure!(!c.bench_obn3_view_only || c.bench_roi.is_none(),
         "OBN3 view-only bench configuration excludes compact delivery");
     ensure!(!c.bench_full_compact_tcp || c.bench_roi.is_some(),"full compact TCP requires a bench destination");
+    ensure!(c.roi.is_none() || c.bench_roi.is_none(), "configure one ROI destination");
+    ensure!(c.roi.is_none_or(|peer| peer.is_ipv4()), "ROI destination must be IPv4");
     let catalog_policy = c.scan["planner_version"] == 2 && c.scan["catalog_on_boot"] != false
         && c.external_mixer.is_none();
     if let Some(preview) = &c.field_preview {
@@ -2548,6 +2584,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     ensure!(!stream002 || c.field_preview.is_none(), "legacy FIELD1 collector requires OBN2");
     ensure!(stream002 || c.resident_field.is_none(), "resident FIELD collector requires OBN3/FLD2/FFM1");
     ensure!(stream002 || c.bench_roi.is_none(),"bench ROI requires OBN3");
+    ensure!(obn5 || c.roi.is_none(),"production ROI requires OBN5");
     ensure!(
         regs.read(0x64) == 16
             && regs.read(0x1e0) == 0
@@ -2631,6 +2668,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
+        "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
+        "roi":c.roi.is_some(),"resident_field":c.resident_field.is_some(),"video_profiles":obn5,
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
@@ -2747,6 +2786,7 @@ mod tests {
             field_preview: None,
             resident_field: None,
             bench_roi: None,
+            roi: None,
             bench_full_compact_tcp: false,
         };
         let input = json!({"scan":{"ranges":[

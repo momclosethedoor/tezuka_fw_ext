@@ -6,12 +6,9 @@ mod view_batch;
 mod sweep_delivery;
 mod progress;
 mod obn3;
-#[cfg(feature="scan-stream-bench")]
 mod roi;
-#[cfg(feature="scan-stream-bench")]
 mod roi_stream;
 mod timing;
-#[cfg(feature="scan-stream-bench")]
 pub(crate) use roi_stream::Map as RoiMap;
 pub(crate) const LEGACY_ROI_WIDTH_HZ:i64=56_000_000;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -554,13 +551,11 @@ pub(crate) struct RunControl<'a>{
  pub bench_stall_after_next:bool,
  pub sweep:Option<&'a SweepSpec>,
  pub next:Option<NextView<'a>>,
- #[cfg(feature="scan-stream-bench")]
  pub roi:Option<RoiControl<'a>>,
 }
-#[cfg(feature="scan-stream-bench")]
 pub(crate) struct RoiControl<'a>{
  pub peer:std::net::SocketAddr,
- pub full_scan:bool,
+ pub full_scan:bool,pub production:bool,
  pub initial:RoiMap,
  pub next:Option<RoiMap>,
  pub request:&'a dyn Fn()->Option<RoiRequest>,
@@ -603,23 +598,15 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let obn5=matches!(io.stream_format,Some(obn3::Format::Obn5(_)));
  let fft_bins=if obn5 {obn3::Format::obn5_config(c.stream_config.unwrap_or(0))?.bins()} else {continuous::BINS};
  let wire_view_bins=view::mode_bins(fft_bins,c.mode);
- #[cfg(feature="scan-stream-bench")]
  let stream002=io.stream_format.is_some();
- #[cfg(feature="scan-stream-bench")]
  let roi_control=control.and_then(|q|q.roi.as_ref());
- if obn5 && control.is_some() {
-  #[cfg(feature="scan-stream-bench")]
-  {io.managed_view_only=roi_control.is_none();}
-  #[cfg(not(feature="scan-stream-bench"))]
-  {io.managed_view_only=true;}
- }
- #[cfg(feature="scan-stream-bench")]
+ if obn5 && control.is_some() { io.managed_view_only=roi_control.is_none(); }
  let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
   if !c.scan || !stream002 || (config.full_scan && c.mode != 0 && !obn5) {
    return Err("ROI requires an active compact scan; parallel full TCP and VIEW require OBN5".into());
   }
   let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),
-   config.full_scan,wire_view_bins,fft_bins,obn5)?;
+   config.full_scan,wire_view_bins,fft_bins,obn5,config.production)?;
   stream.update((config.request)())?;
   Some(stream)
  }else{None});
@@ -677,32 +664,22 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut progress=progress::Progress::new(c.k,c.scan,c.settling,if c.managed_tx{io.r(0x330)}else{0});
  let mut sampled_execution=None;
   let next_for_record=||control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)());
-  #[cfg(feature="scan-stream-bench")]
-  let roi_header_filter=obn5 || std::env::var_os("OBS_ROI_HEADER_FILTER").is_some_and(|v|v=="1");
-  #[cfg(feature="scan-stream-bench")]
+  let roi_header_filter=obn5 || (cfg!(feature="scan-stream-bench")
+    && std::env::var_os("OBS_ROI_HEADER_FILTER").is_some_and(|v|v=="1"));
   let filter_anchor=std::cell::Cell::new(None);
-  #[cfg(feature="scan-stream-bench")]
   let mut keep=|h:Header|{
    let next=next_for_record();
    filter_anchor.set(Some(next));
    zoom.borrow().as_ref().is_none_or(|stream|stream.keeps_record(h,initial_anchor,next))
   };
  let mut sink=|h:Header,overview:&[u8],_owned_full:&[u8]|->R<()>{
-   #[cfg(feature="scan-stream-bench")]
    let filtered=filter_anchor.take();
-   #[cfg(feature="scan-stream-bench")]
    let header_only=filtered.is_some() && _owned_full.is_empty();
-   #[cfg(not(feature="scan-stream-bench"))]
-   let header_only=false;
-   #[cfg(feature="scan-stream-bench")]
    let next_at=filtered.unwrap_or_else(&next_for_record);
-   #[cfg(not(feature="scan-stream-bench"))]
-   let next_at=next_for_record();
-  #[cfg(feature="scan-stream-bench")]
-  if let Some(zoom)=zoom.borrow_mut().as_mut(){
+   if let Some(zoom)=zoom.borrow_mut().as_mut(){
     if !header_only {zoom.prepare(h,_owned_full,overview,initial_anchor,next_at)?;}
-   zoom.pump();
-  }
+    zoom.pump();
+   }
   if let Some(q)=control {
     let view_bytes=if header_only{view::view_len(h)}else{overview.len()};
     if view_bytes!=wire_view_bins{return Err("delivery VIEW geometry differs from active descriptor".into())}
@@ -724,7 +701,6 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     execution.set(Some(e));
     (next.started)(h,e);
    }
-  #[cfg(feature="scan-stream-bench")]
   let overview=if !obn5 && zoom.borrow().as_ref().is_some_and(roi_stream::Stream::filters_view){
     if view::view_len(h)!=0{network.borrow_mut().suppressed+=1;}
    &[][..]
@@ -741,8 +717,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if c.trace_limit!=0{if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}}Ok(())
  };
   let mut service=|reader:&mut view::PairReader,io:&mut Hardware|{
-   #[cfg(feature="scan-stream-bench")]
-   if roi_header_filter && (obn5 || io.stream_format==Some(obn3::Format::Compact))
+    if roi_header_filter && (obn5 || io.stream_format==Some(obn3::Format::Compact))
        && zoom.borrow().as_ref().is_some_and(|stream|obn5||stream.filters_view()) {
     return reader.service_filtered(io,Some(&mut keep),full_read_without_sum,&mut sink);
    }
@@ -756,8 +731,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
-   #[cfg(feature="scan-stream-bench")]
-   if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){
+    if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){
     let filtering=zoom.filters_view();
     zoom.update((config.request)())?;
     if !obn5 && !filtering && zoom.filters_view(){network.borrow_mut().suppress_pending();}
@@ -776,14 +750,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
      v["observed_to_payload"]=histogram(reader.observed_to_payload);
      v["release"]=histogram(reader.release);
     }
-    #[cfg(feature="scan-stream-bench")]
-    {v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);}
+      {v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);}
     *STATUS.lock().unwrap()=v;
    }status_due=Instant::now();
   }
   let t=Instant::now();max_poll_us=max_poll_us.max(t.duration_since(last_poll).as_micros()as u64);last_poll=t;
   let s=service(&mut reader,&mut io)?;
-  #[cfg(feature="scan-stream-bench")]
   if let Some(zoom)=zoom.borrow_mut().as_mut(){zoom.pump();}
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
@@ -809,7 +781,6 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }else{net.flush(sock);}
   }
   if drained{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
- #[cfg(feature="scan-stream-bench")]
  if let Some(zoom)=zoom.borrow_mut().as_mut(){
   let deadline=Instant::now()+Duration::from_secs(1);
   while zoom.pending() && Instant::now()<deadline {
@@ -825,7 +796,6 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    v["observed_to_payload"]=histogram(reader.observed_to_payload);
    v["release"]=histogram(reader.release);
   }
-  #[cfg(feature="scan-stream-bench")]
   {v["roi"]=zoom.borrow().as_ref().map_or(Value::Null,roi_stream::Stream::stats);}
   *STATUS.lock().unwrap()=v;
  }
