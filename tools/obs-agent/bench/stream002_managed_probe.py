@@ -117,6 +117,11 @@ def summary(status):
     return dict(phase=status["phase"], error=status["error"], field_error=field_watch.get("error"),
                 generation=status["actual"]["generation"], progress=status["progress"], reader=reader)
 
+def view_snapshot(receiver, generation):
+    stats = dict(receiver.view_stats(generation))
+    stats["actual_k_counts"] = dict(stats["actual_k_counts"])
+    return stats
+
 
 def mode_regressions(stand, probe, receiver, log, analysis):
     scan = dict(SCAN, view_bins=512)
@@ -264,7 +269,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
             snapshots = []
             abort_ether = False
             arm_begin = stand.ssh(ARM_COUNTERS)
-            host_begin = dict(receiver.view_stats(generation))
+            host_begin = view_snapshot(receiver, generation)
             while time.monotonic()-start < args.seconds:
                 sample = probe.request()
                 snapshots.append(summary(sample))
@@ -275,7 +280,7 @@ test "$(devmem 0x7c460284)" = 0x00000000
                     break
                 target = start+len(snapshots)
                 time.sleep(max(0,target-time.monotonic()))
-            host_end = dict(receiver.view_stats(generation))
+            host_end = view_snapshot(receiver, generation)
             elapsed = time.monotonic()-start
             arm_end = stand.ssh(ARM_COUNTERS)
             row = dict(view=width, field=num, k=k, seconds=elapsed, generation=generation, samples=snapshots,

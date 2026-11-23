@@ -138,6 +138,8 @@ class Receiver(Sinks):
                     stats["last_host_ns"] = now
                     stats["last_tick"] = tick
                     stats["received"] += 1
+                    actual_k_counts = stats["actual_k_counts"]
+                    actual_k_counts[k] = actual_k_counts.get(k, 0) + 1
                     stats["view_wire_bytes"] += record
             else:
                 self.malformed_udp += 1
@@ -145,7 +147,7 @@ class Receiver(Sinks):
     def view_stats(self, generation):
         return self.views.setdefault(generation, dict(received=0, gaps=0, reordered=0, A=0, B=0,
             expected=0, observed=0, sender_drops=0, partial_notes=0, view_wire_bytes=0, sweep_wire_bytes=0,
-            last_pass_id=None, pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None))
+            last_pass_id=None, pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None, actual_k_counts={}))
 
     def real8(self, conn):
         from sdr.source.field1_stream import Field1Stream
