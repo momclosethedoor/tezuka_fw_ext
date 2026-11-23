@@ -217,7 +217,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
                 time.sleep(.05)
         dmac_trace = "OBS_FSB1_DMAC_TRACE=1 " if args.fsb1_dmac_trace else ""
         iio_depth = f"OBS_FSB1_IIO_BUFFERS={args.fsb1_iio_buffers} " if args.fsb1_iio_buffers != 4 else ""
-        stand.ssh(f"cd {remote}; (OBS_PHASE_TIMING=1 OBS_FFM1_TRACE=1 {dmac_trace}{iio_depth}timeout 270 ./maia-delivery --system-control owner.json "
+        capture = f"OBS_FSB1_CAPTURE_WORKER={args.fsb1_capture_worker} " if args.fsb1_capture_worker else ""
+        stand.ssh(f"cd {remote}; (OBS_PHASE_TIMING=1 OBS_FFM1_TRACE=1 {dmac_trace}{iio_depth}{capture}timeout 270 ./maia-delivery --system-control owner.json "
                   "--listen 0.0.0.0:18080 </dev/null >probe-agent.log 2>&1 &)")
         time.sleep(.3)
         if not stand.ssh("pidof maia-delivery || true").strip():

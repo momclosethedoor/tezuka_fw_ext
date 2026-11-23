@@ -58,10 +58,10 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == build/pl-field-stream-001 ]]; then
             mkdir agent-artifact
             arm_cc=output/nano/host/bin/arm-linux-gcc
-            "$arm_cc" -O2 -Wall -Wextra -Werror -DOBS_SCAN_STREAM_BENCH tools/obs-guard/obs-ffm1-iio.c -ldl -o agent-artifact/obs-ffm1-iio
+            "$arm_cc" -O2 -Wall -Wextra -Werror -DOBS_SCAN_STREAM_BENCH tools/obs-guard/obs-ffm1-iio.c -pthread -ldl -o agent-artifact/obs-ffm1-iio
             "$arm_cc" -O2 -Wall -Wextra -Werror -fsyntax-only tools/obs-guard/obs-ffm1-iio.c
             output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/obs-ffm1-iio > agent-artifact/elf.txt
-            sha256sum tools/obs-guard/obs-ffm1-iio.c tools/obs-guard/obs-field-{egress,preview}.h tools/obs-guard/obs-fsb1-stream.h > agent-artifact/source-sha256.txt
+            sha256sum tools/obs-guard/obs-ffm1-iio.c tools/obs-guard/obs-field-{capture,egress,preview}.h tools/obs-guard/obs-fsb1-stream.h > agent-artifact/source-sha256.txt
             cd agent-artifact
             sha256sum obs-ffm1-iio elf.txt source-sha256.txt > SHA256SUMS
             exit 0
@@ -92,7 +92,7 @@ jobs:
           mkdir agent-artifact
           cp tools/obs-agent/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd agent-artifact/
           $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -ldl -o agent-artifact/obs-field1
-          $OPENBLAS_CC -O2 -Wall -Wextra -Werror "${ffm_args[@]}" tools/obs-guard/obs-ffm1-iio.c -ldl -o agent-artifact/obs-ffm1-iio
+          $OPENBLAS_CC -O2 -Wall -Wextra -Werror "${ffm_args[@]}" tools/obs-guard/obs-ffm1-iio.c -pthread -ldl -o agent-artifact/obs-ffm1-iio
           output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
           if [[ ${#bench_args[@]} -ne 0 ]]; then
             cargo +1.94.0 check --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd

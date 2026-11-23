@@ -19,7 +19,10 @@
 #include <unistd.h>
 #ifdef OBS_SCAN_STREAM_BENCH
 #include <sys/resource.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
 #endif
+#include <stdatomic.h>
 #include "obs-field-preview.h"
 #include "obs-stream-002.h"
 #include "obs-watch-policy.h"
@@ -31,7 +34,8 @@ enum { FFM_ID=OBS_FFM1_ID_REG, SESSION=OBS_FFM1_SESSION, POP=OBS_FFM1_POP, LEVEL
        FFM_LEVEL_COUNT=0x1ffu, FFM_HEAD_AVAILABLE=1u<<16,
        BLOCK=262144, FIELD_MAX=337924, IIO_BLOCKS=4,
        HISTORY_BLOCKS=3, RETAIN=HISTORY_BLOCKS*BLOCK };
-static volatile sig_atomic_t stopping;
+_Static_assert(ATOMIC_INT_LOCK_FREE==2,"signal flag requires a lock-free atomic");
+static _Atomic sig_atomic_t stopping;
 static void stop_session(int sig) { (void)sig; stopping=1; }
 static double monotonic(void)
 {
@@ -344,6 +348,11 @@ static void quiesce_source(volatile uint32_t *reg, const char *reason, ssize_t i
     if(dmac.reg) dmac_dump(&dmac,&fault);
 #endif
 }
+
+#ifdef OBS_SCAN_STREAM_BENCH
+#include "obs-field-capture.h"
+#endif
+
 static struct observation get_head(volatile uint32_t *reg)
 {
     uint32_t words[6];
@@ -406,15 +415,22 @@ int main(int argc,char **argv)
     void *lib=NULL,*context=NULL,*buffer=NULL;
     struct iio_api io={0};
     struct iio_blocks blocks={.count=IIO_BLOCKS};
+#ifdef OBS_SCAN_STREAM_BENCH
+    struct field_capture capture={.wake=-1};
+    const char *capture_mode=getenv("OBS_FSB1_CAPTURE_WORKER");
+    size_t storage_bytes=capture_mode ? FIELD_CAPTURE_BYTES : RETAIN;
+#else
+    size_t storage_bytes=RETAIN;
+#endif
     volatile uint32_t *reg=MAP_FAILED;
     struct watch_table wat={0};
     uint8_t *watch_bytes=malloc(WATCH_HEADER+WATCH_RECORD*WATCH_RESIDENT_MAX+1);
-    uint8_t *storage=malloc(RETAIN);
+    uint8_t *storage=malloc(storage_bytes);
     struct field_egress egress={.fd=-1};
     const char *host=getenv("OBS_FFM1_HOST"), *port=getenv("OBS_FFM1_PORT");
     bool send_enabled=host && port;
     struct preview_history history;
-    if(!watch_bytes || preview_init(&history,storage,RETAIN) ||
+    if(!watch_bytes || preview_init(&history,storage,storage_bytes) ||
        (!!host!=!!port) || (send_enabled && field_connect(&egress,host,port,BLOCK))) goto done;
     problem="load libiio";
     lib=dlopen("libiio.so.0",RTLD_NOW);
@@ -490,7 +506,16 @@ int main(int argc,char **argv)
         if(state&FIELD_SOURCE_READY) break;
     }
     uint32_t lost_start=reg[LOST/4];
+#ifdef OBS_SCAN_STREAM_BENCH
+    if(capture_mode) {
+        problem="start dedicated FIELD capture";
+        if(capture_start(&capture,pollfd,reg,&blocks,&history,capture_mode)) goto done;
+    }
+#endif
     write_reg(reg,SESSION,1);
+#ifdef OBS_SCAN_STREAM_BENCH
+    if(capture.started) atomic_store_explicit(&capture.armed,true,memory_order_release);
+#endif
     fprintf(stderr,"FFM1_READY block=%d history=%d dma_blocks=%u explicit_return=1\n",BLOCK,RETAIN,blocks.count);
     struct observation obs={0};
     struct field_live live={0};
@@ -512,6 +537,15 @@ int main(int argc,char **argv)
             deadline=monotonic()+1.25;
         }
         ssize_t got=-EAGAIN;
+#ifdef OBS_SCAN_STREAM_BENCH
+        if(capture.started) {
+            got=capture_take(&capture,&history,&live);
+            if(got<=0 && !source_failure) {
+                source_failure=atomic_load_explicit(&capture.failure,memory_order_acquire);
+                if(source_failure) rc=4;
+            }
+        } else
+#endif
         if(!source_failure) {
 #ifdef OBS_SCAN_STREAM_BENCH
             if(dmac.reg && (reg[STATUS/4]&FIELD_SOURCE_FAULT))
@@ -625,7 +659,11 @@ int main(int argc,char **argv)
         if(expired || (draining && !pending && !egress.count && !(reg[STATUS/4]&FIELD_ACTIVE) &&
            !(reg[LEVEL/4]&FFM_LEVEL_COUNT))) break;
         if(got>0) continue;
-        struct pollfd p[2]={{.fd=source_failure?-1:pollfd,.events=POLLIN},
+        int wake_fd=pollfd;
+#ifdef OBS_SCAN_STREAM_BENCH
+        if(capture.started) wake_fd=capture.wake;
+#endif
+        struct pollfd p[2]={{.fd=source_failure?-1:wake_fd,.events=POLLIN},
                             {.fd=egress.count?egress.fd:-1,.events=POLLOUT}};
         /* The accepted FIELD timeout bounds receipt observation if the IIO
          * source goes quiet; admission itself is exclusively in hardware. */
@@ -639,10 +677,28 @@ int main(int argc,char **argv)
             source_failure="IIO poll reported a source fault";
         }
         if(source_failure && p[0].fd>=0) {
+#ifdef OBS_SCAN_STREAM_BENCH
+            if(capture.started) {
+                capture_stop(&capture);
+                if(atomic_load_explicit(&capture.failure,memory_order_acquire)) {
+                    rc=4;
+                    continue;
+                }
+            }
+#endif
             quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap,&blocks);
             rc=4;
         }
     }
+#ifdef OBS_SCAN_STREAM_BENCH
+    if(capture.started) {
+        capture_stop(&capture);
+        if(atomic_load_explicit(&capture.failure,memory_order_acquire)) rc=4;
+        max_refill_gap=capture.max_gap;
+        fprintf(stderr,"FSB1_CAPTURE blocks=%u peak_pending=%u rejects=%u nice=%d cpu_s=%.9f\n",
+            capture.produced,capture.peak,capture.rejected,capture.nice,capture.cpu);
+    }
+#endif
     field_abandon(&egress);
     if(reg[LOST/4]!=lost_start || pending || failed || egress.abandoned || reg[LEVEL/4]&FFM_LEVEL_COUNT) rc=4;
     fprintf(stderr,"FFM1_STOP bytes=%llu receipt_lost=%u error=%d\n",
@@ -665,6 +721,9 @@ int main(int argc,char **argv)
     if(dmac.reg && !source_failure) dmac_dump(&dmac,NULL);
 #endif
 done:
+#ifdef OBS_SCAN_STREAM_BENCH
+    capture_stop(&capture);
+#endif
     if(rc && !source_failure) report_error(reg,problem?problem:"receipt, history or drain fault",iio_result);
     if(stream_owned) {write_reg(reg,SESSION,0);write_reg(reg,COMMAND,FIELD_CANCEL);write_reg(reg,RUN,0);}
     for(unsigned i=0;i<blocks.count;++i) if(blocks.maps[i]) munmap(blocks.maps[i],BLOCK);
