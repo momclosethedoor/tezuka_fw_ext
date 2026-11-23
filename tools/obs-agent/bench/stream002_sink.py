@@ -167,12 +167,14 @@ def field_frame(conn, header):
 
 
 class FieldChunks:
-    """Validate wire offsets and exact extents without storing a field."""
+    """Validate wire offsets and exact extents, with an optional one-field sample."""
 
-    def __init__(self):
+    def __init__(self, sample=None):
         self.active = None
         self.received = 0
         self.digest = None
+        self.sample = sample
+        self.payload = None
 
     def read(self, conn, header):
         magic, meta_bytes, length = FIELD.unpack(header)
@@ -187,6 +189,7 @@ class FieldChunks:
             self.active = meta
             self.received = 0
             self.digest = sha256()
+            self.payload = bytearray() if self.sample else None
         else:
             if self.active is None or meta["stream_tag"] != self.active["stream_tag"]:
                 raise ValueError("FSB1 stream identity mismatch")
@@ -195,6 +198,10 @@ class FieldChunks:
                     raise ValueError("FSB1 DATA gap or overlap")
                 self.digest.update(payload)
                 self.received += length
+                if self.payload is not None and len(self.payload)+length <= 337924:
+                    self.payload.extend(payload)
+                else:
+                    self.payload = None
             elif kind == "end":
                 for key in ("epoch", "map_version", "target_position", "target_hz", "watch_generation", "watch_revision"):
                     if meta[key] != self.active[key]:
@@ -208,6 +215,10 @@ class FieldChunks:
                             or meta["first"] != 0 or meta["end"] != self.received):
                         raise ValueError("FSB1 SUCCESS extent mismatch")
                     meta["sha256"] = self.digest.hexdigest()
+                    if self.payload is not None:
+                        self.sample(self.active, meta, self.payload)
+                        self.sample = None
+                self.payload = None
                 self.active = None
             else:
                 raise ValueError("invalid FSB1 frame kind")

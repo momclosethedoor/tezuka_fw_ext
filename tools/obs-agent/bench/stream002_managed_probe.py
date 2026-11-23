@@ -31,20 +31,27 @@ done"""
 class BenchReceiver(Receiver):
     field_mode = False
     fsb1 = False
+    sample_live_video = False
+    view_sample_limit = 512
     def __init__(self, folder):
         self.view_samples = {}
         super().__init__(folder)
 
     def sample_view(self, generation, ordinal, flags, k, view):
         records = self.view_samples.setdefault(generation, [])
-        if len(records) < 512 or flags & 64 and len(records) < 528:
+        if len(records) < self.view_sample_limit or flags & 64 and len(records) < self.view_sample_limit + 16:
             records.append(dict(generation=generation, ordinal=ordinal, flags=flags,
                                 actual_k=k, payload_hex=view.hex()))
 
     def real8(self, conn):
         if not self.field_mode:
             return super().real8(conn)
-        chunks = FieldChunks() if self.fsb1 else None
+        def save_field(begin, end, payload):
+            stem = self.folder / f"field-{end['map_version']}-{end['epoch']}"
+            stem.with_suffix(".bin").write_bytes(payload)
+            stem.with_suffix(".json").write_text(json.dumps(dict(begin=begin,end=end)), encoding="utf-8")
+
+        chunks = FieldChunks(save_field if self.sample_live_video else None) if self.fsb1 else None
         while not self.stop.is_set():
             try:
                 header = exact(conn, FIELD.size, eof=True)
@@ -255,7 +262,10 @@ test "$(devmem 0x7c460284)" = 0x00000000
     receiver = BenchReceiver(log)
     receiver.obn5 = args.obn5
     receiver.record_views = args.obn5 and full
+    if args.check_roi_view:
+        receiver.view_sample_limit = 4096
     receiver.fsb1 = args.fsb1 or args.obn5
+    receiver.sample_live_video = args.gate_transmitter
     if receiver.fsb1:
         receiver.field_stats.update(payload_bytes=0,successes=[])
     roi_process = launch_roi(log,full,args.obn5 and (full or roi_range is not None)) if roi_enabled else None
@@ -316,6 +326,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
             if roi_center is not None:
                 probe.request(dict(op="roi",id=uuid.uuid4().hex,center_hz=roi_center))
             elif roi_range is not None:
+                if args.check_roi_view:
+                    receiver.record_views = True
                 probe.request(dict(op="roi",id=uuid.uuid4().hex,lo_hz=roi_range[0],hi_hz=roi_range[1],
                                    view_bins=args.roi_view_bins))
             time.sleep(1)
