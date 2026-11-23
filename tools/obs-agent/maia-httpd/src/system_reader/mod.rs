@@ -716,8 +716,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  if matches!(&socket,Some(ViewTransport::WebSocket(_))){
   let mut net=network.borrow_mut();
-  net.coalesce_us=0;
-  net.max_records=1;
+  net.max_records=view_websocket::records_per_frame();
+  net.coalesce_us=if net.max_records>1 {1500} else {0};
  }
  if control.is_some() && let Some(ViewTransport::Udp(sock))=&socket{
   let mut net=network.borrow_mut();

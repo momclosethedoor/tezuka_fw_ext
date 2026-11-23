@@ -13,15 +13,20 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-const QUEUE_LIMIT: usize = 128;
+const QUEUE_RECORD_BUDGET: usize = 128;
 static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 
 pub(super) struct Client {
     queue: mpsc::Sender<Bytes>,
+    queue_limit: usize,
     peak: AtomicU64,
     written: AtomicU64,
     written_bytes: AtomicU64,
     writer_errors: AtomicU64,
+}
+
+pub(super) fn records_per_frame() -> usize {
+    if std::env::var("OBS_DIAG_VIEW_WS_BATCH").as_deref() == Ok("8") { 8 } else { 1 }
 }
 
 pub(super) fn client() -> Option<Arc<Client>> {
@@ -34,15 +39,15 @@ impl Client {
             mpsc::error::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
             mpsc::error::TrySendError::Closed(_) => io::ErrorKind::BrokenPipe,
         })?;
-        self.peak.fetch_max((QUEUE_LIMIT - self.queue.capacity()) as u64, Ordering::Relaxed);
+        self.peak.fetch_max((self.queue_limit - self.queue.capacity()) as u64, Ordering::Relaxed);
         slot.send(Bytes::copy_from_slice(record));
         Ok(record.len())
     }
 
     pub(super) fn stats(&self) -> Value {
         json!({
-            "queue_limit": QUEUE_LIMIT,
-            "pending": QUEUE_LIMIT - self.queue.capacity(),
+            "queue_limit": self.queue_limit,
+            "pending": self.queue_limit - self.queue.capacity(),
             "queue_peak": self.peak.load(Ordering::Relaxed),
             "written": self.written.load(Ordering::Relaxed),
             "written_bytes": self.written_bytes.load(Ordering::Relaxed),
@@ -56,9 +61,10 @@ pub(crate) async fn upgrade(ws: WebSocketUpgrade) -> Response {
     if active.is_some() {
         return StatusCode::CONFLICT.into_response();
     }
-    let (queue, mut receiver) = mpsc::channel(QUEUE_LIMIT);
+    let queue_limit = QUEUE_RECORD_BUDGET / records_per_frame();
+    let (queue, mut receiver) = mpsc::channel(queue_limit);
     let client = Arc::new(Client {
-        queue, peak: AtomicU64::new(0), written: AtomicU64::new(0),
+        queue, queue_limit, peak: AtomicU64::new(0), written: AtomicU64::new(0),
         written_bytes: AtomicU64::new(0), writer_errors: AtomicU64::new(0),
     });
     struct Lease;

@@ -61,6 +61,7 @@ impl UdpBatch {
   self.diagnostic=Some(DatagramDiagnostic{limit:1,calls:0,wait:Histogram::default(),send});
  }
  pub(super) fn stream_flush(&mut self,s:&impl ViewSocket){
+  if s.udp().is_none() && !self.due(Instant::now()){return;}
   if let Some(diag)=self.diagnostic.as_ref() && diag.limit>1 && self.pending<diag.limit as u64 &&
       self.first.is_some_and(|first|first.elapsed()<Duration::from_millis(4)){
    return;
@@ -217,6 +218,33 @@ fn send_error(result:io::Result<usize>)->(bool,Option<i32>){
   }
   assert_eq!((q.sent,q.datagrams,q.dropped,q.send_calls),(4,4,0,4));
   assert_eq!(q.diagnostic.as_ref().unwrap().calls,4);
+ }
+
+ #[test] fn stream_frames_flush_at_limit_or_age(){
+  #[derive(Default)]
+  struct Sink(std::cell::RefCell<Vec<Vec<u8>>>);
+  impl ViewSocket for Sink {
+   fn send(&self, record:&[u8])->io::Result<usize>{
+    self.0.borrow_mut().push(record.to_vec());
+    Ok(record.len())
+   }
+   fn udp(&self)->Option<&UdpSocket>{None}
+  }
+  let sink=Sink::default();
+  let mut batch=UdpBatch::configured(10_000_000,false,8,4160);
+  add(&mut batch,1);
+  batch.stream_flush(&sink);
+  assert!(sink.0.borrow().is_empty());
+  for value in 2..=8{add(&mut batch,value);}
+  batch.stream_flush(&sink);
+  assert_eq!(sink.0.borrow()[0].len(),8*4160);
+  for (index,record) in sink.0.borrow()[0].chunks_exact(4160).enumerate(){
+   assert!(record.iter().all(|value|*value==index as u8+1));
+  }
+  add(&mut batch,9);
+  batch.first=Instant::now().checked_sub(Duration::from_secs(11));
+  batch.stream_flush(&sink);
+  assert_eq!(sink.0.borrow()[1],vec![9;4160]);
  }
 
 }
