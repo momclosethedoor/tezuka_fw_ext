@@ -1,5 +1,13 @@
 use std::{io,net::UdpSocket,time::{Duration,Instant}};
 use super::timing::Histogram;
+pub(super) trait ViewSocket {
+ fn send(&self, record:&[u8])->io::Result<usize>;
+ fn udp(&self)->Option<&UdpSocket>;
+}
+impl ViewSocket for UdpSocket {
+ fn send(&self, record:&[u8])->io::Result<usize>{UdpSocket::send(self,record)}
+ fn udp(&self)->Option<&UdpSocket>{Some(self)}
+}
 pub(super) const MAX_SENDMMSG:usize=16;
 type SendDatagrams=fn(&UdpSocket,&[u8],usize)->io::Result<usize>;
 pub(super) struct DatagramDiagnostic {
@@ -46,13 +54,13 @@ impl UdpBatch {
  pub fn timer_due(&self,now:Instant)->bool {
   self.first.is_some_and(|t|now.saturating_duration_since(t)>=Duration::from_micros(self.coalesce_us))
  }
- pub fn flush_due(&mut self,s:&UdpSocket){if self.due(Instant::now()){self.flush(s);}}
+ pub fn flush_due(&mut self,s:&impl ViewSocket){if self.due(Instant::now()){self.flush(s);}}
  pub(super) fn enable_datagram_diagnostic(&mut self,send:SendDatagrams){
   assert_eq!(self.max_records,1);
   self.bytes.reserve(self.record_size * MAX_SENDMMSG);
   self.diagnostic=Some(DatagramDiagnostic{limit:1,calls:0,wait:Histogram::default(),send});
  }
- pub(super) fn stream_flush(&mut self,s:&UdpSocket){
+ pub(super) fn stream_flush(&mut self,s:&impl ViewSocket){
   if let Some(diag)=self.diagnostic.as_ref() && diag.limit>1 && self.pending<diag.limit as u64 &&
       self.first.is_some_and(|first|first.elapsed()<Duration::from_millis(4)){
    return;
@@ -64,7 +72,7 @@ impl UdpBatch {
   self.suppressed+=self.pending;
   self.bytes.clear();self.pending=0;self.first=None;
  }
- pub fn completion(&mut self,s:&UdpSocket,bytes:&[u8])->bool {
+ pub fn completion(&mut self,s:&impl ViewSocket,bytes:&[u8])->bool {
   self.send_calls+=1;
   match s.send(bytes) {
    Ok(n) if n==bytes.len()=>{self.notes_sent+=1;true}
@@ -78,7 +86,7 @@ impl UdpBatch {
    }
   }
  }
- pub fn flush(&mut self,s:&UdpSocket){
+ pub fn flush(&mut self,s:&impl ViewSocket){
   if self.pending==0{return}
   self.high_records=self.high_records.max(self.pending);
   let now=Instant::now();
@@ -91,14 +99,14 @@ impl UdpBatch {
     self.oldest_wait_bins[upper_exponent.min(31) as usize]+=1;
    }
   }
-  if let Some(diag)=self.diagnostic.as_mut().filter(|d|d.limit>1){
+  if let (Some(diag),Some(udp))=(self.diagnostic.as_mut().filter(|d|d.limit>1),s.udp()){
    let mut offset=0;
    while offset<self.bytes.len(){
     let count=diag.limit.min((self.bytes.len()-offset)/self.record_size);
     let stop=offset+count*self.record_size;
     self.send_calls+=1;
     diag.calls+=1;
-    let result=(diag.send)(s,&self.bytes[offset..stop],self.record_size);
+    let result=(diag.send)(udp,&self.bytes[offset..stop],self.record_size);
     match result {
      Ok(sent) if (1..=count).contains(&sent)=>{
       self.sent+=sent as u64;

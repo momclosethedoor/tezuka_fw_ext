@@ -3,6 +3,9 @@ mod continuous;
 mod view;
 mod discard;
 mod view_batch;
+mod view_websocket;
+pub(crate) use view_websocket::upgrade as view_websocket_upgrade;
+use view_batch::ViewSocket;
 mod sweep_delivery;
 mod progress;
 mod obn3;
@@ -593,6 +596,36 @@ fn view_idle_wait(k:u32,bins:usize)->Duration {
  Duration::from_micros((u64::from(k)*bins as u64*1_000_000/(8*61_440_000)).min(64))
 }
 
+enum ViewTransport {
+    Udp(std::net::UdpSocket),
+    WebSocket(std::sync::Arc<view_websocket::Client>),
+}
+
+impl ViewSocket for ViewTransport {
+    fn send(&self, record: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(socket) => socket.send(record),
+            Self::WebSocket(client) => client.send(record),
+        }
+    }
+
+    fn udp(&self) -> Option<&std::net::UdpSocket> {
+        match self {
+            Self::Udp(socket) => Some(socket),
+            Self::WebSocket(_) => None,
+        }
+    }
+}
+
+fn view_network_status(net: &UdpBatch, socket: Option<&ViewTransport>) -> Value {
+    let mut status = net.counts();
+    status["socket_pending_bytes"] = json!(socket.and_then(ViewSocket::udp).and_then(udp_socket_queue));
+    if let Some(ViewTransport::WebSocket(client)) = socket {
+        status["websocket"] = client.stats();
+    }
+    status
+}
+
 fn send_view_datagrams(socket: &std::net::UdpSocket, bytes: &[u8], record_size: usize)
     -> std::io::Result<usize>
 {
@@ -645,7 +678,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   Some(stream)
  }else{None});
  let managed_view_only=io.managed_view_only;
- let empty_wait=if control.is_some(){view_idle_wait(c.k.min(c.hold_k.unwrap_or(c.k)),fft_bins)}else{Duration::ZERO};
+ let default_empty_wait=if control.is_some(){view_idle_wait(c.k.min(c.hold_k.unwrap_or(c.k)),fft_bins)}else{Duration::ZERO};
+ let empty_wait_file=std::env::var_os("OBS_DIAG_VIEW_EMPTY_WAIT_FILE").map(PathBuf::from)
+  .filter(|_|c.scan && control.is_some());
+ let mut empty_wait=default_empty_wait;
+ let mut empty_wait_elapsed=timing::Histogram::default();
  io.idle_wait_us=empty_wait.as_micros() as u64;
  save(c,"memory.json",&json!({"full_dma":io.info.full,"view_dma":io.info.view,"full_len":io.info.full_len,"view_len":io.info.view_len,"cached":io.info.cached,"cache_line":io.info.cache_line,"mmap":"read-only MAP_SHARED, Linux DMA API","lifetime":"module pinned until reboot","shift544":c.shift544}))?;
  save(c,"before.json",&io.counters()?)?;
@@ -667,10 +704,22 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let initial=io.snapshot()?;
  let mut reader=view::PairReader::attach(initial)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
- let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
+ let socket=if c.udp.is_some() && c.scan && control.is_some() && std::env::var("OBS_DIAG_VIEW_WS").as_deref()==Ok("1") {
+  Some(ViewTransport::WebSocket(view_websocket::client().ok_or("attach the diagnostic VIEW WebSocket before scan")?))
+ } else if let Some(dest)=&c.udp {
+  let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;
+  sock.connect(dest).map_err(|e|e.to_string())?;
+  sock.set_nonblocking(true).map_err(|e|e.to_string())?;
+  Some(ViewTransport::Udp(sock))
+ } else {None};
  let record_bytes=(if control.is_some(){64}else{56})+wire_view_bins;
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
- if control.is_some() && let Some(sock)=&socket{
+ if matches!(&socket,Some(ViewTransport::WebSocket(_))){
+  let mut net=network.borrow_mut();
+  net.coalesce_us=0;
+  net.max_records=1;
+ }
+ if control.is_some() && let Some(ViewTransport::Udp(sock))=&socket{
   let mut net=network.borrow_mut();
   net.coalesce_us=0;
   let mut mtu:libc::c_int=0;
@@ -691,7 +740,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let initial_anchor=io.live64(0x238);
  let view_mute_file=std::env::var_os("OBS_DIAG_VIEW_MUTE_FILE").map(PathBuf::from);
  let view_mmsg_file=std::env::var_os("OBS_DIAG_VIEW_MMSG_FILE").map(PathBuf::from)
-  .filter(|_|c.scan && control.is_some() && socket.is_some() && network.borrow().max_records==1);
+  .filter(|_|c.scan && control.is_some() && matches!(&socket,Some(ViewTransport::Udp(_))) && network.borrow().max_records==1);
  if view_mmsg_file.is_some(){network.borrow_mut().enable_datagram_diagnostic(send_view_datagrams);}
  let view_muted=std::cell::Cell::new(false);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
@@ -775,6 +824,20 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
+    if let Some(path)=&empty_wait_file {
+     let wait=std::fs::read_to_string(path).ok()
+      .and_then(|value|value.trim().parse::<u64>().ok())
+      .filter(|wait|matches!(*wait,50|100|150)).map(Duration::from_micros).unwrap_or(default_empty_wait);
+     if wait!=empty_wait {
+      empty_wait=wait;
+      io.idle_wait_us=wait.as_micros() as u64;
+      io.physical_high_water=0;
+      reader.high_water=0;
+      io.max_release_gap_us=0;
+      max_poll_us=0;
+      empty_wait_elapsed=timing::Histogram::default();
+     }
+    }
     if let (Some(path),Some(sock))=(&view_mmsg_file,&socket){
      let limit=std::fs::read_to_string(path).ok()
       .and_then(|value|value.trim().parse::<usize>().ok())
@@ -806,9 +869,13 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     if let Err(e)=io.check_progress(&mut progress,start,&s,q,execution.get(),map){route_failure=Some(e);break;}
    }
    if let Ok(mut v)=mark(&mut io,&reader,start){
-    v["network"]=network.borrow().counts();
+    v["network"]=view_network_status(&network.borrow(),socket.as_ref());
     if view_mute_file.is_some(){v["network"]["diag_view_muted"]=json!(view_muted.get());}
-    v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
+    if empty_wait_file.is_some(){
+     v["diag_ring"]=json!({"capacity_slots":1024,"physical_peak_slots":io.physical_high_water,
+      "logical_peak_slots":reader.high_water,"max_release_interval_us":io.max_release_gap_us,
+      "max_service_interval_us":max_poll_us,"sleep_elapsed":histogram(empty_wait_elapsed)});
+    }
     if io.phase_on {
      v["observed_to_payload"]=histogram(reader.observed_to_payload);
      v["release"]=histogram(reader.release);
@@ -829,7 +896,11 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if c.command=="drain"&&s.committed==s.released{break}
   if s.committed==s.released {
    if empty_wait.is_zero(){std::hint::spin_loop();}
-   else{std::thread::sleep(empty_wait);}
+   else{
+    let before=empty_wait_file.is_some().then(Instant::now);
+    std::thread::sleep(empty_wait);
+    if let Some(before)=before{empty_wait_elapsed.observe(before.elapsed());}
+   }
   }
  }
  let measured=json!({"high_water":io.physical_high_water,"logical_high_water":reader.high_water,"max_service_us":max_service_us,"max_service_interval_us":max_poll_us,"max_release_interval_us":io.max_release_gap_us});
@@ -853,9 +924,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   zoom.close();
  }
  if let Ok(mut v)=mark(&mut io,&reader,start){
-  v["network"]=network.borrow().counts();
+  v["network"]=view_network_status(&network.borrow(),socket.as_ref());
   if view_mute_file.is_some(){v["network"]["diag_view_muted"]=json!(view_muted.get());}
-  v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
   if io.phase_on {
    v["observed_to_payload"]=histogram(reader.observed_to_payload);
    v["release"]=histogram(reader.release);

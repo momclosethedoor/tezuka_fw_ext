@@ -2763,13 +2763,16 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
             result
         }
     });
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/api/system/control", get(status).post(submit))
         .route(
             "/api/system/field",
             get(crate::field1_control::get).post(crate::field1_control::post),
         )
         .with_state(shared.clone());
+    if std::env::var("OBS_DIAG_VIEW_WS").as_deref() == Ok("1") {
+        app = app.route("/ws/view-bench", get(crate::system_reader::view_websocket_upgrade));
+    }
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             while !STOP_RUNTIME.load(Ordering::Acquire) {
