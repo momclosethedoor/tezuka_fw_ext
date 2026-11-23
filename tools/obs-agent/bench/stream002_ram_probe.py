@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--roi-center-hz", type=int)
     parser.add_argument("--roi-range-hz", type=int, nargs=2, metavar=("LOW", "HIGH"))
     parser.add_argument("--roi-view-bins", type=int, choices=(512, 1024, 2048, 4096), default=4096)
+    parser.add_argument("--roi-skip-unselected", action="store_true",
+                        help="during packed ROI read only the headers of unselected DMA records")
     parser.add_argument("--full-compact-tcp", action="store_true")
     parser.add_argument("--gate-transmitter", action="store_true",
                         help="pause before FIELD windows for the operator's ready signal")
@@ -48,6 +50,8 @@ def main():
     parser.add_argument("--fsb1-capture-worker", choices=("normal", "priority"),
                         help="separate IIO return from FIELD formatting and TCP")
     args = parser.parse_args()
+    if args.roi_skip_unselected and not args.roi_range_hz:
+        parser.error("--roi-skip-unselected requires --roi-range-hz")
     if args.fsb1_dmac_trace and not (args.fsb1 and args.managed and max(args.field_counts)):
         parser.error("--fsb1-dmac-trace requires --fsb1, --managed and an active FIELD window")
     if args.fsb1_iio_buffers != 4 and not args.fsb1_dmac_trace:

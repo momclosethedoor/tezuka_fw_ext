@@ -55,17 +55,6 @@ jobs:
       - name: Build main agent with in-process reader and preview
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF_NAME" == build/pl-field-stream-001 ]]; then
-            mkdir agent-artifact
-            arm_cc=output/nano/host/bin/arm-linux-gcc
-            "$arm_cc" -O2 -Wall -Wextra -Werror -DOBS_SCAN_STREAM_BENCH tools/obs-guard/obs-ffm1-iio.c -pthread -ldl -o agent-artifact/obs-ffm1-iio
-            "$arm_cc" -O2 -Wall -Wextra -Werror -fsyntax-only tools/obs-guard/obs-ffm1-iio.c
-            output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/obs-ffm1-iio > agent-artifact/elf.txt
-            sha256sum tools/obs-guard/obs-ffm1-iio.c tools/obs-guard/obs-field-{capture,egress,preview}.h tools/obs-guard/obs-fsb1-stream.h > agent-artifact/source-sha256.txt
-            cd agent-artifact
-            sha256sum obs-ffm1-iio elf.txt source-sha256.txt > SHA256SUMS
-            exit 0
-          fi
           rustc +1.94.0 --edition=2024 --test tools/obs-agent/owned-reader-tests.rs -o /tmp/owned-reader-tests
           OBS_VIEW_VECTOR_ROOT=tools/obs-agent/maia-httpd/tests/view \
           OBS_OBN2_VECTOR_ROOT=tools/obs-agent/maia-httpd/tests/observation-continuous \
@@ -84,7 +73,7 @@ jobs:
           export RUSTFLAGS="-C target-cpu=cortex-a9 -C link-arg=$PWD/agent-neon.o -C link-arg=$PWD/agent-preview.o -C link-arg=-ldl -C link-arg=-lm"
           bench_args=()
           ffm_args=()
-          if [[ "$GITHUB_REF_NAME" == build/arm-scan-stream-002 ]]; then
+          if [[ "$GITHUB_REF_NAME" == build/arm-scan-stream-002 || "$GITHUB_REF_NAME" == build/pl-field-stream-001 ]]; then
             bench_args=(--features scan-stream-bench)
             ffm_args=(-DOBS_SCAN_STREAM_BENCH)
           fi
@@ -98,7 +87,7 @@ jobs:
             cargo +1.94.0 check --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd
           fi
           find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
-          sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
+          sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-ffm1-iio.c tools/obs-guard/obs-field-{capture,egress,preview}.h tools/obs-guard/obs-fsb1-stream.h tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
           cp board/tezuka/nano/overlay_goofy/usr/sbin/goofy_lease.sh agent-artifact/
           cd agent-artifact
           sha256sum maia-httpd obs-field1 obs-ffm1-iio goofy_lease.sh elf.txt source-sha256.txt > SHA256SUMS

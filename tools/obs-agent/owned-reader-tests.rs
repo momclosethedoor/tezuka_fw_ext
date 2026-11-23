@@ -142,3 +142,45 @@ fn compact_tcp_sink_reads_the_owned_copy_only_after_release() {
     assert!(io.released);
     assert!(io.dma.iter().all(|&value|value==0));
 }
+
+#[test]
+fn roi_header_only_records_keep_order_and_release_without_exposing_old_payload() {
+    struct Ring { tail:u64, copies:u64 }
+    impl PairIo for Ring {
+        fn snapshot(&mut self)->R<continuous::Snapshot>{
+            Ok(continuous::Snapshot{cookie:1,released:self.tail,committed:1026,reserved:1026,..Default::default()})
+        }
+        fn owned_full_bytes(&self)->usize{obn3::COMPACT_BYTES}
+        fn copy_full(&mut self,_:usize,_:&mut[u8])->R<()>{unreachable!()}
+        fn copy_view(&mut self,_:usize,_:&mut[u8])->R<()>{unreachable!()}
+        fn visit_for_release<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(
+            &mut self,slot:usize,full:&mut[u8],_:&mut[u8],keep:Option<&mut dyn FnMut(Header)->bool>,sink:&mut F
+        )->R<usize>{
+            assert_eq!(slot,self.tail as usize%1024);
+            let h=Header{first_seq:0,last_seq:1,epoch:self.tail,first_tick:0,k:2,flags:1,ordinal:self.tail};
+            let bytes=if keep.unwrap()(h){
+                self.copies+=1;
+                full[..obn3::COMPACT_BYTES].fill(42);
+                obn3::COMPACT_BYTES
+            }else{0};
+            sink(h,&[],&[])?;
+            Ok(bytes)
+        }
+        fn release(&mut self,run:u32,tail:u64)->R<()>{
+            assert_eq!((run,tail),(1,self.tail+1));
+            self.tail=tail;
+            Ok(())
+        }
+    }
+    let mut ring=Ring{tail:1023,copies:0};
+    let mut reader=view::PairReader::attach(ring.snapshot().unwrap()).unwrap();
+    let mut received=Vec::new();
+    reader.service_filtered(&mut ring,Some(&mut |h|h.ordinal==1024),|_|panic!("unexpected DMA view"),|h,v,raw|{
+        assert!(v.is_empty());
+        assert!(raw.iter().all(|&b|b==42));
+        received.push((h.ordinal,raw.len()));
+        Ok(())
+    }).unwrap();
+    assert_eq!(received,[(1023,0),(1024,obn3::COMPACT_BYTES),(1025,0)]);
+    assert_eq!((ring.tail,ring.copies,reader.visited,reader.read,reader.payload_skipped),(1026,1,3,1,2));
+}

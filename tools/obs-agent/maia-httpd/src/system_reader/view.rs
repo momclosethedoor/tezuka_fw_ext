@@ -58,6 +58,12 @@ pub trait PairIo{
         self.copy_full(slot,full)?;let h=c::header_revision(full,3)?;let n=view_len(h);
         if n!=0{self.copy_view(slot,&mut view[..n])?;}sink(h,&[full],&view[..n])
     }
+    fn visit_for_release<F:FnMut(Header,&[&[u8]],&[u8])->Result<(),String>>(
+        &mut self,slot:usize,full:&mut[u8],view:&mut[u8],_keep:Option<&mut dyn FnMut(Header)->bool>,sink:&mut F
+    )->Result<usize,String>{
+        self.visit_pair(slot,full,view,sink)?;
+        Ok(self.owned_full_bytes())
+    }
     fn copy_full(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;
     fn copy_view(&mut self,slot:usize,out:&mut[u8])->Result<(),String>;
     fn release(&mut self,run:u32,tail:u64)->Result<(),String>;
@@ -69,30 +75,36 @@ pub(super) fn copy_release<I:PairIo,F:FnOnce()>(io:&mut I,run:u32,ordinal:u64,fu
  if h.ordinal!=ordinal||view_len(h)!=overview.len(){return Err("owned full/VIEW identity".into())}
  io.copy_view(slot,overview)?;copied();io.release(run,ordinal+1)?;Ok(h)
 }
-pub struct PairReader{pub full_read_ns:u128,pub view_own_ns:u128,pub after_release_ns:u128,pub(super) run:u32,pub(super) next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub high_water:u64,
+pub struct PairReader{pub full_read_ns:u128,pub view_own_ns:u128,pub after_release_ns:u128,pub(super) run:u32,pub(super) next:u64,full:Vec<u8>,view:Vec<u8>,power:Vec<f32>,pub read:u64,pub consumed:u64,pub visited:u64,pub payload_skipped:u64,pub high_water:u64,
     pub(super) observed_to_payload:super::timing::Histogram,pub(super) release:super::timing::Histogram}
 impl PairReader{
     /// Finish all DMA reads, release, then expose only the small owned VIEW.
     /// No full-spectrum queue or checksum is part of this path.
-    pub fn service_released<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8],&[u8])->Result<(),String>>(&mut self,io:&mut I,mut read:Rd,mut sink:F)->Result<Snapshot,String>{
+    pub fn service_released<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8],&[u8])->Result<(),String>>(&mut self,io:&mut I,read:Rd,sink:F)->Result<Snapshot,String>{
+        self.service_filtered(io,None,read,sink)
+    }
+    pub fn service_filtered<I:PairIo,Rd:FnMut(&[u8]),F:FnMut(Header,&[u8],&[u8])->Result<(),String>>(
+        &mut self,io:&mut I,mut keep:Option<&mut dyn FnMut(Header)->bool>,mut read:Rd,mut sink:F
+    )->Result<Snapshot,String>{
         let phase=io.phase_timing();
         let s=io.fast_snapshot()?;
         let observed=(phase && cfg!(feature="scan-stream-bench")).then(std::time::Instant::now);
         if s.cookie!=self.run||s.released!=self.next||s.committed<self.next||s.committed>s.reserved||s.reserved-self.next>SLOTS as u64{return Err("r3 cursor/owner violation".into())}
         self.high_water=self.high_water.max(s.reserved-self.next);
         let end=s.committed.min(self.next+io.batch_limit() as u64);
-        let full_len=io.owned_full_bytes();
+        let full_expected=io.owned_full_bytes();
         io.prepare_prefix(self.next,end)?;
         let mut owned_view=[0u8;VIEW_BYTES];
         for ordinal in self.next..end{
             let mut header=None;let mut n=0;
-            io.visit_pair(ordinal as usize&(SLOTS-1),&mut self.full,&mut self.view,&mut |h,parts,v|{
+            let filter=keep.as_mut().map(|f|&mut **f as &mut dyn FnMut(Header)->bool);
+            let full_len=io.visit_for_release(ordinal as usize&(SLOTS-1),&mut self.full,&mut self.view,filter,&mut |h,parts,v|{
                 if h.ordinal!=ordinal{return Err("r3 ordinal mismatch; no release".into())}
                 let t=phase.then(std::time::Instant::now);
                 n=v.len();owned_view[..n].copy_from_slice(v);header=Some(h);
                 if let Some(t)=t{self.view_own_ns+=t.elapsed().as_nanos();}
                 let t=phase.then(std::time::Instant::now);
-                if full_len==0 { for part in parts{read(part);} }
+                if full_expected==0 { for part in parts{read(part);} }
                 if let Some(t)=t{self.full_read_ns+=t.elapsed().as_nanos();}
                 Ok(())
             })?;
@@ -101,7 +113,8 @@ impl PairReader{
             io.release(self.run,ordinal+1)?;
             if let Some(t)=release_begin{self.release.observe(t.elapsed());}
             self.next=ordinal+1;self.visited+=1;
-            if io.full_read(){self.read+=1;self.consumed+=1;}
+            if full_expected!=0 && full_len==0 {self.payload_skipped+=1;}
+            else if io.full_read(){self.read+=1;self.consumed+=1;}
             // The DMA slot may already be overwritten here.
             let t=phase.then(std::time::Instant::now);
             sink(header.ok_or("missing header")?,&owned_view[..n],&self.full[..full_len])?;
@@ -130,7 +143,7 @@ impl PairReader{
     }
     pub fn attach(s:Snapshot)->Result<Self,String>{
         if s.cookie==0||s.fault||s.released>s.committed||s.committed>s.reserved||s.reserved-s.released>SLOTS as u64{return Err("r3 attach cursors".into())}
-        Ok(Self{full_read_ns:0,view_own_ns:0,after_release_ns:0,run:s.cookie,next:s.released,full:vec![0;c::BYTES],view:vec![0;VIEW_BYTES],power:vec![0.;c::BINS],read:0,consumed:0,visited:0,high_water:s.reserved-s.released,
+        Ok(Self{full_read_ns:0,view_own_ns:0,after_release_ns:0,run:s.cookie,next:s.released,full:vec![0;c::BYTES],view:vec![0;VIEW_BYTES],power:vec![0.;c::BINS],read:0,consumed:0,visited:0,payload_skipped:0,high_water:s.reserved-s.released,
             observed_to_payload:Default::default(),release:Default::default()})
     }
     /// Sink consumes all 4096 bins synchronously or copies them into its own

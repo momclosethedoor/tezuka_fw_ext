@@ -129,14 +129,26 @@ impl Stream {
         self.request.is_some_and(|request| !request.legacy_full_record)
     }
 
+    fn locate<'a>(initial:&'a Map, next:Option<&'a Map>, h: Header, anchor: u64,
+                  next_anchor: Option<u64>) -> Option<(&'a Map,u64,u64)> {
+        let (map,anchor)=match (next,next_anchor) {
+            (Some(next),Some(start)) if h.epoch>=start => (next,start),
+            _ => (initial,anchor),
+        };
+        Some((map,anchor,h.epoch.checked_sub(anchor)?))
+    }
+
+    pub(super) fn keeps_record(&self, h: Header, anchor: u64, next_anchor: Option<u64>) -> bool {
+        if self.full_scan || !self.filters_view() { return true; }
+        Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor).is_some_and(|(map,_,relative)| {
+            map.rows[(relative%map.rows.len() as u64) as usize].as_ref().is_some_and(|row| !row.bins.is_empty())
+        })
+    }
+
     pub(super) fn prepare(&mut self, h: Header, raw: &[u8], view: &[u8],
                           anchor: u64, next_anchor: Option<u64>) -> R<()> {
         if !self.full_scan && self.request.is_none() {return Ok(());}
-        let (map,anchor)=match (self.next.as_ref(),next_anchor) {
-            (Some(next),Some(start)) if h.epoch>=start => (next,start),
-            _ => (&self.initial,anchor),
-        };
-        let Some(relative)=h.epoch.checked_sub(anchor) else { return Ok(()); };
+        let Some((map,anchor,relative))=Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor) else { return Ok(()); };
         if self.full_scan {
             let generation=map.generation;
             self.prepare_full(h,raw,generation)?;
