@@ -189,7 +189,7 @@ impl Hardware{
    if copy_full {
     if shifted {
      self.copy(0,head+start,&mut full[start..prefix])?;
-     if prev_view!=0{self.copy(1,previous*view::VIEW_BYTES,&mut full[prefix..prefix+prev_view])?;}
+     if prev_view!=0{self.copy(1,previous*format.view_stride(),&mut full[prefix..prefix+prev_view])?;}
      self.copy(0,offset,&mut full[prefix+prev_view..length])?;
     }else{self.copy(0,offset+start,&mut full[start..length])?;}
     self.copied_bytes+=length as u64;
