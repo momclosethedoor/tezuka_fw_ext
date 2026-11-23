@@ -43,7 +43,7 @@ mod tests {
                 delivery=Delivery::new(&specs[index],versions[index].1,2,&mut network).unwrap();
             }
             delivery.accept(Header{first_seq:ordinal as u64*2,last_seq:ordinal as u64*2+1,
-                ordinal:ordinal as u64,epoch,first_tick:epoch*100,k:2,flags:9},&[0;512],&mut network,&sender);
+                ordinal:ordinal as u64,epoch,first_tick:epoch*100,bins:4096,k:2,flags:9},&[0;512],&mut network,&sender);
         }
         delivery.finish_drained(&mut network,&sender,final_epoch);
         notes+=delivery.notes_sent;

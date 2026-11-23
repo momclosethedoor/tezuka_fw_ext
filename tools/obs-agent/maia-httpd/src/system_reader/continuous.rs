@@ -43,7 +43,7 @@ fn u16v(b:&[u8],i:usize)->u16{u16::from_le_bytes(b[i..i+2].try_into().unwrap())}
 fn u32v(b:&[u8],i:usize)->u32{u32::from_le_bytes(b[i..i+4].try_into().unwrap())}
 fn u64v(b:&[u8],i:usize)->u64{u64::from_le_bytes(b[i..i+8].try_into().unwrap())}
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-pub struct Header{pub first_seq:u64,pub last_seq:u64,pub epoch:u64,pub first_tick:u64,pub k:u32,pub flags:u32,pub ordinal:u64}
+pub struct Header{pub first_seq:u64,pub last_seq:u64,pub epoch:u64,pub first_tick:u64,pub bins:usize,pub k:u32,pub flags:u32,pub ordinal:u64}
 impl Header{pub fn clean(self)->bool{self.flags&1!=0}pub fn peak(self)->bool{self.flags&4!=0}}
 /// Cheap metadata validation, before payload normalization or serialization.
 pub fn header(b:&[u8])->Result<Header,String>{
@@ -60,7 +60,7 @@ pub fn header_prefix(b:&[u8],revision:u16)->Result<Header,String>{
     if u32v(&h,0)!=ABI || u16v(&h,4)!=revision || u16v(&h,6)!=64 || u32v(&h,32)!=4096 || u32v(&h,40)!=TICK_HZ as u32 || u32v(&h,48)!=2 || u32v(&h,52)!=BYTES as u32{return Err("OBN2 ABI/revision/encoding/constants".into())}
     let k=u32v(&h,36);if !(1..=1023).contains(&k){return Err("OBN2 actualK".into())}
     let first_seq=u64v(&h,8);let last_seq=first_seq.checked_add(k as u64-1).ok_or("OBN2 sequence exhaustion")?;
-    let x=Header{first_seq,epoch:u64v(&h,16),first_tick:u64v(&h,24),k,flags:u32v(&h,44),last_seq,ordinal:u64v(&h,56)};
+    let x=Header{first_seq,epoch:u64v(&h,16),first_tick:u64v(&h,24),bins:BINS,k,flags:u32v(&h,44),last_seq,ordinal:u64v(&h,56)};
     if x.flags&!(if revision==3{31}else{7})!=0 || !x.clean() || x.epoch==0 || x.first_tick==u64::MAX{return Err("OBN2 count/flags/continuous clean group".into())}
     Ok(x)
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Temporary r3 DMA owner. Allocations are pinned until reboot, never file close.
  * Load only after the RAM loader restored the real Maia platform device.
- * ABI 1: INFO 0x4f01, SYNC 0x4f02. mmap selectors: offset0=full (32MiB), offset16MiB=view (2MiB).
+ * ABI 1: INFO 0x4f01, SYNC 0x4f02. mmap selectors: offset0=FULL, offset16MiB=VIEW.
  * CPU mappings are read-only. The single reader syncs after commit and before
  * cumulative release; mmap/close/errors never give allocation back to Linux. */
 #include <linux/module.h>
@@ -24,11 +24,23 @@ static struct device *dev;
 static void __iomem *csr;
 static atomic_t opened=ATOMIC_INIT(0);
 static bool quarantine;
-static bool supported_spectrum(void)
+static u32 view_stride, spectrum_id, spectrum_revision;
+static u32 spectrum_view_stride(void)
 {
  u32 id=readl(csr+0x50), revision=readl(csr+0xe4);
- return (id==0x324e424f && revision==3) ||
-        (id==0x334e424f && revision==4 && (readl(csr+0xe0)&0x60)==0x60);
+ if (id==0x354e424f && revision==1 && (readl(csr+0xe0)&0x1ff)==0x1ff)
+  return 4096;
+ if ((id==0x324e424f && revision==3) ||
+     (id==0x334e424f && revision==4 && (readl(csr+0xe0)&0x60)==0x60))
+  return 2048;
+ return 0;
+}
+static bool supported_spectrum(void)
+{
+ return view_stride && readl(csr+0x50)==spectrum_id && readl(csr+0xe4)==spectrum_revision &&
+        spectrum_view_stride()==view_stride &&
+        readl(csr+0x1c0)==1024 && readl(csr+0x1c4)==32768 &&
+        readl(csr+0x1c8)==view_stride;
 }
 static bool engine_drained(u32 status)
 {
@@ -42,6 +54,11 @@ static int open_owner(struct inode *i, struct file *f)
  if (!capable(CAP_SYS_RAWIO)) return -EPERM;
  if (atomic_cmpxchg(&opened,0,1)) return -EBUSY;
  if (READ_ONCE(quarantine)) { atomic_set(&opened,0); return -EIO; }
+ if (!supported_spectrum()) {
+  WRITE_ONCE(quarantine,true);
+  atomic_set(&opened,0);
+  return -ENODEV;
+ }
  return 0;
 }
 static int close_owner(struct inode *i, struct file *f)
@@ -103,8 +120,11 @@ static int __init begin(void)
 {
  int i,err=-ENODEV;
  csr=ioremap(0x7c460000,0x1000); if(!csr) return -ENOMEM;
+ spectrum_id=readl(csr+0x50);
+ spectrum_revision=readl(csr+0xe4);
+ view_stride=spectrum_view_stride();
  if(!supported_spectrum() || !engine_drained(readl(csr+0x64))) goto fail;
- if(readl(csr+0x1c0)!=1024 || readl(csr+0x1c4)!=32768 || readl(csr+0x1c8)!=2048) { err=-EINVAL; goto fail; }
+ regions[1].len=1024*view_stride;
  dev=bus_find_device_by_name(&platform_bus_type,NULL,"7c460000.maia-sdr"); if(!dev) goto fail;
  err=dma_set_mask_and_coherent(dev,DMA_BIT_MASK(32)); if(err) goto fail;
  for(i=0;i<2;i++) {
@@ -112,7 +132,7 @@ static int __init begin(void)
   if(cached) r->page=dma_alloc_pages(dev,r->len,&r->dma,DMA_FROM_DEVICE,GFP_KERNEL|__GFP_ZERO);
   else r->cpu=dma_alloc_coherent(dev,r->len,&r->dma,GFP_KERNEL);
   if(!r->page && !r->cpu) { err=-ENOMEM; goto fail; }
-  if(r->dma%(i?2048:32768) || r->dma+r->len>0xffffffffULL) { err=-EINVAL; goto fail; }
+  if(r->dma%(i?view_stride:32768) || (u64)r->dma+r->len>0xffffffffULL) { err=-EINVAL; goto fail; }
   if(cached) dma_sync_single_for_device(dev,r->dma,r->len,DMA_FROM_DEVICE);
   pr_info("obs_dma: region%d DMA=%pad len=%zu cached=%d\n",i,&r->dma,r->len,cached);
  }

@@ -50,9 +50,9 @@ impl Map {
         Ok(Self{version,generation,rows:visits})
     }
 
-    fn select(&mut self, request: Request, source_bins: u16) -> R<()> {
+    fn select(&mut self, request: Request, source_bins: u16, fft_bins: u16) -> R<()> {
         for row in self.rows.iter_mut().flatten() {
-            row.bins=roi::bin_ranges(request.range,row.center_hz,row.side,&row.usable,source_bins)
+            row.bins=roi::bin_ranges(request.range,row.center_hz,row.side,&row.usable,source_bins,fft_bins)
                 .filter(|bins| bins.len()<=MAX_RANGES).ok_or("ROI bin selection bounds")?;
         }
         Ok(())
@@ -71,6 +71,8 @@ pub(super) struct Stream {
     full_scan: bool,
     configured_view_bins: u16,
     source_bins: u16,
+    fft_bins: u16,
+    obn5: bool,
     request: Option<Request>,
     initial: Map,
     next: Option<Map>,
@@ -98,10 +100,11 @@ pub(super) struct Stream {
 
 impl Stream {
     pub(super) fn open(peer: SocketAddr, initial: Map, next: Option<Map>,
-                       full_scan: bool, configured_view_bins: u16) -> R<Self> {
+                       full_scan: bool, configured_view_bins: usize, fft_bins: usize, obn5: bool) -> R<Self> {
         let socket=TcpStream::connect_timeout(&peer,IO_DEADLINE).map_err(|e|e.to_string())?;
         socket.set_nonblocking(true).map_err(|e|e.to_string())?;
-        Ok(Self{full_scan,configured_view_bins,source_bins:roi::FFT_BINS as u16,
+        Ok(Self{full_scan,configured_view_bins:configured_view_bins as u16,source_bins:fft_bins as u16,
+            fft_bins:fft_bins as u16,obn5,
             request:None,initial,next,socket:Some(socket),
             free:(0..CAPACITY).map(|_|Vec::with_capacity(FRAME_LIMIT)).collect(),
             pending:VecDeque::with_capacity(CAPACITY),selected:0,selected_bins:0,prepared:0,
@@ -115,11 +118,14 @@ impl Stream {
             // Full-record legacy requests are retained for VIEW-OFF bench comparisons.
             self.request=request.filter(|r| !r.legacy_full_record || self.configured_view_bins==0);
             if let Some(request)=self.request {
+                if request.legacy_full_record && self.fft_bins!=4096 {
+                    return Err("legacy ROI requires FFT4096".into());
+                }
                 self.source_bins=if request.view_bins==self.configured_view_bins {
                     self.configured_view_bins
-                } else { roi::FFT_BINS as u16 };
-                self.initial.select(request,self.source_bins)?;
-                if let Some(next)=self.next.as_mut() { next.select(request,self.source_bins)?; }
+                } else { self.fft_bins };
+                self.initial.select(request,self.source_bins,self.fft_bins)?;
+                if let Some(next)=self.next.as_mut() { next.select(request,self.source_bins,self.fft_bins)?; }
             }
         }
         Ok(())
@@ -139,6 +145,7 @@ impl Stream {
     }
 
     pub(super) fn keeps_record(&self, h: Header, anchor: u64, next_anchor: Option<u64>) -> bool {
+        if self.obn5 && !self.full_scan && self.request.is_none() { return false; }
         if self.full_scan || !self.filters_view() { return true; }
         Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor).is_some_and(|(map,_,relative)| {
             map.rows[(relative%map.rows.len() as u64) as usize].as_ref().is_some_and(|row| !row.bins.is_empty())
@@ -158,14 +165,16 @@ impl Stream {
         let position=relative%map.rows.len() as u64;
         let Some(row)=map.rows[position as usize].as_ref() else { return Ok(()); };
         if row.bins.is_empty() { return Ok(()); }
-        if raw.len()!=obn3::COMPACT_BYTES || h.flags&2!=0 { return Err("ROI requires compact raw scan records".into()); }
+        if raw.len()!=obn3::COMPACT_PREFIX_BYTES+obn3::M45E3_WORD_BYTES*h.bins || h.flags&2!=0 {
+            return Err("ROI requires compact raw scan records".into());
+        }
         let bins=row.bins.iter().map(|b|u64::from(b.end-b.start)).sum::<u64>();
         self.selected+=1;
         self.selected_bins+=bins;
         if self.socket.is_none() {self.rejected+=1;return Ok(());}
         let Some(mut frame)=self.free.pop() else { self.rejected+=1;return Ok(()); };
         frame.clear();
-        let (payload, word_bytes)=if self.source_bins==roi::FFT_BINS as u16 {
+        let (payload, word_bytes)=if self.source_bins==self.fft_bins {
             (&raw[obn3::COMPACT_PREFIX_BYTES..],obn3::M45E3_WORD_BYTES)
         } else { (view,1) };
         if payload.len()!=usize::from(self.source_bins)*word_bytes {
@@ -212,8 +221,10 @@ impl Stream {
     }
 
     fn prepare_full(&mut self, h: Header, raw: &[u8], generation: u64) -> R<()> {
-        if raw.len()!=obn3::COMPACT_BYTES {return Err("full compact TCP requires format 3".into());}
-        let bins=super::continuous::BINS as u64;
+        if raw.len()!=obn3::COMPACT_PREFIX_BYTES+obn3::M45E3_WORD_BYTES*h.bins {
+            return Err("full compact TCP requires format 3".into());
+        }
+        let bins=h.bins as u64;
         self.selected+=1;
         self.selected_bins+=bins;
         if self.socket.is_none() { self.rejected+=1;return Ok(()); }

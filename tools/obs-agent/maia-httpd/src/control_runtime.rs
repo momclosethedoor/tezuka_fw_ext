@@ -270,16 +270,28 @@ fn clock_ns() -> u64 {
 }
 
 fn view_mode(settings: &Value) -> Result<u32> {
-    match settings.get("view_bins") {
-        None => Ok(1),
-        Some(bins) => match bins.as_u64() {
-            Some(0) => Ok(0),
-            Some(512) => Ok(1),
-            Some(1024) => Ok(2),
-            Some(2048) => Ok(3),
-            _ => bail!("view_bins must be 0, 512, 1024 or 2048"),
-        },
+    let bins = settings.get("view_bins").map(|_| int(settings,"view_bins",0,4096))
+        .transpose()?.unwrap_or(512);
+    let fft = settings.get("fft_bins").map(|_| int(settings,"fft_bins",1024,4096))
+        .transpose()?.unwrap_or(4096);
+    ensure!(matches!(fft,1024|2048|4096),"fft_bins must be 1024, 2048 or 4096");
+    [0,fft/8,fft/4,fft/2,fft].iter().position(|&n|n==bins)
+        .map(|mode| mode as u32).ok_or_else(||anyhow!("view_bins must be off or FFT bins divided by 1, 2, 4 or 8"))
+}
+
+fn check_spectrum_settings(settings: &Value, obn5: bool) -> Result<()> {
+    for key in ["fft_bins", "hold_k", "view_bins"] {
+        if settings.get(key).is_some() {
+            ensure!(matches!(settings["op"].as_str(),Some("scan"|"analysis")),"{key} requires scan or analysis");
+        }
     }
+    if settings.get("hold_k").is_some() { int(settings,"hold_k",1,1023)?; }
+    if matches!(settings["op"].as_str(),Some("scan"|"analysis")) {
+        let mode=view_mode(settings)?;
+        ensure!(obn5 || (settings.get("fft_bins").is_none() && settings.get("hold_k").is_none() && mode<4),
+            "fft_bins, hold_k and VIEW /1 require OBN5");
+    }
+    Ok(())
 }
 
 fn roi_request(cmd:&Value,generation:u64)->Result<Option<crate::system_reader::RoiRequest>> {
@@ -309,10 +321,7 @@ fn validate(v: &Value) -> Result<()> {
         ensure!(v["op"] == "scan" && v["planner_version"] == 2, "field_targets requires v2 scan");
         resident_field::targets(&v["field_targets"])?;
     }
-    if v.get("view_bins").is_some() {
-        ensure!(matches!(v["op"].as_str(), Some("scan" | "analysis")), "view_bins requires scan or analysis");
-        view_mode(v)?;
-    }
+    check_spectrum_settings(v,true)?;
     match v["op"].as_str() {
         Some("scan") => {
             if let Some(delivery) = v.get("view_delivery") {
@@ -474,6 +483,9 @@ async fn submit(
         );
     }
     let mut q = shared.inbox.lock().unwrap();
+    if cmd["op"]!="roi" && let Err(error)=check_spectrum_settings(&cmd,q.capabilities["spectrum_abi"]=="OBN5") {
+        return (StatusCode::BAD_REQUEST,Json(json!({"error":error.to_string()})));
+    }
     if let Some(error) = &q.worker_error {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
     }
@@ -488,6 +500,9 @@ async fn submit(
             };
             if q.actual["view_bins"]!=0 && request.is_some_and(|r|r.legacy_full_record) {
                 return (StatusCode::CONFLICT,Json(json!({"error":"full-record ROI requires VIEW OFF"})));
+            }
+            if q.actual["spectrum"]["fft_bins"]!=4096 && request.is_some_and(|r|r.legacy_full_record) {
+                return (StatusCode::CONFLICT,Json(json!({"error":"full-record ROI requires FFT4096"})));
             }
             q.roi_generation=generation;
             q.roi=request;
@@ -1602,7 +1617,8 @@ fn worker(
                 }
                 "scan" | "analysis" => {
                     if request.get("view_bins").is_none() {
-                        request["view_bins"] = pending[op]["view_bins"].as_u64().unwrap_or(512).into();
+                        let previous=pending[op]["view_bins"].as_u64().unwrap_or(512);
+                        request["view_bins"] = if request.get("fft_bins").is_some() {512} else {previous}.into();
                     }
                     resume_scan = None;
                     pending["alternative"] = Value::Null;
@@ -1828,19 +1844,21 @@ fn worker(
                         "resident FIELD requires FLD2/FFM1 and the physical A/B map");
                     let directory=c.output.join(format!("field-{generation}"));
                     fs::create_dir(&directory)?;
+                    let joint_rows = regs.read(0x50) == 0x354e424f && regs.read(0xe4) == 1
+                        && regs.read(0xe0) & 0x100 != 0;
                     let stride=(setup.len()-200)/3;
                     let count=word(setup,8) as usize;
                     let start=40+stride;
                     ensure!(count*32<=stride,"FIELD active map bounds");
                     let plan=resident_field::Plan::compile(&mut setup[start..start+count*32],
-                        &a["spectrum"],&targets,generation)?;
+                        &a["spectrum"],&targets,generation,joint_rows)?;
                     a["field_watch"]=plan.save(&directory)?;
                     if let Some(desc)=next_spectrum.as_ref() {
                         let count=word(setup,12) as usize;
                         let start=40+2*stride;
                         ensure!(count*32<=stride,"FIELD NEXT map bounds");
                         let plan=resident_field::Plan::compile(&mut setup[start..start+count*32],
-                            desc,&targets,generation+1)?;
+                            desc,&targets,generation+1,joint_rows)?;
                         a["field_watch"]["next"]=plan.save(&directory)?;
                     }
                     field_directory=Some(directory);
@@ -1965,12 +1983,17 @@ fn worker(
             let tx_active = actual.borrow()["tx"]["on"] == true;
             let work = c.output.join("reader");
             let k = actual.borrow()["k"].clone();
-            let mode_index = view_mode(&actual.borrow()[&mode])?;
+            let settings=actual.borrow()[&mode].clone();
+            let mode_index = view_mode(&settings)?;
+            let obn5=regs.read(0x50)==0x354e424f;
             let view_only = scan && c.bench_obn3_view_only;
-            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":mode_index,
+            let stream_config=if obn5 {
+                Some(match settings["fft_bins"].as_u64().unwrap_or(4096) {4096=>0,2048=>2,1024=>4,_=>bail!("OBN5 FFT length")})
+            } else {view_only.then_some(0)};
+            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":if obn5{0}else{mode_index},
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
-                "stream_config":view_only.then_some(0u32),"bench_obn3_view_only":view_only,
+                "stream_config":stream_config,"hold_k":settings["hold_k"],"bench_obn3_view_only":view_only,
                 "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
@@ -1997,7 +2020,7 @@ fn worker(
                     ("scan", json!(scan)),
                     ("fs_hz", json!(FS)),
                     ("flags", json!(h.flags)),
-                    ("fft_bins", json!(4096)),
+                    ("fft_bins", json!(h.bins)),
                     (
                         "view_bins",
                         json!(crate::system_reader::view_bins(h)),
@@ -2046,7 +2069,7 @@ fn worker(
                 let mut s = next_spectrum.as_ref().unwrap().clone();
                 for (key,value) in [("generation",json!(next_gen)),("map_epoch",json!(anchor)),
                     ("k",k.clone()),("scan",json!(true)),("fs_hz",json!(FS)),("flags",json!(h.flags)),
-                    ("fft_bins",json!(4096)),("view_bins",json!(crate::system_reader::view_bins(h))),("TX_OFF",Value::Null)] {
+                    ("fft_bins",json!(h.bins)),("view_bins",json!(crate::system_reader::view_bins(h))),("TX_OFF",Value::Null)] {
                     s[key]=value;
                 }
                 a["generation"]=json!(next_gen);
@@ -2505,18 +2528,20 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         );
     }
     let regs = Registers::open()?;
-    let stream002 = regs.read(0x50) == 0x334e424f && regs.read(0xe4) == 4
-        && regs.read(0xe0) & 0x60 == 0x60 && regs.read(0x280) == 0x32444c46
-        && regs.read(0x350) == 0x314d4646;
+    let obn5 = regs.read(0x50)==0x354e424f && regs.read(0xe4)==1 && regs.read(0xe0)&0x1ff==0x1ff;
+    let obn3 = regs.read(0x50)==0x334e424f && regs.read(0xe4)==4 && regs.read(0xe0)&0x60==0x60;
+    let stream002 = (obn3 || obn5) && regs.read(0x280)==0x32444c46 && regs.read(0x350)==0x314d4646;
     let legacy = regs.read(0x50) == 0x324e424f && regs.read(0xe4) == 3;
     ensure!(
         (stream002 || legacy) && regs.read(0x224) == 0x31444c46
             && Path::new("/dev/obs_cap2").exists(),
         "row99 CAP2 and compatible spectral ABI required"
     );
-    ensure!(!stream002 || !c.bench_split544, "OBN3 requires separate DMA regions");
-    ensure!(stream002 || !c.bench_obn3_layout,"OBN3 RAM layout requires OBN3");
-    ensure!(stream002 || !c.bench_obn3_view_only,"OBN3 view-only bench configuration requires OBN3");
+    ensure!(!stream002 || !c.bench_split544, "compact ABI requires separate DMA regions");
+    ensure!(obn3 || !c.bench_obn3_layout,"OBN3 RAM layout requires OBN3");
+    ensure!(obn3 || !c.bench_obn3_view_only,"OBN3 view-only bench configuration requires OBN3");
+    check_spectrum_settings(&c.scan,obn5)?;
+    check_spectrum_settings(&c.analysis,obn5)?;
     ensure!(!stream002 || c.field_preview.is_none(), "legacy FIELD1 collector requires OBN2");
     ensure!(stream002 || c.resident_field.is_none(), "resident FIELD collector requires OBN3/FLD2/FFM1");
     ensure!(stream002 || c.bench_roi.is_none(),"bench ROI requires OBN3");
@@ -2601,8 +2626,10 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let (threshold, mult) = generated::environment()?;
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
-    let view_modes: &[u32] = if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
-    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":stream002,"ring_layout":if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
+    let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
+    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
+        "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
+        "ring_layout":if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,

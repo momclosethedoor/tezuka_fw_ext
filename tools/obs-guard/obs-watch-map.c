@@ -48,10 +48,17 @@ int main(int argc, char **argv)
         int cap2 = (flags & 8u) != 0;
         if (cap2 ? !word : (flags & 32u) ? word >= 0x10000000u : word != 0)
             return 3;
+        uint32_t upper = watch_u32(row + 28);
+        int had_joint = cap2 && (flags & 32u);
+        if (had_joint) put32(row + 28, upper & 15u);
         flags &= ~32u;
         struct watch_target target=watch_row(&tasks,i);
         if (target.enabled) flags |= 32u;
         if (!cap2) put32(row + 12, target.enabled ? target.nco : 0);
+        if (cap2 && target.enabled) {
+            if (!had_joint && upper >= 16u) return 3;
+            put32(row + 28, (upper & 15u) | (target.nco << 4));
+        }
         put32(row + 4, flags);
     }
     int fd = open(argv[3], O_CREAT | O_EXCL | O_WRONLY | O_BINARY, 0600);

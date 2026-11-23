@@ -13,12 +13,18 @@ pub fn geometry(revision:u32,slots:u32,full:u32,view:u32)->Result<(),String>{
 /// Geometry alone is NOT allocation/ownership proof. Called only after a driver
 /// has returned owned DMA addresses, exact lengths and valid mappings.
 pub fn ranges(full:u64,full_len:usize,view:u64,view_len:usize)->Result<(),String>{
-    if full==0||view==0||full%32768!=0||view%2048!=0||full_len!=FULL_LENGTH||view_len!=VIEW_LENGTH{return Err("DMA allocation size/alignment".into())}
+    ranges_for_stride(full,full_len,view,view_len,VIEW_BYTES)
+}
+pub(super) fn ranges_for_stride(full:u64,full_len:usize,view:u64,view_len:usize,stride:usize)->Result<(),String>{
+    if full==0||view==0||full%c::BYTES as u64!=0||view%stride as u64!=0||full_len!=FULL_LENGTH||view_len!=SLOTS*stride{return Err("DMA allocation size/alignment".into())}
     let end=full.checked_add(full_len as u64).ok_or("full overflow")?;
     let vend=view.checked_add(view_len as u64).ok_or("view overflow")?;
     if end>u32::MAX as u64||vend>u32::MAX as u64||!(end<=view||vend<=full){return Err("DMA allocation overlap/end overflow".into())}Ok(())
 }
-pub fn view_len(h:Header)->usize{match(h.flags>>3)&3{0=>0,1=>512,2=>1024,_=>2048}}
+pub fn mode_bins(bins:usize,mode:u32)->usize{
+    match mode {1=>bins/8,2=>bins/4,3=>bins/2,4=>bins,_=>0}
+}
+pub fn view_len(h:Header)->usize{mode_bins(h.bins,((h.flags>>3)&3)|((h.flags>>5)&4))}
 
 // Native OBN2 uses independent full and VIEW slots. The RAM fixture alone
 // needs the owned split544 lookbehind and its displaced VIEW.
@@ -94,7 +100,7 @@ impl PairReader{
         let end=s.committed.min(self.next+io.batch_limit() as u64);
         let full_expected=io.owned_full_bytes();
         io.prepare_prefix(self.next,end)?;
-        let mut owned_view=[0u8;VIEW_BYTES];
+        let mut owned_view=[0u8;super::obn3::OBN5_VIEW_STRIDE];
         for ordinal in self.next..end{
             let mut header=None;let mut n=0;
             let filter=keep.as_mut().map(|f|&mut **f as &mut dyn FnMut(Header)->bool);

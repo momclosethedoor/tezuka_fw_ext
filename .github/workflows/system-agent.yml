@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-scan-stream-002, build/pl-field-stream-001]
+    branches: [build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-scan-stream-002, build/pl-field-stream-001, build/pl-fft-hold-002]
     paths: ['tools/obs-agent/**', 'tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-ffm1-iio.c', 'tools/obs-guard/obs-field-*.h', 'tools/obs-guard/obs-fsb1-stream.h', '.github/workflows/system-agent.yml']
   workflow_dispatch:
 permissions:
@@ -73,7 +73,7 @@ jobs:
           export RUSTFLAGS="-C target-cpu=cortex-a9 -C link-arg=$PWD/agent-neon.o -C link-arg=$PWD/agent-preview.o -C link-arg=-ldl -C link-arg=-lm"
           bench_args=()
           ffm_args=()
-          if [[ "$GITHUB_REF_NAME" == build/arm-scan-stream-002 || "$GITHUB_REF_NAME" == build/pl-field-stream-001 ]]; then
+          if [[ "$GITHUB_REF_NAME" == build/arm-scan-stream-002 || "$GITHUB_REF_NAME" == build/pl-field-stream-001 || "$GITHUB_REF_NAME" == build/pl-fft-hold-002 ]]; then
             bench_args=(--features scan-stream-bench)
             ffm_args=(-DOBS_SCAN_STREAM_BENCH)
           fi

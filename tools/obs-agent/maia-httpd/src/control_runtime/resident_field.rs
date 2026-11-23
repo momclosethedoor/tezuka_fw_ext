@@ -52,7 +52,8 @@ pub(super) struct Plan {
 }
 
 impl Plan {
-    pub(super) fn compile(rows: &mut [u8], desc: &Value, targets: &[Target], revision: u64) -> Result<Self> {
+    pub(super) fn compile(rows: &mut [u8], desc: &Value, targets: &[Target], revision: u64,
+        joint_rows: bool) -> Result<Self> {
         let positions = desc["positions"].as_array().ok_or_else(|| anyhow!("FIELD positions missing"))?;
         ensure!(rows.len() == 32 * positions.len() && (1..=65535).contains(&positions.len()), "FIELD map length");
         let version = desc["version"].as_u64().ok_or_else(|| anyhow!("FIELD map version"))?;
@@ -89,7 +90,15 @@ impl Plan {
                 let row=index*32;
                 let flags=word(rows,row+4);
                 put(rows,row+4,flags|32);
-                if flags&8==0 { put(rows,row+12,nco); }
+                if flags & 8 == 0 {
+                    put(rows,row+12,nco);
+                } else {
+                    ensure!(joint_rows, "joint CAP2/FIELD row requires OBN5 r1 feature bit 8");
+                    ensure!(word(rows,row+12) != 0, "zero CAP2 job ID");
+                    let upper = word(rows,row+28);
+                    ensure!(upper < 16 || flags & 32 != 0, "RF upper endpoint exceeds 36 bits");
+                    put(rows,row+28,(upper & 15) | (nco << 4));
+                }
                 assignments.push(json!({"target_id":target.target_id,"lo_hz":target.lo_hz,
                     "hi_hz":target.hi_hz,"target_hz":hz,"position":index,"phase":phase,
                     "nco":nco,"generation":target.generation}));

@@ -122,7 +122,7 @@ fn compact_tcp_sink_reads_the_owned_copy_only_after_release() {
             &mut self,_:usize,full:&mut[u8],_:&mut[u8],sink:&mut F
         )->R<()> {
             full[..self.dma.len()].copy_from_slice(&self.dma);
-            sink(Header{first_seq:10,last_seq:11,epoch:1,first_tick:5,k:2,flags:1,ordinal:0},&[],&[])
+            sink(Header{first_seq:10,last_seq:11,epoch:1,first_tick:5,bins:4096,k:2,flags:1,ordinal:0},&[],&[])
         }
         fn release(&mut self,run:u32,tail:u64)->R<()>{
             assert_eq!((run,tail),(3,1));
@@ -157,7 +157,7 @@ fn roi_header_only_records_keep_order_and_release_without_exposing_old_payload()
             &mut self,slot:usize,full:&mut[u8],_:&mut[u8],keep:Option<&mut dyn FnMut(Header)->bool>,sink:&mut F
         )->R<usize>{
             assert_eq!(slot,self.tail as usize%1024);
-            let h=Header{first_seq:0,last_seq:1,epoch:self.tail,first_tick:0,k:2,flags:1,ordinal:self.tail};
+            let h=Header{first_seq:0,last_seq:1,epoch:self.tail,first_tick:0,bins:4096,k:2,flags:1,ordinal:self.tail};
             let bytes=if keep.unwrap()(h){
                 self.copies+=1;
                 full[..obn3::COMPACT_BYTES].fill(42);

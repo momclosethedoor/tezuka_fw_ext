@@ -49,6 +49,7 @@ impl SweepSpec {
  boot_id:String,output:PathBuf,command:String,#[serde(default="kdefault")]k:u32,
  #[serde(default)]mode:u32,#[serde(default)]peak:bool,#[serde(default)]scan:bool,
  #[serde(default)]stream_config:Option<u32>,
+ #[serde(default)]hold_k:Option<u32>,
  #[serde(default)]bench_obn3_layout:bool,
  #[serde(default)]bench_obn3_view_only:bool,
  #[serde(default="settledefault")]settling:u32,#[serde(default="secondsdefault")]seconds:f64,
@@ -96,16 +97,28 @@ impl Hardware{
   if unsafe{libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("spectral owner busy".into())}
   let device=OpenOptions::new().read(true).write(true).open("/dev/obs_dma").map_err(|e|e.to_string())?;
   let mut info=Info::default();if unsafe{libc::ioctl(device.as_raw_fd(),0x4f01,&mut info)}!=0{return Err("DMA INFO ioctl".into())}
-  if info.abi!=1{return Err("DMA ABI".into())}view::ranges(info.full,info.full_len as usize,info.view,info.view_len as usize)?;
+  if info.abi!=1{return Err("DMA ABI".into())}
+  let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
+  let id=unsafe{std::ptr::read_volatile(regs.ptr.add(0x50).cast::<u32>())};
+  let stride=if id==obn3::OBN5_ID {obn3::OBN5_VIEW_STRIDE} else {view::VIEW_BYTES};
+  view::ranges_for_stride(info.full,info.full_len as usize,info.view,info.view_len as usize,stride)?;
   // Explicitly exclude both installed reserves, even though DMA API owns CMA.
   for(a,n)in[(info.full,info.full_len),(info.view,info.view_len)]{for(lo,hi)in[(0x06000000,0x0e000000),(0x16000000,0x16040000)]{if a<hi&&a+n as u64>lo{return Err("DMA overlaps stock reserve".into())}}}
   let full=Map::new(&device,info.full_len as usize,0,false)?;let overview=Map::new(&device,info.view_len as usize,0x1000000,false)?;
-  let mem=OpenOptions::new().read(true).write(true).open("/dev/mem").map_err(|e|e.to_string())?;let regs=Map::new(&mem,4096,0x7c460000,true)?;
   let mut h=Self{stream_format:None,bench_obn3_layout:c.bench_obn3_layout,previous_full_len:continuous::BYTES,managed_view_only,phase_on:std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),snapshot_ns:0,release_ns:0,snapshots:0,empty_snapshots:0,release_commands:0,idle_wait_us:0,sync_bytes:0,fast_snapshot_on:std::env::var("OBS_FAST_SNAPSHOT").as_deref()!=Ok("0"),pressure_on:std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"),pressure_due:Instant::now(),pressure:Vec::with_capacity(if std::env::var("OBS_PRESSURE_TRACE").as_deref()==Ok("1"){65536}else{0}),pressure_omitted:0,_lease:lease,device,regs,full,overview,info,valid:0,active:false,shift:c.shift544||c.bench_obn3_layout,logical_tail:None,physical_high_water:0,previous_view:[0,512,1024,2048][c.previous_mode as usize],ranges:Vec::with_capacity(4),copied_bytes:0,view_bytes:0,max_release_gap_us:0,last_release:Instant::now(),sync_ns:0,copy_ns:0,batch_sync:c.batch_sync,direct:c.direct,release_only:c.release_only,batch_limit:c.batch_limit,covered:Vec::with_capacity(4),sync_calls:0,process_ns:0,actual_copy_bytes:0,reuse_owned_cache:c.reuse_owned_cache,retained_synced:None,sync_reused_bytes:0};
-  if (h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))!=(1024,32768,2048) {
+  if (h.r(0x1c0),h.r(0x1c4),h.r(0x1c8))!=(1024,32768,stride as u32) {
    return Err("DMA ring geometry mismatch".into());
   }
+  if id!=obn3::OBN5_ID && (c.mode>3 || c.hold_k.is_some()) {
+   return Err("VIEW mode 4 and hold_k require OBN5".into());
+  }
   match (h.r(0x50),h.r(0xe4)) {
+   (obn3::OBN5_ID,1) if h.r(0xe0)&0x1ff==0x1ff => {
+    if c.shift544 || c.discard_cold || c.diagnostic_sync.is_some() || c.bench_obn3_layout || c.bench_obn3_view_only {
+     return Err("OBN5 requires its native compact DMA layout".into());
+    }
+    h.stream_format=Some(obn3::Format::obn5_config(h.r(0x34c))?);
+   }
    (obn3::ID,4) if h.r(0xe0)&0x60==0x60 => {
     if c.shift544 || c.discard_cold || c.diagnostic_sync.is_some() {
      return Err("OBN3 requires separate full and VIEW slots".into());
@@ -147,7 +160,7 @@ impl Hardware{
   #[cfg(not(target_arch="arm"))] std::sync::atomic::fence(Ordering::SeqCst);
   Ok(())
  }
-  fn visit_obn3<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,format:obn3::Format,slot:usize,
+  fn visit_stream<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,format:obn3::Format,slot:usize,
      full:&mut[u8],keep:Option<&mut dyn FnMut(Header)->bool>,sink:&mut F)->R<usize>{
    let offset=slot*continuous::BYTES;
    let length=format.active_bytes();
@@ -157,19 +170,23 @@ impl Hardware{
    let prefix=OBN3_RAM_SHIFT_BYTES-prev_view;
    let head=if shifted {previous*continuous::BYTES+self.previous_full_len-prefix} else {offset};
    let mut start=0;
+   let mut copy_full=!self.managed_view_only;
    let checked=if self.managed_view_only || keep.is_some() {
     start=format.prefix_bytes();
     self.copy(0,head,&mut full[..start])?;
     let h=format.header(&full[..start])?;
     if keep.is_some_and(|accept| !accept(h)) {
-     self.previous_view=view::view_len(h);
-     self.previous_full_len=length;
-     sink(h,&[],&[])?;
-     return Ok(0);
+     if !matches!(format,obn3::Format::Obn5(_)) {
+      self.previous_view=view::view_len(h);
+      self.previous_full_len=length;
+      sink(h,&[],&[])?;
+      return Ok(0);
+     }
+     copy_full=false;
     }
     Some(h)
    }else{None};
-   if !self.managed_view_only {
+   if copy_full {
     if shifted {
      self.copy(0,head+start,&mut full[start..prefix])?;
      if prev_view!=0{self.copy(1,previous*view::VIEW_BYTES,&mut full[prefix..prefix+prev_view])?;}
@@ -180,19 +197,26 @@ impl Hardware{
    let header=if let Some(h)=checked {h}else{format.header(&full[..length])?};
    let n=view::view_len(header);
    let (region,view_offset,base)=if shifted {(0,offset+length-OBN3_RAM_SHIFT_BYTES,self.full.ptr)}
-      else {(1,slot*view::VIEW_BYTES,self.overview.ptr)};
+      else {(1,slot*format.view_stride(),self.overview.ptr)};
    if n!=0{self.ensure_sync(region,view_offset as u32,n as u32)?;}
    let payload=unsafe{std::slice::from_raw_parts(base.add(view_offset),n)};
    self.previous_view=n;
    self.previous_full_len=length;
    self.view_bytes+=n as u64;
    sink(header,&[],payload)?;
-   Ok(if self.managed_view_only {0} else {length})
+   Ok(if copy_full {length} else {0})
   }
  fn prepare(&mut self,c:&Config)->R<()>{let s=self.snapshot()?;if s.running||s.dma_busy||!s.drained||s.committed!=s.released||s.reserved!=s.committed||s.fault{return Err("START needs STOP/DRAINED/released/nonfatal".into())}
-  if self.stream_format.is_some(){
-   let config=c.stream_config.unwrap_or(2);
-   obn3::Format::from_config(config)?;
+  if let Some(format)=self.stream_format {
+   let is_obn5=matches!(format,obn3::Format::Obn5(_));
+   let config=c.stream_config.unwrap_or(if is_obn5 {0} else {2});
+   if is_obn5 {
+    obn3::Format::obn5_config(config)?;
+    let hold=c.hold_k.unwrap_or(1023);
+    if !(1..=1023).contains(&hold){return Err("hold_k must be 1 through 1023".into());}
+    self.w(0x398,hold);
+    if self.r(0x398)!=hold{return Err("OBN5 hold_k readback".into());}
+   }else{obn3::Format::from_config(config)?;}
    self.w(0x348,config);
    if self.r(0x348)!=config{return Err("OBN3 staged configuration readback".into());}
   }
@@ -204,7 +228,9 @@ impl Hardware{
   if let Some(staged)=staged {
    let effective=self.r(0x34c);
    if effective!=staged{return Err("OBN3 configuration was not latched at START".into());}
-   self.stream_format=Some(obn3::Format::from_config(effective)?);
+   self.stream_format=Some(if matches!(self.stream_format,Some(obn3::Format::Obn5(_))) {
+    obn3::Format::obn5_config(effective)?
+   } else {obn3::Format::from_config(effective)?});
   }
   self.last_release=Instant::now();Ok(())}
  fn service_route(&mut self,q:&RunControl)->R<()>{
@@ -415,7 +441,7 @@ impl PairIo for Hardware{
  }
  fn visit_pair<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,slot:usize,full:&mut[u8],overview:&mut[u8],sink:&mut F)->R<()>{
   if let Some(format)=self.stream_format {
-    return self.visit_obn3(format,slot,full,None,sink).map(|_|());
+    return self.visit_stream(format,slot,full,None,sink).map(|_|());
   }
   if self.managed_view_only {
    let (header_offset,region,view_offset)=view::delivery_offsets(slot,self.shift,self.previous_view);
@@ -457,7 +483,7 @@ impl PairIo for Hardware{
  }
  fn visit_for_release<F:FnMut(Header,&[&[u8]],&[u8])->R<()>>(&mut self,slot:usize,full:&mut[u8],overview:&mut[u8],
     keep:Option<&mut dyn FnMut(Header)->bool>,sink:&mut F)->R<usize>{
-  if let Some(format)=self.stream_format {return self.visit_obn3(format,slot,full,keep,sink);}
+  if let Some(format)=self.stream_format {return self.visit_stream(format,slot,full,keep,sink);}
   self.visit_pair(slot,full,overview,sink)?;
   Ok(0)
  }
@@ -554,23 +580,32 @@ fn udp_socket_queue(socket:&std::net::UdpSocket)->Option<i32> {
 
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
- if !(1..=1023).contains(&c.k)||c.mode>3||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
+ if !(1..=1023).contains(&c.k)||c.mode>4||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
  if c.diagnostic_sync.is_some(){return discard::execute(c)}
  if c.owned_pipeline{return Err("full-copy experiment rejected; use immediate release reader".into())}
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c,control.is_some())?;
+ let obn5=matches!(io.stream_format,Some(obn3::Format::Obn5(_)));
+ let fft_bins=if obn5 {obn3::Format::obn5_config(c.stream_config.unwrap_or(0))?.bins()} else {continuous::BINS};
+ let wire_view_bins=view::mode_bins(fft_bins,c.mode);
  #[cfg(feature="scan-stream-bench")]
  let stream002=io.stream_format.is_some();
  #[cfg(feature="scan-stream-bench")]
  let roi_control=control.and_then(|q|q.roi.as_ref());
+ if obn5 && control.is_some() {
+  #[cfg(feature="scan-stream-bench")]
+  {io.managed_view_only=roi_control.is_none();}
+  #[cfg(not(feature="scan-stream-bench"))]
+  {io.managed_view_only=true;}
+ }
  #[cfg(feature="scan-stream-bench")]
  let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
   if !c.scan || !stream002 || (config.full_scan && c.mode != 0) {
    return Err("ROI requires an active OBN3 scan; full compact TCP requires VIEW OFF".into());
   }
   let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),
-   config.full_scan,[0,512,1024,2048][c.mode as usize])?;
+   config.full_scan,wire_view_bins,fft_bins,obn5)?;
   stream.update((config.request)())?;
   Some(stream)
  }else{None});
@@ -598,7 +633,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut reader=view::PairReader::attach(initial)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
  let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
- let record_bytes=(if control.is_some(){64}else{56})+[0,512,1024,2048][c.mode as usize];
+ let record_bytes=(if control.is_some(){64}else{56})+wire_view_bins;
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  if control.is_some() && let Some(sock)=&socket{
   let mut net=network.borrow_mut();
@@ -629,7 +664,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let mut sampled_execution=None;
   let next_for_record=||control.and_then(|q|q.next.as_ref()).and_then(|next|(next.anchor)());
   #[cfg(feature="scan-stream-bench")]
-  let roi_header_filter=std::env::var_os("OBS_ROI_HEADER_FILTER").is_some_and(|v|v=="1");
+  let roi_header_filter=obn5 || std::env::var_os("OBS_ROI_HEADER_FILTER").is_some_and(|v|v=="1");
   #[cfg(feature="scan-stream-bench")]
   let filter_anchor=std::cell::Cell::new(None);
   #[cfg(feature="scan-stream-bench")]
@@ -656,7 +691,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   if let Some(q)=control {
     let view_bytes=if header_only{view::view_len(h)}else{overview.len()};
-    if view_bytes!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
+    if view_bytes!=wire_view_bins{return Err("delivery VIEW geometry differs from active descriptor".into())}
    if execution.get().is_none(){
     let e=Execution{generation:q.generation,version:q.version,anchor:if c.scan{initial_anchor}else{h.epoch},run:initial.cookie};
     if h.epoch<e.anchor{network.borrow_mut().suppressed+=1;return Ok(())}
@@ -676,12 +711,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     (next.started)(h,e);
    }
   #[cfg(feature="scan-stream-bench")]
-  let overview=if zoom.borrow().as_ref().is_some_and(roi_stream::Stream::filters_view){
+  let overview=if !obn5 && zoom.borrow().as_ref().is_some_and(roi_stream::Stream::filters_view){
     if view::view_len(h)!=0{network.borrow_mut().suppressed+=1;}
    &[][..]
   }else{overview};
   if let Some(sock)=&socket{
-   if control.is_none() && !overview.is_empty() && overview.len()!=[0,512,1024,2048][c.mode as usize]{return Err("delivery VIEW geometry differs from active descriptor".into())}
+   if control.is_none() && !obn5 && !overview.is_empty() && overview.len()!=wire_view_bins{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
    if execution.get().is_some_and(|e|h.epoch<e.anchor){net.suppressed+=1;return Ok(())}
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
@@ -693,8 +728,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  };
   let mut service=|reader:&mut view::PairReader,io:&mut Hardware|{
    #[cfg(feature="scan-stream-bench")]
-   if roi_header_filter && io.stream_format==Some(obn3::Format::Compact)
-       && zoom.borrow().as_ref().is_some_and(roi_stream::Stream::filters_view) {
+   if roi_header_filter && (obn5 || io.stream_format==Some(obn3::Format::Compact))
+       && zoom.borrow().as_ref().is_some_and(|stream|obn5||stream.filters_view()) {
     return reader.service_filtered(io,Some(&mut keep),full_read_without_sum,&mut sink);
    }
    reader.service_released(io,full_read_without_sum,&mut sink)

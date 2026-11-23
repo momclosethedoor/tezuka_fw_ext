@@ -1,8 +1,7 @@
 //! Select calibrated RF bins from an existing fftshifted record.
 use std::ops::Range;
 
-pub(super) const FFT_BINS: i64 = 4096;
-pub(super) const FFT_STEP_HZ: i64 = 61_440_000 / FFT_BINS;
+const FS_HZ: i64 = 61_440_000;
 
 pub(crate) fn bin_ranges(
     [start, stop]: [i64; 2],
@@ -10,19 +9,22 @@ pub(crate) fn bin_ranges(
     side: i64,
     usable_hz: &[[i64; 2]],
     source_bins: u16,
+    fft_bins: u16,
 ) -> Option<Vec<Range<u16>>> {
     if start >= stop
         || !(70_000_000..=13_000_000_000).contains(&profile_center_hz)
         || !matches!(side, -1 | 1)
-        || !matches!(source_bins, 512 | 1024 | 2048 | 4096)
+        || !matches!(fft_bins, 1024 | 2048 | 4096)
+        || source_bins < fft_bins / 8 || source_bins > fft_bins || !source_bins.is_power_of_two()
     {
         return None;
     }
     let bins = i64::from(source_bins);
-    let stride = FFT_BINS / bins;
-    let margin = (stride - 1) * FFT_STEP_HZ / 2;
+    let stride = i64::from(fft_bins) / bins;
+    let fft_step = FS_HZ / i64::from(fft_bins);
+    let margin = (stride - 1) * fft_step / 2;
     let center = profile_center_hz + side * margin;
-    let step = stride * FFT_STEP_HZ;
+    let step = stride * fft_step;
     let mut ranges = Vec::with_capacity(usable_hz.len());
     for &[usable_start, usable_stop] in usable_hz {
         // Include an aggregated VIEW bin only if all its source bins fit.
@@ -62,6 +64,8 @@ mod tests {
 
     #[test]
     fn bin_selection_matches_rf_coordinate_for_both_mixer_orientations() {
+        const FFT_BINS: i64 = 4096;
+        const FFT_STEP_HZ: i64 = FS_HZ / FFT_BINS;
         let center = 5_865_000_000;
         let usable = [[center - 27_000_000, center - 500_000],
             [center + 500_000, center + 27_000_000]];
@@ -70,7 +74,7 @@ mod tests {
             for side in [-1, 1] {
                 for bins in [512, 1024, 2048, 4096] {
                     let stride = FFT_BINS / i64::from(bins);
-                    let ranges = bin_ranges(limits, center, side, &usable, bins).unwrap();
+                    let ranges = bin_ranges(limits, center, side, &usable, bins, FFT_BINS as u16).unwrap();
                     for bin in 0..bins {
                         let hz = |offset| center + side * (i64::from(bin) * stride + offset - FFT_BINS / 2) * FFT_STEP_HZ;
                         let endpoints = [hz(0), hz(stride - 1)];
