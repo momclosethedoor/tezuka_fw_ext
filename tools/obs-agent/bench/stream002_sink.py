@@ -243,6 +243,7 @@ def main():
             summary["connections"] += 1
             previous = None
             seen = 0
+            hold_samples = 0
             with conn:
                 conn.settimeout(2)
                 try:
@@ -255,10 +256,12 @@ def main():
                             break
                         if args.mode != "field":
                             sample = None
-                            if args.sample_file and seen < 64:
+                            on_hold = args.sample_file and args.mode == "compact" and COMPACT.unpack(head)[6] & 64
+                            if args.sample_file and (seen < 64 or on_hold and hold_samples < 16):
                                 def sample(row):
                                     with args.sample_file.open("a", encoding="utf-8") as stream:
                                         stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+                                hold_samples += bool(on_hold)
                             ordinal, bins, length = receive(conn, head, sample) if sample else receive(conn, head)
                             seen += 1
                             if previous is not None and ordinal <= previous:

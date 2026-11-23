@@ -37,7 +37,7 @@ class BenchReceiver(Receiver):
 
     def sample_view(self, generation, ordinal, flags, k, view):
         records = self.view_samples.setdefault(generation, [])
-        if len(records) < 512:
+        if len(records) < 512 or flags & 64 and len(records) < 528:
             records.append(dict(generation=generation, ordinal=ordinal, flags=flags,
                                 actual_k=k, payload_hex=view.hex()))
 
@@ -206,7 +206,7 @@ def mode_regressions(stand, probe, receiver, log, analysis, obn5=False):
                 else:
                     raise RuntimeError(f"{mode} has no fresh data in generation {gen}")
                 stages.append(dict(mode=mode,generation=gen,records=count,view_bins=active.get("view_bins"),
-                                   fft_bins=active.get("spectrum", {}).get("fft_bins"),
+                                   fft_bins=(active.get("spectrum") or {}).get("fft_bins"),
                                    tx=active["tx"],guard_tx=active.get("guard_tx")))
                 previous = gen
         except RuntimeError as error:
