@@ -677,7 +677,9 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    let header_only=filtered.is_some() && _owned_full.is_empty();
    let next_at=filtered.unwrap_or_else(&next_for_record);
    if let Some(zoom)=zoom.borrow_mut().as_mut(){
-    if !header_only {zoom.prepare(h,_owned_full,overview,initial_anchor,next_at)?;}
+    if !header_only || roi_control.is_some_and(|config|config.production) {
+     zoom.prepare(h,_owned_full,overview,initial_anchor,next_at)?;
+    }
     zoom.pump();
    }
   if let Some(q)=control {

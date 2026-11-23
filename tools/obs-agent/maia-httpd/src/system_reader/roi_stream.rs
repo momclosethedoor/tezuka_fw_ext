@@ -158,15 +158,21 @@ impl Stream {
     pub(super) fn keeps_record(&self, h: Header, anchor: u64, next_anchor: Option<u64>) -> bool {
         if self.obn5 && !self.full_scan && self.request.is_none() { return false; }
         if self.production && (self.socket.is_none() || self.connecting) { return false; }
+        if self.uses_view() { return false; }
         if self.full_scan || !self.filters_view() { return true; }
         Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor).is_some_and(|(map,_,relative)| {
             map.rows[(relative%map.rows.len() as u64) as usize].as_ref().is_some_and(|row| !row.bins.is_empty())
         })
     }
 
+    fn uses_view(&self) -> bool {
+        self.production && self.source_bins < self.fft_bins && self.configured_view_bins >= self.source_bins
+    }
+
     pub(super) fn prepare(&mut self, h: Header, raw: &[u8], view: &[u8],
                           anchor: u64, next_anchor: Option<u64>) -> R<()> {
         if !self.full_scan && self.request.is_none() {return Ok(());}
+        if self.production && (self.socket.is_none() || self.connecting) {return Ok(());}
         let Some((map,anchor,relative))=Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor) else { return Ok(()); };
         if self.full_scan {
             let generation=map.generation;
@@ -177,7 +183,8 @@ impl Stream {
         let position=relative%map.rows.len() as u64;
         let Some(row)=map.rows[position as usize].as_ref() else { return Ok(()); };
         if row.bins.is_empty() { return Ok(()); }
-        if raw.len()!=obn3::COMPACT_PREFIX_BYTES+obn3::M45E3_WORD_BYTES*h.bins || h.flags&2!=0 {
+        let view_source = self.uses_view();
+        if (!view_source && raw.len()!=obn3::COMPACT_PREFIX_BYTES+obn3::M45E3_WORD_BYTES*h.bins) || h.flags&2!=0 {
             return Err("ROI requires compact raw scan records".into());
         }
         let bins=row.bins.iter().map(|b|u64::from(b.end-b.start)).sum::<u64>();
@@ -225,7 +232,11 @@ impl Stream {
         if request.legacy_full_record {
             frame.extend_from_slice(raw);
         } else {
-            frame.extend_from_slice(&raw[..obn3::COMPACT_PREFIX_BYTES]);
+            if view_source {
+                frame.extend_from_slice(&view_prefix(h));
+            } else {
+                frame.extend_from_slice(&raw[..obn3::COMPACT_PREFIX_BYTES]);
+            }
             for range in &row.bins {
                 let stride = usize::from(input_bins / self.source_bins) * word_bytes;
                 let selected = &payload[usize::from(range.start)*stride..usize::from(range.end)*stride];
@@ -330,6 +341,7 @@ impl Stream {
             (unsafe{libc::ioctl(socket.as_raw_fd(),libc::TIOCOUTQ,&mut value)}==0).then_some(value)
         });
         json!({"full_scan":self.full_scan,"generation":self.request.map(|r|r.generation),"selected":self.selected,
+            "source":if self.uses_view(){"view"}else{"full"},"effective_bins":self.source_bins,
             "selected_bins":self.selected_bins,"prepared":self.prepared,"sent":self.sent,"sent_bins":self.sent_bins,
             "accepted_bytes":self.accepted_bytes,"sent_bytes":self.sent_bytes,"rejected":self.rejected,
             "abandoned":self.abandoned,"partial":self.partial,"blocked":self.blocked,
@@ -347,6 +359,21 @@ fn compact_code(word: &[u8]) -> u8 {
     let value = u64::from_le_bytes(bytes);
     let mantissa = value & ((1u64 << 45) - 1);
     if mantissa == 0 { 0 } else { (64 - mantissa.leading_zeros() + 2 * (value >> 45) as u32) as u8 }
+}
+
+fn view_prefix(h: Header) -> [u8; obn3::COMPACT_PREFIX_BYTES] {
+    let mut prefix = [0; obn3::COMPACT_PREFIX_BYTES];
+    for (offset, value) in [
+        (0,obn3::OBN5_ID),(4,0x0040_0001),(32,h.bins as u32),(36,h.k),
+        (40,super::continuous::TICK_HZ as u32),(44,h.flags),(48,3),
+        (52,obn3::Format::Obn5(h.bins).active_bytes() as u32),
+    ] {
+        prefix[offset..offset+4].copy_from_slice(&value.to_le_bytes());
+    }
+    for (offset, value) in [(8,h.first_seq),(16,h.epoch),(24,h.first_tick),(56,h.ordinal)] {
+        prefix[offset..offset+8].copy_from_slice(&value.to_le_bytes());
+    }
+    prefix
 }
 
 fn connect_nonblocking(peer: SocketAddrV4) -> io::Result<TcpStream> {
