@@ -220,7 +220,7 @@ def main():
         stand.uart("load")
         if args.obn5_layout_check:
             stand.upload(args.obn5_layout_check, remote, "obn5-layout-check")
-            result=stand.ssh(f"cd {remote}; chmod 700 obn5-layout-check && timeout 10 ./obn5-layout-check; echo status=$?")
+            result=stand.ssh(f"cd {remote}; chmod 700 obn5-layout-check && timeout 10 ./obn5-layout-check 2>&1; echo status=$?")
             (log / "direct-layout.log").write_text(result, encoding="utf-8")
             print(result, flush=True)
             if not result.strip().endswith("status=0"):

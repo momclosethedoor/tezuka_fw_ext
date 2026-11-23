@@ -164,7 +164,7 @@ impl Hardware{
      full:&mut[u8],keep:Option<&mut dyn FnMut(Header)->bool>,sink:&mut F)->R<usize>{
    let offset=slot*continuous::BYTES;
    let length=format.active_bytes();
-   let shifted=cfg!(feature="scan-stream-bench") && self.bench_obn3_layout;
+   let shifted=self.shift;
    let previous=slot.wrapping_sub(1)&(view::SLOTS-1);
    let prev_view=self.previous_view;
    let prefix=OBN3_RAM_SHIFT_BYTES-prev_view;
@@ -246,8 +246,9 @@ impl Hardware{
   Ok(())
  }
  fn cold_split(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
-  #[cfg(feature="scan-stream-bench")]
-  if self.bench_obn3_layout{return self.bind_obn3_prefix(control,c);}
+  if self.bench_obn3_layout || matches!(self.stream_format,Some(obn3::Format::Obn5(_))) {
+   return self.bind_stream_layout(control,c);
+  }
   let initial=self.snapshot()?;
   if !self.shift||control.is_none()&&(initial.cookie!=1||initial.released!=0){return Ok(Value::Null)}
   let start=Instant::now();
@@ -295,51 +296,66 @@ impl Hardware{
   Ok(json!({"discarded":1,"run":1,"ordinal":0,"first_epoch":first_epoch,
             "next_epoch":next.epoch,"physical_released":self.r64(0x110)}))
  }
- #[cfg(feature="scan-stream-bench")]
- fn bind_obn3_prefix(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
+ fn bind_stream_layout(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
   let initial=self.snapshot()?;
   let cold=initial.cookie==1 && initial.released==0;
-  let format=self.stream_format.ok_or("OBN3 layout without OBN3 ABI")?;
+  let format=self.stream_format.ok_or("compact layout without a stream ABI")?;
+  let auto=matches!(format,obn3::Format::Obn5(_));
   let start=Instant::now();
   loop {
    if STOP.load(Ordering::Relaxed)||control.is_some_and(|q|q.stop.load(Ordering::Acquire)){
-    return Err("OBN3 RAM prefix binding cancelled".into());
+    return Err("spectrum layout binding cancelled".into());
    }
    if let Some(q)=control.filter(|_|c.scan){self.service_route(q)?;(q.check)()?;}
    let s=self.fast_snapshot()?;
    if !s.running||s.fault||s.cookie!=initial.cookie||s.released!=initial.released
-      ||s.reserved-s.released>=view::SLOTS as u64 {return Err("OBN3 RAM prefix no longer owned".into());}
+      ||s.reserved-s.released>=view::SLOTS as u64 {return Err("spectrum layout prefix no longer owned".into());}
    let mut first=initial.released;
    let mut binding=None;
-   if s.committed>first{binding=self.find_obn3_prefix(format,first,c)?;}
+   if s.committed>first {
+    if auto && let Some(h)=self.stream_header_at(format,first as usize & (view::SLOTS-1),0,first)? {
+     return Ok(json!({"run":initial.cookie,"layout":"native","ordinal":first,"epoch":h.epoch}));
+    }
+    binding=self.find_stream_prefix(format,first,c)?;
+   }
    if binding.is_none() && cold && s.committed>=2 {
     first=1;
-    binding=self.find_obn3_prefix(format,first,c)?;
+    binding=self.find_stream_prefix(format,first,c)?;
    }
    if let Some((length,view_width,header))=binding {
+    self.shift=true;
     self.previous_full_len=length;
     self.previous_view=view_width;
     if first!=initial.released {self.release(initial.cookie,first)?;}
-    return Ok(json!({"run":initial.cookie,"ordinal":first,"epoch":header.epoch,
+    return Ok(json!({"run":initial.cookie,"layout":"split544","ordinal":first,"epoch":header.epoch,
         "previous_active_bytes":length,"previous_view_bytes":view_width,
         "unrecoverable_cold_records":first-initial.released}));
    }
    if s.committed-initial.released>=2 || start.elapsed()>OBN3_PREFIX_TIMEOUT{
-    return Err("could not bind the observed OBN3 RAM prefix".into());
+    return Err("could not bind the committed spectrum layout".into());
    }
    std::thread::sleep(OBN3_PREFIX_POLL);
   }
  }
- #[cfg(feature="scan-stream-bench")]
- fn find_obn3_prefix(&mut self,format:obn3::Format,ordinal:u64,c:&Config)->R<Option<(usize,usize,Header)>>{
+ fn stream_header_at(&mut self,format:obn3::Format,slot:usize,offset:usize,ordinal:u64)->R<Option<Header>>{
+  let offset=slot*continuous::BYTES+offset;
+  let len=format.prefix_bytes();
+  self.ensure_sync(0,offset as u32,len as u32)?;
+  let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(offset),len)};
+  Ok(format.header(prefix).ok().filter(|h|h.ordinal==ordinal))
+ }
+ fn find_stream_prefix(&mut self,format:obn3::Format,ordinal:u64,c:&Config)->R<Option<(usize,usize,Header)>>{
   let slot=ordinal.wrapping_sub(1) as usize&(view::SLOTS-1);
-  for previous_active in [obn3::COMPACT_BYTES,continuous::BYTES] {
-   for previous_view in [0,512,1024,2048] {
-    let offset=slot*continuous::BYTES+previous_active-OBN3_RAM_SHIFT_BYTES+previous_view;
-    let len=format.prefix_bytes();
-    self.ensure_sync(0,offset as u32,len as u32)?;
-    let prefix=unsafe{std::slice::from_raw_parts(self.full.ptr.add(offset),len)};
-    if let Ok(h)=format.header(prefix) && h.ordinal==ordinal && h.k==c.k && (h.flags>>3)&3==c.mode {
+  let auto=matches!(format,obn3::Format::Obn5(_));
+  let shapes:&[obn3::Format]=if auto {&[obn3::Format::Obn5(4096),obn3::Format::Obn5(2048),obn3::Format::Obn5(1024)]}
+       else {&[obn3::Format::Compact,obn3::Format::Native]};
+  for shape in shapes {
+   let previous_active=shape.active_bytes();
+   for mode in 0..=if auto {4} else {3} {
+    let previous_view=view::mode_bins(shape.bins(),mode);
+    let offset=previous_active-OBN3_RAM_SHIFT_BYTES+previous_view;
+    if let Some(h)=self.stream_header_at(format,slot,offset,ordinal)? &&
+       (auto || h.k==c.k && (h.flags>>3)&3==c.mode) {
      return Ok(Some((previous_active,previous_view,h)));
     }
    }
@@ -516,7 +532,7 @@ fn full_read_without_sum(b:&[u8]){
 }
 fn save(c:&Config,name:&str,v:&Value)->R<()>{std::fs::write(c.output.join(name),serde_json::to_vec_pretty(v).unwrap()).map_err(|e|e.to_string())}
 fn mark(io:&mut Hardware,reader:&view::PairReader,start:Instant)->R<Value>{let regs=io.counters()?;Ok(json!({"time":start.elapsed().as_secs_f64(),"cpu_seconds":cpu(),"memory":memory(),"regs":regs,"full_read":reader.read,"stream_config":io.stream_format.map(|_|io.r(0x34c)),"managed_view_only":io.managed_view_only,"full_read_ns":reader.full_read_ns.to_string(),"view_own_ns":reader.view_own_ns.to_string(),"after_release_ns":reader.after_release_ns.to_string(),"metadata_read":reader.visited,"sync_calls":io.sync_calls,"sync_bytes":io.sync_bytes,
-"payload_read_bytes":io.copied_bytes,"payload_skipped":reader.payload_skipped,"metadata_span_bytes":if io.managed_view_only{reader.visited*512}else{reader.payload_skipped*obn3::COMPACT_PREFIX_BYTES as u64},
+"payload_read_bytes":io.copied_bytes,"payload_skipped":reader.payload_skipped,"metadata_span_bytes":if io.managed_view_only{reader.visited*io.stream_format.map_or(512,obn3::Format::prefix_bytes) as u64}else{reader.payload_skipped*obn3::COMPACT_PREFIX_BYTES as u64},"split544":io.shift,
 "owned_view_bytes":io.view_bytes,"snapshot_calls":io.snapshots,"empty_snapshots":io.empty_snapshots,"release_commands":io.release_commands,"managed_idle_wait_us":if io.managed_view_only{io.idle_wait_us}else{0},"process_ns":io.process_ns.to_string(),"phase_timing":io.phase_on,"snapshot_ns":io.snapshot_ns.to_string(),"release_ns":io.release_ns.to_string(),"actual_copy_bytes":io.actual_copy_bytes,"consumed":reader.consumed,"full_bytes":io.copied_bytes,"view_bytes":io.view_bytes,"sync_ns":io.sync_ns.to_string(),"copy_ns":io.copy_ns.to_string()}))}
 fn interface_counters()->Value{json!({"monotonic_s":crate::delivery_runtime::mono(),"netdev":std::fs::read_to_string("/proc/net/dev").unwrap_or_default(),"snmp":std::fs::read_to_string("/proc/net/snmp").unwrap_or_default()})}
 pub(crate) fn view_bins(header: Header) -> usize {
@@ -618,7 +634,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   io.prepare(c)?;io.start()?;std::thread::sleep(Duration::from_secs_f64(c.seconds));io.stop();let t=Instant::now();while {let s=io.snapshot()?;s.dma_busy||!s.drained||s.committed!=s.reserved}{if t.elapsed()>Duration::from_secs(3){return Err("capture STOP timeout".into())}std::thread::sleep(Duration::from_millis(1));}
   save(c,"unreleased.json",&io.counters()?)?;
   // Heavy whole-ring evidence is outside every rate window, before ANY release.
-  for(r,n)in[(0,0x2000000),(1,0x200000)]{let mut b=vec![0;n];io.copy(r,0,&mut b)?;std::fs::write(c.output.join(if r==0{"full-ring.bin"}else{"view-ring.bin"}),b).map_err(|e|e.to_string())?;io.give_back()?;}
+  for(r,n)in[(0,io.info.full_len),(1,io.info.view_len)]{let mut b=vec![0;n as usize];io.copy(r,0,&mut b)?;std::fs::write(c.output.join(if r==0{"full-ring.bin"}else{"view-ring.bin"}),b).map_err(|e|e.to_string())?;io.give_back()?;}
   // Diagnostic export owns both copied rings. Drain the descriptor tail
   // before handing the radio back, so another diagnostic can start safely.
   let drained=io.snapshot()?;
@@ -716,7 +732,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    &[][..]
   }else{overview};
   if let Some(sock)=&socket{
-   if control.is_none() && !obn5 && !overview.is_empty() && overview.len()!=wire_view_bins{return Err("delivery VIEW geometry differs from active descriptor".into())}
+   if control.is_none() && !overview.is_empty() && overview.len()!=wire_view_bins{return Err("delivery VIEW geometry differs from active descriptor".into())}
    let mut net=network.borrow_mut();
    if execution.get().is_some_and(|e|h.epoch<e.anchor){net.suppressed+=1;return Ok(())}
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
@@ -746,7 +762,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){
     let filtering=zoom.filters_view();
     zoom.update((config.request)())?;
-    if !filtering && zoom.filters_view(){network.borrow_mut().suppress_pending();}
+    if !obn5 && !filtering && zoom.filters_view(){network.borrow_mut().suppress_pending();}
    }
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
    if let Some(q)=control {

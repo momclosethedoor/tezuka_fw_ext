@@ -6,13 +6,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
-enum { SLOTS = 1024, FULL = 32768, VIEW = 4096, OBN5 = 0x354e424f };
+enum { SLOTS = 1024, FULL = 32768, VIEW = 4096, OBN5 = 0x354e424f, SHIFT = 544 * 8 };
 static volatile uint32_t *regs;
 static const uint8_t *full, *views;
 
@@ -55,17 +56,61 @@ static void print_locations(unsigned first, unsigned count)
     }
 }
 
+static bool has_header(const uint8_t *p, uint64_t ordinal)
+{
+    return le(p, 4) == OBN5 && le(p+4, 4) == 0x400001 && le(p+56, 8) == ordinal;
+}
+
+static bool bind_split(uint64_t ordinal, unsigned *last_length, unsigned *last_view)
+{
+    const uint8_t *previous = full + ((ordinal - 1) % SLOTS) * FULL;
+    for (unsigned bins = 4096; bins >= 1024; bins /= 2) {
+        unsigned length = 128 + 6 * bins;
+        unsigned widths[] = {0, bins / 8, bins / 4, bins / 2, bins};
+        for (unsigned i = 0; i < sizeof widths / sizeof *widths; ++i) {
+            if (has_header(previous + length - SHIFT + widths[i], ordinal)) {
+                *last_length = length;
+                *last_view = widths[i];
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void validate(uint64_t first, uint64_t end, unsigned bins, unsigned mode)
 {
     unsigned divisor = mode == 4 ? 1 : 4;
     unsigned length = 128 + 6 * bins;
+    unsigned last_length = 0, last_view = 0;
+    bool split = !has_header(full + (first % SLOTS) * FULL, first);
+    if (split && !bind_split(first, &last_length, &last_view)) {
+        check(first == 0 && bind_split(1, &last_length, &last_view), "split544 binding");
+        puts("Cold ordinal 0 lacks a complete split544 prefix");
+        ++first;
+    }
+    printf("layout=%s first_checked=%" PRIu64 " previous_length=%u previous_view=%u\n",
+           split ? "split544" : "native", first, last_length, last_view);
+    uint8_t reconstruction[128 + 6 * 4096];
     uint64_t previous_seq = 0;
     for (uint64_t ordinal = first; ordinal < end; ++ordinal) {
         unsigned slot = ordinal % SLOTS;
         const uint8_t *p = full + slot * FULL;
-        if (le(p, 4) != OBN5 || le(p+56, 8) != ordinal)
+        const uint8_t *overview = views + slot * VIEW;
+        if (split) {
+            unsigned prev = (slot + SLOTS - 1) % SLOTS;
+            unsigned prefix = SHIFT - last_view;
+            memcpy(reconstruction, full + prev * FULL + last_length - prefix, prefix);
+            memcpy(reconstruction + prefix, views + prev * VIEW, last_view);
+            memcpy(reconstruction + SHIFT, p, length - SHIFT);
+            overview = p + length - SHIFT;
+            p = reconstruction;
+            last_length = length;
+            last_view = bins / divisor;
+        }
+        if (!has_header(p, ordinal))
             print_locations(first % SLOTS, (unsigned)(end-first));
-        check(le(p, 4) == OBN5 && le(p+56, 8) == ordinal, "FULL header placement/ordinal");
+        check(has_header(p, ordinal), "FULL header placement/ordinal");
         unsigned flags = le(p+44, 4);
         check(le(p+4, 4) == 0x400001 && le(p+32, 4) == bins && le(p+36, 4) == 64 &&
               le(p+40, 4) == 62500000 && le(p+48, 4) == 3 && le(p+52, 4) == length &&
@@ -80,7 +125,7 @@ static void validate(uint64_t first, uint64_t end, unsigned bins, unsigned mode)
                 unsigned code = mantissa ? 64 - __builtin_clzll(mantissa) + 2 * (word >> 45) : 0;
                 if (max_code < code) max_code = code;
             }
-            check(views[slot * VIEW + bin / divisor] == max_code, "VIEW reduction or placement");
+            check(overview[bin / divisor] == max_code, "VIEW reduction or placement");
         }
         uint64_t seq = le(p+8, 8);
         check(ordinal == first || seq - previous_seq == 64, "static FFT cadence");
@@ -102,8 +147,12 @@ int main(void)
     check(mem >= 0, "open Maia CSR");
     regs = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mem, 0x7c460000);
     check(full != MAP_FAILED && views != MAP_FAILED && regs != MAP_FAILED, "DMA or CSR mmap");
-    check(regs[0x50/4] == OBN5 && regs[0x64/4] == 16 && !regs[0x284/4] && !regs[0x1e0/4],
+    printf("Initial abi=%08x spectrum=%08x field_run=%08x guard=%08x session=%08x\n",
+           regs[0x50/4], regs[0x64/4], regs[0x284/4], regs[0x1e0/4], regs[0x354/4]);
+    check(regs[0x50/4] == OBN5 && regs[0x64/4] == 16 && !regs[0x354/4] && !regs[0x1e0/4],
           "stopped OBN5 with no other owner");
+    regs[0x284/4] = 0;
+    check(!regs[0x284/4], "stop unowned real8 stream before the static reference");
     printf("DMA full=0x%08" PRIx64 " view=0x%08" PRIx64 " cached=%u\n", info.full, info.view, info.cached);
     for (unsigned test = 0; test < 6; ++test) {
         unsigned config = 2 * (test % 3);
