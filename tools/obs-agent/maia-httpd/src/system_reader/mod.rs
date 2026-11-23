@@ -615,8 +615,8 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  }
  #[cfg(feature="scan-stream-bench")]
  let zoom=std::cell::RefCell::new(if let Some(config)=roi_control {
-  if !c.scan || !stream002 || (config.full_scan && c.mode != 0) {
-   return Err("ROI requires an active OBN3 scan; full compact TCP requires VIEW OFF".into());
+  if !c.scan || !stream002 || (config.full_scan && c.mode != 0 && !obn5) {
+   return Err("ROI requires an active compact scan; parallel full TCP and VIEW require OBN5".into());
   }
   let mut stream=roi_stream::Stream::open(config.peer,config.initial.clone(),config.next.clone(),
    config.full_scan,wire_view_bins,fft_bins,obn5)?;

@@ -48,6 +48,10 @@ def row(lo, hi):
 
 class Receiver(Sinks):
     obn5 = False
+    record_views = False
+
+    def sample_view(self, generation, ordinal, flags, k, view):
+        pass
 
     def __init__(self, folder, capture_pal=False, window_s=30):
         self.capture_pal = capture_pal
@@ -100,15 +104,23 @@ class Receiver(Sinks):
             now = time.perf_counter_ns()
             magic = buf[:8]
             if magic == b"GSWEEP1\x00" and size == SWEEP.size:
-                _, gen, version, anchor, pass_id, phase, first, last, _, _, _, expected, observed, flags = SWEEP.unpack_from(buf)
+                _, gen, version, anchor, pass_id, phase, first, last, _, _, last_tick, expected, observed, flags = SWEEP.unpack_from(buf)
                 if not (gen and version and first >= anchor and first <= last and phase == pass_id % 2 and 0 <= observed <= expected):
                     self.malformed_udp += 1
                     continue
                 stats = self.view_stats(gen)
                 previous_pass = stats["last_pass_id"]
+                previous_tick = stats["last_pass_tick"]
                 if previous_pass is not None:
                     stats["pass_note_gaps"] += max(0, pass_id - previous_pass - 1)
                     stats["pass_note_reordered"] += int(pass_id <= previous_pass)
+                if (previous_pass is not None and pass_id == previous_pass + 1 and previous_tick is not None
+                        and flags & 1 and observed and last_tick > previous_tick):
+                    timer = stats["pass_ticks"]["AB"[phase]]
+                    timer["count"] += 1
+                    timer["sum"] += last_tick - previous_tick
+                if previous_pass is None or pass_id > previous_pass:
+                    stats["last_pass_tick"] = last_tick if flags & 1 and observed else None
                 stats["last_pass_id"] = max(pass_id, previous_pass or 0)
                 stats["sweep_wire_bytes"] += size
                 stats["expected"] += expected
@@ -157,13 +169,16 @@ class Receiver(Sinks):
                         hold_k_counts = stats["hold_k_counts"]
                         hold_k_counts[k] = hold_k_counts.get(k, 0) + 1
                     stats["view_wire_bytes"] += record
+                    if self.record_views:
+                        self.sample_view(gen, ordinal, flags, k, memoryview(buf)[at+64:at+record])
             else:
                 self.malformed_udp += 1
 
     def view_stats(self, generation):
         return self.views.setdefault(generation, dict(received=0, gaps=0, reordered=0, A=0, B=0,
             expected=0, observed=0, sender_drops=0, partial_notes=0, view_wire_bytes=0, sweep_wire_bytes=0,
-            last_pass_id=None, pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None, actual_k_counts={}, hold_k_counts={}))
+            last_pass_id=None, last_pass_tick=None, pass_ticks={p:dict(count=0,sum=0) for p in "AB"},
+            pass_note_gaps=0, pass_note_reordered=0, first_ordinal=None, last_ordinal=None, first_host_ns=None, last_host_ns=None, first_tick=None, last_tick=None, actual_k_counts={}, hold_k_counts={}))
 
     def real8(self, conn):
         from sdr.source.field1_stream import Field1Stream

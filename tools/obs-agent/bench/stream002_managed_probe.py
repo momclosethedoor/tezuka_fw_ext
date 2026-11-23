@@ -31,6 +31,15 @@ done"""
 class BenchReceiver(Receiver):
     field_mode = False
     fsb1 = False
+    def __init__(self, folder):
+        self.view_samples = {}
+        super().__init__(folder)
+
+    def sample_view(self, generation, ordinal, flags, k, view):
+        records = self.view_samples.setdefault(generation, [])
+        if len(records) < 512:
+            records.append(dict(generation=generation, ordinal=ordinal, flags=flags,
+                                actual_k=k, payload_hex=view.hex()))
 
     def real8(self, conn):
         if not self.field_mode:
@@ -87,7 +96,7 @@ def launch_roi(log, full, sample=False):
         command = [sys.executable,"-B","-u",str(Path(__file__).with_name("stream002_sink.py")),
                    "compact" if full else "roi",str(ROI_PORT),"--bind",HOST,"--seconds","240","--done-file",str(log/"roi-done")]
         if sample:
-            command += ["--sample-file",str(log/"roi-sample.jsonl")]
+            command += ["--sample-file",str(log/("full-sample.jsonl" if full else "roi-sample.jsonl"))]
         return subprocess.Popen(command,
             stdout=output,stderr=subprocess.STDOUT)
     finally:
@@ -124,6 +133,7 @@ def view_snapshot(receiver, generation):
     stats = dict(receiver.view_stats(generation))
     stats["actual_k_counts"] = dict(stats["actual_k_counts"])
     stats["hold_k_counts"] = dict(stats["hold_k_counts"])
+    stats["pass_ticks"] = {name:dict(counts) for name,counts in stats["pass_ticks"].items()}
     return stats
 
 
@@ -244,10 +254,11 @@ test "$(devmem 0x7c460284)" = 0x00000000
     stand.upload(config, remote, config.name)
     receiver = BenchReceiver(log)
     receiver.obn5 = args.obn5
+    receiver.record_views = args.obn5 and full
     receiver.fsb1 = args.fsb1 or args.obn5
     if receiver.fsb1:
         receiver.field_stats.update(payload_bytes=0,successes=[])
-    roi_process = launch_roi(log,full,args.obn5 and roi_range is not None) if roi_enabled else None
+    roi_process = launch_roi(log,full,args.obn5 and (full or roi_range is not None)) if roi_enabled else None
     halted, ready = threading.Event(), threading.Event()
     lease = threading.Thread(target=lease_loop, args=(halted, ready, log, threading.Event()), daemon=True)
     lease.start()
@@ -361,6 +372,11 @@ test "$(devmem 0x7c460284)" = 0x00000000
         halted.set()
         lease.join(4)
         receiver.close()
+        if receiver.record_views:
+            with (log/"view-samples.jsonl").open("w",encoding="utf-8") as out:
+                for samples in receiver.view_samples.values():
+                    for sample in samples:
+                        out.write(json.dumps(sample, separators=(",", ":")) + "\n")
         if roi_process is not None:
             (log/"roi-done").touch()
             try:

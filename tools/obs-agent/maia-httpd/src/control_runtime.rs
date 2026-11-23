@@ -2130,7 +2130,7 @@ fn worker(
             #[cfg(feature="scan-stream-bench")]
             let roi_request=||shared.inbox.lock().unwrap().roi;
             #[cfg(feature="scan-stream-bench")]
-            let roi=if let Some(peer)=c.bench_roi.filter(|_| scan && (!c.bench_full_compact_tcp || mode_index == 0)) {
+            let roi=if let Some(peer)=c.bench_roi.filter(|_| scan && (obn5 || !c.bench_full_compact_tcp || mode_index == 0)) {
                 let a=actual.borrow();
                 let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
                     .map_err(anyhow::Error::msg)?;
@@ -2632,7 +2632,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
-        "ring_layout":if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
+        "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,

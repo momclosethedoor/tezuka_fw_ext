@@ -151,7 +151,8 @@ def main():
         parser.error("FIELD windows require --targets")
     if sum((args.full_compact_tcp, args.roi_center_hz is not None, args.roi_range_hz is not None)) > 1:
         parser.error("choose one of full compact TCP, legacy ROI or packed ROI")
-    if compact_tcp and (not args.managed or args.regression or any(args.widths)):
+    if compact_tcp and (not args.managed or args.regression or
+                        any(args.widths) and not (args.obn5 and args.full_compact_tcp)):
         parser.error("compact TCP requires a managed scan with VIEW OFF")
     if args.roi_range_hz and (not args.managed or args.regression or
                               not 70_000_000 <= args.roi_range_hz[0] < args.roi_range_hz[1] <= 13_000_000_000):

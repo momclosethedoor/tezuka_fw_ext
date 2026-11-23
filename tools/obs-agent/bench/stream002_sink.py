@@ -48,14 +48,18 @@ def compact_header(slot):
     return (ordinal, seq, epoch, tick, k, flags), bins, length
 
 
-def compact_frame(conn, header):
+def compact_frame(conn, header, sample=None):
     magic,*words,generation=COMPACT.unpack(header)
     if magic!=b"GCMP1\x00\x00\x00" or not generation:
         raise ValueError("invalid full compact frame")
     observed,bins,length=compact_header(exact(conn,COMPACT_PREFIX_BYTES))
     if observed!=tuple(words):
         raise ValueError("full compact envelope and spectrum identity differ")
-    exact(conn,length-COMPACT_PREFIX_BYTES)
+    payload = exact(conn,length-COMPACT_PREFIX_BYTES)
+    if sample is not None:
+        ordinal, seq, epoch, tick, actual_k, flags = observed
+        sample(dict(generation=generation, ordinal=ordinal, seq=seq, epoch=epoch,
+                    tick=tick, actual_k=actual_k, flags=flags, fft_bins=bins, payload_hex=payload.hex()))
     return observed[0],bins,COMPACT.size+length
 
 
@@ -63,16 +67,25 @@ def verify_obn5_pairs(full_slots, view_slots, fft_bins, mode):
     """Recompute every active VIEW bin directly from the captured M45E3 words."""
     observations = []
     divisors = (0, 8, 4, 2, 1)
-    for capture_slot in range(len(full_slots) // 32768):
-        slot = full_slots[capture_slot * 32768:(capture_slot + 1) * 32768]
-        if not any(slot[:COMPACT_PREFIX_BYTES]):
+    length = COMPACT_PREFIX_BYTES + 6 * fft_bins
+    view_length = fft_bins // divisors[mode] if mode else 0
+    shift = 544 * 8
+    prefix_at = length - shift + view_length
+    numbers = [0,1,2,3,4,5,6,7,1023]
+    full = dict(zip(numbers,(full_slots[i:i+32768] for i in range(0,len(full_slots),32768))))
+    views = dict(zip(numbers,(view_slots[i:i+4096] for i in range(0,len(view_slots),4096))))
+    for physical_slot, raw in full.items():
+        previous = (physical_slot-1)%1024
+        if raw[:8] == b"OBN5\x01\0\x40\0":
+            slot, overview, layout = raw, views[physical_slot], "native"
+        elif previous in full and full[previous][prefix_at:prefix_at+8] == b"OBN5\x01\0\x40\0":
+            slot = full[previous][prefix_at:length] + views[previous][:view_length] + raw[:length-shift]
+            overview, layout = raw[length-shift:length-shift+view_length], "split544"
+        else:
             continue
-        if slot[:4] != b"OBN5":
-            raise ValueError("OBN5 header must be at the FULL slot base")
-        (ordinal, seq, epoch, tick, k, flags), bins, length = compact_header(slot)
-        physical_slot = 1023 if capture_slot == 8 else capture_slot
+        (ordinal, seq, epoch, tick, k, flags), bins, observed_length = compact_header(slot)
         actual_mode = ((flags >> 3) & 3) | ((flags >> 5) & 4)
-        if ordinal % 1024 != physical_slot or bins != fft_bins or actual_mode != mode:
+        if ordinal % 1024 != physical_slot or bins != fft_bins or observed_length != length or actual_mode != mode:
             raise ValueError("OBN5 slot identity or active geometry mismatch")
         if mode:
             words = [int.from_bytes(slot[i:i + 6], "little") for i in range(128, length, 6)]
@@ -80,11 +93,10 @@ def verify_obn5_pairs(full_slots, view_slots, fft_bins, mode):
             power = [(word & mask) << (2 * (word >> 45)) for word in words]
             step = divisors[mode]
             expected = bytes(max(power[i:i+step]).bit_length() for i in range(0, bins, step))
-            start = capture_slot * 4096
-            if view_slots[start:start+len(expected)] != expected:
+            if overview[:len(expected)] != expected:
                 raise ValueError(f"OBN5 VIEW power mismatch at ordinal {ordinal}")
         observations.append(dict(ordinal=ordinal, seq=seq, epoch=epoch, tick=tick,
-                                 k=k, flags=flags, full_bytes=length, bins=bins, mode=mode))
+                                 k=k, flags=flags, full_bytes=length, bins=bins, mode=mode, layout=layout))
     if len(observations) < 4:
         raise ValueError("fewer than four independently validated OBN5 records")
     return observations
@@ -209,7 +221,7 @@ def main():
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--seconds", type=float, default=60)
     parser.add_argument("--done-file", type=Path)
-    parser.add_argument("--sample-file", type=Path, help="write the first 64 packed ROI records per connection")
+    parser.add_argument("--sample-file", type=Path, help="write the first 64 spectra per connection")
     args = parser.parse_args()
     if not 0 < args.seconds <= 300:
         parser.error("--seconds must be in (0, 300]")
@@ -243,7 +255,7 @@ def main():
                             break
                         if args.mode != "field":
                             sample = None
-                            if args.mode == "roi" and args.sample_file and seen < 64:
+                            if args.sample_file and seen < 64:
                                 def sample(row):
                                     with args.sample_file.open("a", encoding="utf-8") as stream:
                                         stream.write(json.dumps(row, separators=(",", ":")) + "\n")

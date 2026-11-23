@@ -229,7 +229,8 @@ static void joint_case(const char *mode, const char *config, const char *iq_path
 	      (csr[0xe0 / 4] & 0x100) && csr[0x39c / 4] == 1023, "OBN5 joint ABI and handoff history");
 	struct obs_cap2_submit submit = {job, n, 187500, info.payload_offset, (n + 31) / 32, job};
 	struct obs_cap2_receipt r = {0};
-	uint64_t begin = now(CLOCK_MONOTONIC), submitted = 0, field_epoch = 0, field_seen = 0;
+	uint64_t begin = now(CLOCK_MONOTONIC), begin_cpu = now(CLOCK_PROCESS_CPUTIME_ID);
+	uint64_t submitted = 0, field_epoch = 0, field_seen = 0;
 	uint64_t field_done = 0, cap_ready = 0;
 	if (first) {
 		check(!ioctl(cap_fd, OBS_CAP2_SUBMIT, &submit), "submit CAP2 before starting the scan");
@@ -286,9 +287,22 @@ static void joint_case(const char *mode, const char *config, const char *iq_path
 		      "CAP2 READY with FIELD epoch");
 	const unsigned char *arena = acquire(r, info);
 	canaries(arena, info.length, submit.offset, r.captured);
-	if (r.captured)
-		dump(iq_path, (const uint32_t *)(arena + submit.offset), r.captured, fs);
+	sig0_work *work = NULL;
+	if (r.captured) {
+		const uint32_t *iq = (const uint32_t *)(arena + submit.offset);
+		dump(iq_path, iq, r.captured, fs);
+		check(!sig0_configure(NULL, NULL) && !sig0_prepare_iq(iq, r.captured, fs, &work), "joint CAP2 SIG0 preparation");
+	}
 	release_window(arena, info.length);
+	if (work) {
+		sig0_detection result;
+		uint64_t start = now(CLOCK_MONOTONIC), cpu = now(CLOCK_PROCESS_CPUTIME_ID), before_epoch = epoch();
+		check(!sig0_finish(work, &result), "joint CAP2 SIG0 correlation");
+		printf("sig0_status=%u detections=%u sig0_ns=%" PRIu64 " sig0_cpu_ns=%" PRIu64
+		       " epoch_before=%" PRIu64 " epoch_after=%" PRIu64 "\n", result.status, result.count,
+		       now(CLOCK_MONOTONIC) - start, now(CLOCK_PROCESS_CPUTIME_ID) - cpu, before_epoch, epoch());
+	}
+	printf("cap2_probe_cpu_ns=%" PRIu64 "\n", now(CLOCK_PROCESS_CPUTIME_ID) - begin_cpu);
 }
 
 int main(int argc, char **argv)
