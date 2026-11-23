@@ -215,7 +215,8 @@ test "$(devmem 0x7c460284)" = 0x00000000
                 if roi_process.poll() is not None or time.monotonic()>=deadline:
                     raise RuntimeError("compact ROI receiver did not bind")
                 time.sleep(.05)
-        stand.ssh(f"cd {remote}; (OBS_PHASE_TIMING=1 OBS_FFM1_TRACE=1 timeout 270 ./maia-delivery --system-control owner.json "
+        dmac_trace = "OBS_FSB1_DMAC_TRACE=1 " if args.fsb1_dmac_trace else ""
+        stand.ssh(f"cd {remote}; (OBS_PHASE_TIMING=1 OBS_FFM1_TRACE=1 {dmac_trace}timeout 270 ./maia-delivery --system-control owner.json "
                   "--listen 0.0.0.0:18080 </dev/null >probe-agent.log 2>&1 &)")
         time.sleep(.3)
         if not stand.ssh("pidof maia-delivery || true").strip():

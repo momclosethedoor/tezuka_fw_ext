@@ -125,6 +125,7 @@ struct iio_blocks {
 #ifdef OBS_SCAN_STREAM_BENCH
     uint64_t dequeued, returned;
     double max_checkout;
+    unsigned last_id;
 #endif
 };
 
@@ -177,6 +178,7 @@ static ssize_t read_iio_block(int fd, struct iio_blocks *blocks,
     }
 #ifdef OBS_SCAN_STREAM_BENCH
     ++blocks->returned;
+    blocks->last_id=block.id;
     double elapsed=monotonic()-start;
     if(elapsed>blocks->max_checkout) blocks->max_checkout=elapsed;
 #endif
@@ -192,6 +194,66 @@ struct observation {
 };
 #include "obs-fsb1-stream.h"
 
+#ifdef OBS_SCAN_STREAM_BENCH
+enum {
+    DMAC_BASE=0x7c400000, DMAC_PAGE=4096, DMAC_HISTORY=8,
+    DMAC_CONTROL=0x400, DMAC_NEXT_ID=0x404, DMAC_SUBMIT=0x408,
+    DMAC_DONE=0x428, DMAC_EOT_ID=0x42c, DMAC_PROGRESS=0x448
+};
+struct dmac_sample {
+    double begin, end;
+    uint32_t cause, status, control, next_id, submit, done, eot_id, progress;
+    uint64_t returned;
+    unsigned block;
+};
+struct dmac_trace {
+    volatile const uint32_t *reg;
+    struct dmac_sample history[DMAC_HISTORY];
+    unsigned next, count;
+};
+static struct dmac_trace dmac;
+
+static struct dmac_sample dmac_read(const struct dmac_trace *trace, volatile const uint32_t *field,
+                                    const struct iio_blocks *blocks)
+{
+    volatile const uint32_t *reg=trace->reg;
+    struct dmac_sample sample={.begin=monotonic(),.returned=blocks->returned,.block=blocks->last_id};
+    sample.cause=field[FSB_CAUSES/4];
+    sample.status=field[STATUS/4];
+    sample.control=reg[DMAC_CONTROL/4];
+    sample.submit=reg[DMAC_SUBMIT/4];
+    sample.next_id=reg[DMAC_NEXT_ID/4];
+    sample.eot_id=reg[DMAC_EOT_ID/4];
+    sample.done=reg[DMAC_DONE/4];
+    sample.progress=reg[DMAC_PROGRESS/4];
+    sample.end=monotonic();
+    return sample;
+}
+
+static void dmac_remember(struct dmac_trace *trace, volatile const uint32_t *field,
+                          const struct iio_blocks *blocks)
+{
+    trace->history[trace->next]=dmac_read(trace,field,blocks);
+    trace->next=(trace->next+1)%DMAC_HISTORY;
+    if(trace->count<DMAC_HISTORY) ++trace->count;
+}
+
+static void dmac_print(const struct dmac_sample *s, const char *stage)
+{
+    fprintf(stderr,"FSB1_DMAC stage=%s t0=%.9f t1=%.9f cause=%02x fld=%08x "
+        "ctrl=%08x submit=%u next=%u eot=%u done=%08x progress=%u returned=%llu iio_id=%u\n",
+        stage,s->begin,s->end,s->cause,s->status,s->control,s->submit,s->next_id,
+        s->eot_id,s->done,s->progress,(unsigned long long)s->returned,s->block);
+}
+
+static void dmac_dump(const struct dmac_trace *trace, const struct dmac_sample *fault)
+{
+    unsigned first=(trace->next+DMAC_HISTORY-trace->count)%DMAC_HISTORY;
+    for(unsigned n=0;n<trace->count;++n) dmac_print(&trace->history[(first+n)%DMAC_HISTORY],"after_return");
+    dmac_print(fault,"before_stop");
+}
+#endif
+
 static int wait_register(volatile uint32_t *reg, unsigned offset, uint32_t mask, uint32_t value)
 {
     double deadline=monotonic()+0.1;
@@ -203,8 +265,14 @@ static int wait_register(volatile uint32_t *reg, unsigned offset, uint32_t mask,
 }
 
 static void quiesce_source(volatile uint32_t *reg, const char *reason, ssize_t iio_result,
-                           uint64_t consumed, double refill_gap)
+                           uint64_t consumed, double refill_gap, const struct iio_blocks *blocks)
 {
+#ifdef OBS_SCAN_STREAM_BENCH
+    struct dmac_sample fault={0};
+    if(dmac.reg) fault=dmac_read(&dmac,reg,blocks);
+#else
+    (void)blocks;
+#endif
     uint32_t status=reg[STATUS/4], session=reg[SESSION/4], before=reg[FSB_CAUSES/4];
     write_reg(reg,SESSION,0);
     write_reg(reg,COMMAND,FIELD_CANCEL);
@@ -222,6 +290,9 @@ static void quiesce_source(volatile uint32_t *reg, const char *reason, ssize_t i
         "status=%08x session=%u iio=%zd consumed=%llu refill_gap_s=%.9f settled=%d stage=%s\n",
         before,after,before&FSB_CAUSE_MASK,after&FSB_CAUSE_MASK,status,session,iio_result,
         (unsigned long long)consumed,refill_gap,settled,reason);
+#ifdef OBS_SCAN_STREAM_BENCH
+    if(dmac.reg) dmac_dump(&dmac,&fault);
+#endif
 }
 static struct observation get_head(volatile uint32_t *reg)
 {
@@ -317,6 +388,14 @@ int main(int argc,char **argv)
     if(reg==MAP_FAILED || reg[FFM_ID/4]!=OBS_FFM1 || reg[0x280/4]!=OBS_FLD2 ||
        reg[FSB_ID/4]!=UINT32_C(0x31425346) || reg[SESSION/4] ||
        reg[STATUS/4]&FIELD_ACTIVE || reg[LEVEL/4]&FFM_LEVEL_COUNT) goto done;
+#ifdef OBS_SCAN_STREAM_BENCH
+    if(getenv("OBS_FSB1_DMAC_TRACE")) {
+        problem="map ADI DMAC read-only for bench diagnostics";
+        void *mapping=mmap(NULL,DMAC_PAGE,PROT_READ,MAP_SHARED,mem,DMAC_BASE);
+        if(mapping==MAP_FAILED) goto done;
+        dmac.reg=mapping;
+    }
+#endif
     oldmode=reg[0x38/4];oldcode=reg[0x40/4];oldtimeout=reg[0x28c/4];
     oldrun=reg[RUN/4];stream_owned=1;
     write_reg(reg,RUN,0);write_reg(reg,0x38,1);write_reg(reg,0x40,24);
@@ -377,8 +456,14 @@ int main(int argc,char **argv)
         }
         ssize_t got=-EAGAIN;
         if(!source_failure) {
-            got=read_iio_block(pollfd,&blocks,&history,&source_failure);
-            iio_result=got;
+#ifdef OBS_SCAN_STREAM_BENCH
+            if(dmac.reg && (reg[STATUS/4]&FIELD_SOURCE_FAULT))
+                source_failure="real8 hardware reported a source fault";
+#endif
+            if(!source_failure) {
+                got=read_iio_block(pollfd,&blocks,&history,&source_failure);
+                iio_result=got;
+            }
             if(got>0) {
                 double now=monotonic();
                 if(last_refill) {
@@ -386,6 +471,9 @@ int main(int argc,char **argv)
                     if(refill_gap>max_refill_gap) max_refill_gap=refill_gap;
                 }
                 last_refill=now;
+#ifdef OBS_SCAN_STREAM_BENCH
+                if(dmac.reg) dmac_remember(&dmac,reg,&blocks);
+#endif
                 live=stable_live(reg,history.consumed);
             }
             if(!source_failure && reg[STATUS/4]&FIELD_SOURCE_FAULT)
@@ -393,7 +481,7 @@ int main(int argc,char **argv)
             if(source_failure) {
                 /* Stop this generation of real8 before any new data can enter history.
                  * FFM1 still reports the marked visits; this remains its sole reader. */
-                quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap);
+                quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap,&blocks);
                 rc=4;
             }
         }
@@ -494,7 +582,7 @@ int main(int argc,char **argv)
             source_failure="IIO poll reported a source fault";
         }
         if(source_failure && p[0].fd>=0) {
-            quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap);
+            quiesce_source(reg,source_failure,iio_result,history.consumed,refill_gap,&blocks);
             rc=4;
         }
     }
@@ -530,6 +618,9 @@ done:
         if(!source_failure) write_reg(reg,RUN,oldrun);
     }
     if(reg!=MAP_FAILED) munmap((void*)reg,4096);
+#ifdef OBS_SCAN_STREAM_BENCH
+    if(dmac.reg) munmap((void*)dmac.reg,DMAC_PAGE);
+#endif
     if(mem>=0) close(mem);
     if(guard>=0) close(guard);
     if(owner>=0) close(owner);

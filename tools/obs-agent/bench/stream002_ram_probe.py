@@ -42,7 +42,10 @@ def main():
                         help="wait 30 to 150 seconds for transmitter readiness (default 90)")
     parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
     parser.add_argument("--fsb1", action="store_true", help="use the PL-FIELD-STREAM-001 RAM image and streaming sink")
+    parser.add_argument("--fsb1-dmac-trace", action="store_true", help="save read-only ADI DMAC samples before a FIELD fault")
     args = parser.parse_args()
+    if args.fsb1_dmac_trace and not (args.fsb1 and args.managed and max(args.field_counts)):
+        parser.error("--fsb1-dmac-trace requires --fsb1, --managed and an active FIELD window")
     compact_tcp = args.full_compact_tcp or args.roi_center_hz is not None
     if sum((args.full_compact_tcp, args.roi_center_hz is not None, args.roi_range_hz is not None)) > 1:
         parser.error("choose one of full compact TCP, legacy ROI or packed ROI")
