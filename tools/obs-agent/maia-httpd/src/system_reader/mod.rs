@@ -734,8 +734,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if let Some(q)=control.filter(|_|c.scan){if let Err(e)=io.service_route(q){route_failure=Some(e);break;}}
   if status_due.elapsed()>=progress::POLL{
     if let (Some(zoom),Some(config))=(zoom.borrow_mut().as_mut(),roi_control){
+    #[cfg(feature="scan-stream-bench")]
     let filtering=zoom.filters_view();
     zoom.update((config.request)())?;
+    #[cfg(feature="scan-stream-bench")]
     if !obn5 && !filtering && zoom.filters_view(){network.borrow_mut().suppress_pending();}
    }
    if let Some(q)=control{if let Err(e)=(q.check)(){route_failure=Some(e);break;}}
