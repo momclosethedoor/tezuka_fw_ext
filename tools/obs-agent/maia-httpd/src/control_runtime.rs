@@ -32,6 +32,7 @@ use std::{
 };
 
 const FS: u64 = 61_440_000;
+const DEFAULT_ANALYSIS_K: u32 = 500;
 const PHY: &str = "/sys/bus/iio/devices/iio:device0";
 const MAP: usize = 40 + 4096;
 const NEXT: usize = MAP + 4096;
@@ -298,8 +299,8 @@ fn check_spectrum_settings(settings: &Value, obn5: bool) -> Result<()> {
 }
 
 fn roi_request(cmd:&Value,generation:u64)->Result<Option<crate::system_reader::RoiRequest>> {
-    use crate::system_reader::{LEGACY_ROI_WIDTH_HZ,RoiRequest};
-    let ranged=cmd.get("lo_hz").is_some()||cmd.get("hi_hz").is_some()||cmd.get("view_bins").is_some();
+    use crate::system_reader::{LEGACY_ROI_WIDTH_HZ,RoiRequest,RoiSource};
+    let ranged=["lo_hz","hi_hz","view_bins","source"].iter().any(|key|cmd.get(*key).is_some());
     if ranged {
         ensure!(cmd["center_hz"].is_null(),"specify ROI limits or a legacy center");
         let low=int(cmd,"lo_hz",70_000_000,plan_math::MAX_RF)? as i64;
@@ -307,12 +308,23 @@ fn roi_request(cmd:&Value,generation:u64)->Result<Option<crate::system_reader::R
         ensure!(low<high,"ROI limits must be increasing");
         let view_bins=cmd["view_bins"].as_u64().filter(|n|matches!(*n,512|1024|2048|4096))
             .ok_or_else(||anyhow!("ROI view_bins must be 512, 1024, 2048 or 4096"))? as u16;
-        return Ok(Some(RoiRequest{range:[low,high],view_bins,generation,legacy_full_record:false}));
+        let source=match cmd.get("source") {
+            None => None,
+            Some(v) if v == "full" => Some(RoiSource::Full),
+            Some(v) if v == "view" => Some(RoiSource::View),
+            _ => bail!("ROI source must be full or view"),
+        };
+        return Ok(Some(RoiRequest{range:[low,high],view_bins,generation,legacy_full_record:false,source}));
     }
     if cmd["center_hz"].is_null(){return Ok(None);}
     let center=int(cmd,"center_hz",70_000_000,plan_math::MAX_RF)? as i64;
     let half=LEGACY_ROI_WIDTH_HZ/2;
-    Ok(Some(RoiRequest{range:[center-half,center+half],view_bins:4096,generation,legacy_full_record:true}))
+    Ok(Some(RoiRequest{range:[center-half,center+half],view_bins:4096,generation,legacy_full_record:true,source:None}))
+}
+
+fn roi_source(spectrum: &Value, request: crate::system_reader::RoiRequest) -> Option<crate::system_reader::RoiSource> {
+    request.resolve_source(spectrum["fft_bins"].as_u64().unwrap_or(0) as u16,
+                           spectrum["view_bins"].as_u64().unwrap_or(0) as u16)
 }
 
 fn validate(v: &Value) -> Result<()> {
@@ -470,8 +482,11 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
 
 async fn submit(
     State(shared): State<Arc<Shared>>,
-    Json(cmd): Json<Value>,
+    Json(mut cmd): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    if cmd["op"] == "analysis" && cmd.get("k").is_none() {
+        cmd["k"] = json!(DEFAULT_ANALYSIS_K);
+    }
     let id = &cmd["id"];
     if !id
         .as_str()
@@ -510,6 +525,15 @@ async fn submit(
             }
             if q.actual["spectrum"]["fft_bins"]!=4096 && request.is_some_and(|r|r.legacy_full_record) {
                 return (StatusCode::CONFLICT,Json(json!({"error":"full-record ROI requires FFT4096"})));
+            }
+            if q.capabilities["roi_exact_bins"] == true &&
+                request.is_some_and(|r| roi_source(&q.actual["spectrum"], r).is_none())
+            {
+                return (StatusCode::CONFLICT, Json(json!({
+                    "error": "ROI requires the active PL FFT or VIEW grid",
+                    "fft_bins": q.actual["spectrum"]["fft_bins"],
+                    "view_bins": q.actual["spectrum"]["view_bins"],
+                })));
             }
             q.roi_generation=generation;
             q.roi=request;
@@ -638,6 +662,14 @@ fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     let mut q = shared.inbox.lock().unwrap();
     q.pending = None;
     q.actual = state.clone();
+    if q.capabilities["roi_exact_bins"] == true && q.roi.is_some_and(|r|
+        state["mode"] != "scan" || state["running"] != true ||
+        roi_source(&state["spectrum"], r).is_none())
+    {
+        q.roi = None;
+        q.roi_id = Value::Null;
+        q.roi_generation += 1;
+    }
     if !progress_matches(&q.progress, state) { q.progress = Value::Null; }
     q.phase = if error.is_some() {
         "failed"
@@ -2467,6 +2499,13 @@ pub fn check_scan_tx_bank() -> Result<()> {
 /// Run the owner only on the prepared row99 RAM kit.
 pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let mut c: Config = serde_json::from_slice(&fs::read(path)?)?;
+    if c.analysis.is_object() && c.analysis.get("k").is_none() {
+        c.analysis["k"] = json!(DEFAULT_ANALYSIS_K);
+    }
+    if c.roi.is_some() && c.scan.is_object() && c.scan.get("fft_bins").is_none() && c.scan.get("view_bins").is_none() {
+        c.scan["fft_bins"] = json!(4096);
+        c.scan["view_bins"] = json!(2048);
+    }
     ensure!(cfg!(feature="scan-stream-bench") ||
         (!c.bench_obn3_layout && !c.bench_obn3_view_only && c.bench_roi.is_none()),
         "RAM layout and ROI require the scan-stream-bench feature");
@@ -2669,7 +2708,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
-        "roi":c.roi.is_some(),"resident_field":c.resident_field.is_some(),"video_profiles":obn5,
+        "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),
+        "resident_field":c.resident_field.is_some(),"video_profiles":obn5,
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,

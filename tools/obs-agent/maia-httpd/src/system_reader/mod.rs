@@ -12,11 +12,26 @@ mod timing;
 pub(crate) use roi_stream::Map as RoiMap;
 pub(crate) const LEGACY_ROI_WIDTH_HZ:i64=56_000_000;
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoiSource {
+ Full,
+ View,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoiRequest {
  pub range:[i64;2],
  pub view_bins:u16,
  pub generation:u64,
  pub legacy_full_record:bool,
+ pub source:Option<RoiSource>,
+}
+impl RoiRequest {
+ pub(crate) fn resolve_source(self, fft_bins:u16, view_bins:u16)->Option<RoiSource>{
+  match self.source {
+   Some(RoiSource::Full) | None if self.view_bins==fft_bins => Some(RoiSource::Full),
+   Some(RoiSource::View) | None if self.view_bins==view_bins => Some(RoiSource::View),
+   _ => None,
+  }
+ }
 }
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;

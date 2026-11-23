@@ -1,5 +1,5 @@
 //! Bounded compact zoom transport. It never owns RF or a DMA slot.
-use super::{Header, R, RoiRequest as Request, Value, histogram, obn3, roi, timing::Histogram};
+use super::{Header, R, RoiRequest as Request, RoiSource, Value, histogram, obn3, roi, timing::Histogram};
 use serde_json::json;
 use std::{
     collections::VecDeque,
@@ -75,6 +75,7 @@ pub(super) struct Stream {
     full_scan: bool,
     configured_view_bins: u16,
     source_bins: u16,
+    view_source: bool,
     fft_bins: u16,
     obn5: bool,
     request: Option<Request>,
@@ -113,7 +114,7 @@ impl Stream {
         };
         Ok(Self{peer,production,connecting:false,retry_at:Instant::now(),
             full_scan,configured_view_bins:configured_view_bins as u16,source_bins:fft_bins as u16,
-            fft_bins:fft_bins as u16,obn5,
+            fft_bins:fft_bins as u16,obn5,view_source:false,
             request:None,initial,next,socket,
             free:(0..CAPACITY).map(|_|Vec::with_capacity(FRAME_LIMIT)).collect(),
             pending:VecDeque::with_capacity(CAPACITY),selected:0,selected_bins:0,prepared:0,
@@ -123,15 +124,20 @@ impl Stream {
     }
 
     pub(super) fn update(&mut self, request: Option<Request>) -> R<()> {
+        // An older ROI can outlive the reader as the mode owner changes grids.
+        let request = request.filter(|r| !self.production ||
+            r.resolve_source(self.fft_bins, self.configured_view_bins).is_some());
         if request!=self.request {
             // Full-record legacy requests are retained for VIEW-OFF bench comparisons.
             self.request=request.filter(|r| !r.legacy_full_record || self.configured_view_bins==0);
+            self.view_source = self.production && self.request.is_some_and(|r|
+                r.resolve_source(self.fft_bins, self.configured_view_bins) == Some(RoiSource::View));
             if let Some(request)=self.request {
                 if request.legacy_full_record && self.fft_bins!=4096 {
                     return Err("legacy ROI requires FFT4096".into());
                 }
                 self.source_bins=if self.production {
-                    request.view_bins.min(self.fft_bins)
+                    request.view_bins
                 } else if request.view_bins==self.configured_view_bins {
                     self.configured_view_bins
                 } else { self.fft_bins };
@@ -166,7 +172,7 @@ impl Stream {
     }
 
     fn uses_view(&self) -> bool {
-        self.production && self.source_bins < self.fft_bins && self.configured_view_bins >= self.source_bins
+        self.view_source
     }
 
     pub(super) fn prepare(&mut self, h: Header, raw: &[u8], view: &[u8],
@@ -193,12 +199,10 @@ impl Stream {
         if self.socket.is_none() {self.rejected+=1;return Ok(());}
         let Some(mut frame)=self.free.pop() else { self.rejected+=1;return Ok(()); };
         frame.clear();
-        let reduction = self.production && self.source_bins < self.fft_bins;
-        let (payload, word_bytes)=if self.source_bins==self.fft_bins || reduction && self.configured_view_bins < self.source_bins {
+        let (payload, word_bytes)=if !view_source && self.source_bins == self.fft_bins {
             (&raw[obn3::COMPACT_PREFIX_BYTES..],obn3::M45E3_WORD_BYTES)
         } else { (view,1) };
-        let input_bins = if word_bytes == 1 { self.configured_view_bins } else {self.fft_bins};
-        if payload.len()!=usize::from(input_bins)*word_bytes {
+        if payload.len()!=usize::from(self.source_bins)*word_bytes {
             return Err("ROI source payload differs from its bin grid".into());
         }
         let wire_bytes=if request.legacy_full_record {
@@ -206,7 +210,7 @@ impl Stream {
             raw.len()
         } else {
             frame.extend_from_slice(b"GROI2\0\0\0");
-            bins as usize*if reduction {1} else {word_bytes}
+            bins as usize * word_bytes
         };
         frame.extend_from_slice(&(wire_bytes as u32).to_le_bytes());
         frame.extend_from_slice(&(row.bins.len() as u16).to_le_bytes());
@@ -238,15 +242,9 @@ impl Stream {
                 frame.extend_from_slice(&raw[..obn3::COMPACT_PREFIX_BYTES]);
             }
             for range in &row.bins {
-                let stride = usize::from(input_bins / self.source_bins) * word_bytes;
-                let selected = &payload[usize::from(range.start)*stride..usize::from(range.end)*stride];
-                if reduction {
-                    frame.extend(selected.chunks_exact(stride).map(|group|
-                        if word_bytes == 1 { *group.iter().max().unwrap() }
-                        else { group.chunks_exact(6).map(compact_code).max().unwrap() }));
-                } else {
-                    frame.extend_from_slice(selected);
-                }
+                let start = usize::from(range.start) * word_bytes;
+                let end = usize::from(range.end) * word_bytes;
+                frame.extend_from_slice(&payload[start..end]);
             }
         }
         self.enqueue(frame,bins);
@@ -351,14 +349,6 @@ impl Stream {
             "socket_pending_bytes":socket_pending,"send_ns":histogram(self.send),
             "queue_ns":histogram(self.queue),"ready_to_api_complete_ns":histogram(self.ready)})
     }
-}
-
-fn compact_code(word: &[u8]) -> u8 {
-    let mut bytes = [0u8; 8];
-    bytes[..6].copy_from_slice(word);
-    let value = u64::from_le_bytes(bytes);
-    let mantissa = value & ((1u64 << 45) - 1);
-    if mantissa == 0 { 0 } else { (64 - mantissa.leading_zeros() + 2 * (value >> 45) as u32) as u8 }
 }
 
 fn view_prefix(h: Header) -> [u8; obn3::COMPACT_PREFIX_BYTES] {
