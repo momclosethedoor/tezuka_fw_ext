@@ -328,6 +328,7 @@ fn roi_source(spectrum: &Value, request: crate::system_reader::RoiRequest) -> Op
 }
 
 fn validate(v: &Value) -> Result<()> {
+    ensure!(v["op"] == "scan" || v.get("roi").is_none(), "embedded ROI requires scan");
     if v["op"]=="roi" {
         roi_request(v,0)?;
         return Ok(());
@@ -386,6 +387,17 @@ fn validate(v: &Value) -> Result<()> {
                 }
             }
             ensure!(!run || enabled, "no enabled range");
+            if let Some(roi) = v.get("roi") {
+                ensure!(run && v["planner_version"] == 2, "embedded ROI requires a running v2 scan");
+                let roi = roi_request(roi, 0)?.ok_or_else(|| anyhow!("embedded ROI requires explicit RF limits"))?;
+                ensure!(roi.source == Some(crate::system_reader::RoiSource::View)
+                    && v["view_bins"].as_u64() == Some(u64::from(roi.view_bins)),
+                    "embedded ROI requires the requested VIEW grid");
+                ensure!(ranges.iter().any(|row| row["enabled"] == true &&
+                    row["lo_hz"].as_i64().is_some_and(|lo| lo < roi.range[1]) &&
+                    row["hi_hz"].as_i64().is_some_and(|hi| hi > roi.range[0])),
+                    "embedded ROI must overlap the scan range");
+            }
             if let Some(bands) = v.get("antenna_bands") {
                 ensure!(!bands.is_null(), "antenna_bands must be an object");
                 parse_antenna_bands(bands)?;
@@ -507,10 +519,16 @@ async fn submit(
     if let Some(error) = &q.worker_error {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"RF owner unavailable","worker_error":error})));
     }
+    if cmd.get("roi").is_some() && q.capabilities["scan_roi_only"] != true {
+        return (StatusCode::CONFLICT, Json(json!({"error":"ROI-only scan delivery is unavailable"})));
+    }
     if cmd["op"]=="roi" {
         let bench = cfg!(feature="scan-stream-bench") && q.capabilities["bench_roi"]==true;
         if (!bench && q.capabilities["roi"]!=true) || q.actual["mode"]!="scan" || q.actual["running"]!=true {
             return (StatusCode::CONFLICT, Json(json!({"error":"active ROI scan required"})));
+        }
+        if q.actual["spectrum"]["overview_enabled"] == false {
+            return (StatusCode::CONFLICT, Json(json!({"error":"change ROI-only delivery with a scan command"})));
         }
         if q.roi_id != *id {
             let generation=q.roi_generation+1;
@@ -661,9 +679,17 @@ fn progress_matches(sample: &Value, state: &Value) -> bool {
 fn receipt(shared: &Shared, state: &Value, id: &Value, error: Option<String>) {
     let mut q = shared.inbox.lock().unwrap();
     q.pending = None;
+    let was_roi_only = q.actual["mode"] == "scan" && q.actual["scan"].get("roi").is_some();
     q.actual = state.clone();
-    if q.capabilities["roi_exact_bins"] == true && q.roi.is_some_and(|r|
-        state["mode"] != "scan" || state["running"] != true ||
+    let next_roi = if error.is_none() && state["mode"] == "scan" && state["running"] == true {
+        state["scan"].get("roi").and_then(|command| roi_request(command, q.roi_generation + 1).ok().flatten())
+    } else { None };
+    if let Some(request) = next_roi {
+        q.roi_generation = request.generation;
+        q.roi = Some(request);
+        q.roi_id = id.clone();
+    } else if q.capabilities["roi_exact_bins"] == true && q.roi.is_some_and(|r|
+        was_roi_only || state["mode"] != "scan" || state["running"] != true ||
         roi_source(&state["spectrum"], r).is_none())
     {
         q.roi = None;
@@ -1889,8 +1915,10 @@ fn worker(
             let mut field_directory = None;
             let targets = if mode=="scan" {resident_field::targets(&actual.borrow()["scan"]["field_targets"])?}
                 else {Vec::new()};
+            let roi_only = mode == "scan" && actual.borrow()["scan"].get("roi").is_some();
             if let Some(setup) = setup.as_mut() {
                 let mut a = actual.borrow_mut();
+                a["spectrum"]["overview_enabled"] = json!(!roi_only);
                 if a["spectrum"]["sweep_wire_version"] == 1 {
                     let delivery = a["scan"]["view_delivery"].as_str()
                         .or_else(||c.scan["view_delivery"].as_str()).unwrap_or("stream").to_owned();
@@ -1903,6 +1931,7 @@ fn worker(
                         next_sweep = crate::system_reader::SweepSpec::from_descriptor(&second,&delivery)
                             .map_err(|e|anyhow!(e))?;
                         second["view_delivery"] = json!(delivery);
+                        second["overview_enabled"] = json!(!roi_only);
                         a["prepared_next_version"] = second["version"].clone();
                         next_spectrum = Some(second);
                     }
@@ -2063,7 +2092,7 @@ fn worker(
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "stream_config":stream_config,"hold_k":settings["hold_k"],"bench_obn3_view_only":view_only,
-                "udp":c.view.to_string(),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
+                "udp":(!roi_only).then(||c.view.to_string()),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
             let started = |h: crate::system_reader::Header, execution: crate::system_reader::Execution| {
@@ -2196,7 +2225,10 @@ fn worker(
                 )
             };
             let last_renew = std::cell::Cell::new(Instant::now());
-            let roi_request=||shared.inbox.lock().unwrap().roi;
+            let roi_request = || {
+                let q = shared.inbox.lock().unwrap();
+                if !applied.get() && (roi_only || q.actual["scan"].get("roi").is_some()) { None } else { q.roi }
+            };
             let roi=if let Some(peer)=c.roi.or(c.bench_roi).filter(|_| scan && (obn5 || !c.bench_full_compact_tcp || mode_index == 0)) {
                 let a=actual.borrow();
                 let initial=crate::system_reader::RoiMap::from_descriptor(&a["spectrum"],initial_version,generation)
@@ -2708,7 +2740,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
-        "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),
+        "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
         "resident_field":c.resident_field.is_some(),"video_profiles":obn5,
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
