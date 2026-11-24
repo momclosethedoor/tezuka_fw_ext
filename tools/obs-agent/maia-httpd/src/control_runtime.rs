@@ -5,6 +5,7 @@ mod field;
 mod resident_field;
 mod generated;
 mod guard_take;
+mod loop_grid;
 mod mixer_math;
 mod plan_math;
 mod tx;
@@ -220,6 +221,7 @@ struct Inbox {
 struct Shared {
     clock_session: String,
     inbox: Mutex<Inbox>,
+    loop_config: Option<Mutex<loop_grid::Store>>,
     wake: Condvar,
     switch: AtomicBool,
     shutdown: AtomicBool,
@@ -328,6 +330,7 @@ fn roi_source(spectrum: &Value, request: crate::system_reader::RoiRequest) -> Op
 }
 
 fn validate(v: &Value) -> Result<()> {
+    ensure!(v.get("loop").is_none(), "loop requires a running v2 scan with grid policy support");
     ensure!(v["op"] == "scan" || v.get("roi").is_none(), "embedded ROI requires scan");
     if v["op"]=="roi" {
         roi_request(v,0)?;
@@ -474,6 +477,7 @@ fn validate(v: &Value) -> Result<()> {
 }
 
 async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
+    let loop_config = shared.loop_config.as_ref().map(|config| config.lock().unwrap().status());
     let q = shared.inbox.lock().unwrap();
     let reader = crate::system_reader::status();
     Json(
@@ -483,7 +487,7 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
         "route_pending":q.route_pending,"route_last":q.route_last,"arm_clock_ns":q.receipt_ns.to_string(),
         "arm_now_ns":clock_ns().to_string(),"boot_id":q.actual["boot"],"clock_session":shared.clock_session,
-        "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,
+        "phase":q.phase,"command_timing":q.command_timing,"capabilities":q.capabilities,"loop_config":loop_config,
         "operation":q.operation,"progress":q.progress,"last_progress":q.last_progress,"progress_failure":q.progress_failure,
         "roi":{"id":q.roi_id,"generation":q.roi_generation,"center_hz":q.roi.map(|r|r.range[0]+(r.range[1]-r.range[0])/2),
                "range_hz":q.roi.map(|r|r.range),"view_bins":q.roi.map(|r|r.view_bins)},
@@ -506,6 +510,36 @@ async fn submit(
     {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid id"})));
     }
+    if cmd["op"] == "loop_config" {
+        if shared.loop_config.is_none() {
+            return (StatusCode::CONFLICT, Json(json!({"error":"ARM loop config is unavailable"})));
+        }
+        let policy = match loop_grid::Policy::parse(cmd["config"].clone()) {
+            Ok(policy) => policy,
+            Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()}))),
+        };
+        let id = id.as_str().unwrap().to_owned();
+        let save_id = id.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            shared.loop_config.as_ref().unwrap().lock().unwrap().save(&save_id, policy)
+        }).await;
+        return match saved {
+            Ok(Ok(())) => (StatusCode::ACCEPTED, Json(json!({"accepted_id":id}))),
+            Ok(Err(error)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error.to_string()}))),
+            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":error.to_string()}))),
+        };
+    }
+    if cmd.get("loop").is_some() && (cmd["op"] != "scan" || shared.loop_config.is_none()) {
+        return (StatusCode::CONFLICT, Json(json!({"error":"configurable loop requires a supported scan"})));
+    }
+    if cmd["op"] == "scan" && cmd["planner_version"] == 2 && let Some(config) = &shared.loop_config {
+        let policy = config.lock().unwrap().effective();
+        let resolved = generated::scan_rf_bounds().and_then(|bounds| policy.resolve_scan(&mut cmd, bounds));
+        if let Err(error) = resolved {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()})));
+        }
+    }
+    let id = &cmd["id"];
     if let Err(e) = validate(&cmd) {
         return (
             StatusCode::BAD_REQUEST,
@@ -2741,6 +2775,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
+        "loop_grid_config":obn5&&c.roi.is_some(),
         "resident_field":c.resident_field.is_some(),"video_profiles":obn5,
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
@@ -2762,6 +2797,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     }
     let shared = Arc::new(Shared {
         clock_session: format!("{}:{:x}",std::process::id(),clock_ns()),
+        loop_config: (obn5 && c.roi.is_some()).then(|| Mutex::new(loop_grid::Store::load(&c.output))),
         inbox: Mutex::new(Inbox {
             phase: if catalog_policy {"accepted"} else {"stopped"},
             next: catalog_policy.then(||json!({"op":"antennas","id":format!("{:032x}",clock_ns()),
