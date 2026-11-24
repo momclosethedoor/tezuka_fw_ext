@@ -1,5 +1,12 @@
 use std::{io,net::UdpSocket,time::{Duration,Instant}};
 use super::timing::Histogram;
+pub(super) const MAX_SENDMMSG:usize=8;
+const MAX_BATCH_WAIT:Duration=Duration::from_millis(4);
+type SendDatagrams=fn(&UdpSocket,&[u8],usize)->io::Result<usize>;
+pub(super) struct DatagramBatch {
+ pub calls:u64,pub wait:Histogram,
+ send:SendDatagrams,
+}
 pub struct UdpBatch {
  pub bytes:Vec<u8>,pub pending:u64,pub sent:u64,pub dropped:u64,pub datagrams:u64,pub send_calls:u64,
  pub mtu:Option<u32>,pub ip_fragmentation:bool,
@@ -9,6 +16,7 @@ pub struct UdpBatch {
  pub last_errno:Option<i32>,pub notes_sent:u64,pub notes_lost:u64,pub transition:u64,
  pub rejected_before_queue:u64,pub suppressed:u64,
  pub(super) api_send:Histogram,pub(super) oldest_to_send:Histogram,
+ pub(super) datagram_batch:Option<DatagramBatch>,
  first:Option<Instant>,record_size:usize,
 }
 impl UdpBatch {
@@ -18,7 +26,7 @@ impl UdpBatch {
    phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,send_calls:0,mtu:None,ip_fragmentation:false,oldest_wait_bins:[0;32],
    sent_bytes:0,high_records:0,would_block:0,send_errors:0,last_errno:None,
    notes_sent:0,notes_lost:0,transition:0,rejected_before_queue:0,suppressed:0,
-   api_send:Histogram::default(),oldest_to_send:Histogram::default()}
+   api_send:Histogram::default(),oldest_to_send:Histogram::default(),datagram_batch:None}
  }
  pub fn new(record_size:usize)->Self {
   let delay=std::env::var("OBS_VIEW_COALESCE_US").ok().and_then(|s|s.parse::<u64>().ok()).filter(|v|*v<=10000).unwrap_or(0);
@@ -40,6 +48,18 @@ impl UdpBatch {
   self.first.is_some_and(|t|now.saturating_duration_since(t)>=Duration::from_micros(self.coalesce_us))
  }
  pub fn flush_due(&mut self,s:&UdpSocket){if self.due(Instant::now()){self.flush(s);}}
+ pub(super) fn enable_datagram_batch(&mut self,send:SendDatagrams){
+  assert_eq!(self.max_records,1);
+  self.bytes.reserve(self.record_size * MAX_SENDMMSG);
+  self.datagram_batch=Some(DatagramBatch{calls:0,wait:Histogram::default(),send});
+ }
+ pub(super) fn stream_flush(&mut self,s:&UdpSocket){
+  if self.datagram_batch.is_some() && self.pending<MAX_SENDMMSG as u64 &&
+      self.first.is_some_and(|first|first.elapsed()<MAX_BATCH_WAIT){
+   return;
+  }
+  self.flush(s);
+ }
  #[cfg(feature="scan-stream-bench")]
  pub(super) fn suppress_pending(&mut self){
   self.suppressed+=self.pending;
@@ -66,12 +86,38 @@ impl UdpBatch {
   if let Some(t)=self.first {
    let age=now.duration_since(t).as_nanos();
    self.max_wait_ns=self.max_wait_ns.max(age);
+   if let Some(batch)=self.datagram_batch.as_mut(){batch.wait.observe(now.duration_since(t));}
    if self.phase_on {
     let upper_exponent=u128::BITS-age.saturating_sub(1).leading_zeros();
     self.oldest_wait_bins[upper_exponent.min(31) as usize]+=1;
    }
   }
-  for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
+  if let Some(batch)=self.datagram_batch.as_mut(){
+   let mut offset=0;
+   while offset<self.bytes.len(){
+    let count=MAX_SENDMMSG.min((self.bytes.len()-offset)/self.record_size);
+    let stop=offset+count*self.record_size;
+    self.send_calls+=1;
+    batch.calls+=1;
+    let result=(batch.send)(s,&self.bytes[offset..stop],self.record_size);
+    match result {
+     Ok(sent) if (1..=count).contains(&sent)=>{
+      self.sent+=sent as u64;
+      self.datagrams+=sent as u64;
+      self.sent_bytes+=(sent*self.record_size) as u64;
+      offset+=sent*self.record_size;
+     }
+     result=>{
+      self.dropped+=count as u64;
+      let (blocked,errno)=send_error(result);
+      self.would_block+=u64::from(blocked);
+      self.send_errors+=1;
+      self.last_errno=errno;
+      offset=stop;
+     }
+    }
+   }
+  }else{for packet in self.bytes.chunks(self.record_size*self.max_records){let count=(packet.len()/self.record_size)as u64;
    self.send_calls+=1;
    let before=(self.phase_on && cfg!(feature="scan-stream-bench")).then(Instant::now);
    match s.send(packet){
@@ -87,7 +133,7 @@ impl UdpBatch {
      self.last_errno=errno;
     }
    }
-  }
+  }}
   self.bytes.clear();self.pending=0;self.first=None;
   if self.phase_on{self.send_ns+=now.elapsed().as_nanos();}
  }
@@ -144,6 +190,25 @@ fn send_error(result:io::Result<usize>)->(bool,Option<i32>){
   assert_eq!(&buf[..576],&[1;576]);assert_eq!(&buf[576..1152],&[2;576]);
   assert_eq!(receiver.recv(&mut buf).unwrap(),576);assert_eq!(&buf[..576],&[3;576]);
   assert_eq!((q.sent,q.datagrams,q.dropped),(3,2,0));
+ }
+
+ #[test] fn datagram_batch_retries_unsent_suffix_without_merging_records(){
+  let receiver=UdpSocket::bind("127.0.0.1:0").unwrap();receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+  let sender=UdpSocket::bind("127.0.0.1:0").unwrap();sender.connect(receiver.local_addr().unwrap()).unwrap();
+  let mut q=UdpBatch::configured(0,false,1,4160);
+  q.enable_datagram_batch(|sock,chunk,record_size|{
+   // Force a successful partial write regardless of the requested batch size.
+   sock.send(&chunk[..record_size]).map(|_|1)
+  });
+  for n in 1..=8{add(&mut q,n);}
+  q.stream_flush(&sender);
+  let mut buf=[0u8;5000];
+  for n in 1..=8{
+   assert_eq!(receiver.recv(&mut buf).unwrap(),4160);
+   assert_eq!(&buf[..4160],&[n;4160]);
+  }
+  assert_eq!((q.sent,q.datagrams,q.dropped,q.send_calls),(8,8,0,8));
+  assert_eq!(q.datagram_batch.as_ref().unwrap().calls,8);
  }
 
 }

@@ -85,6 +85,10 @@ mod tests {
 enum Mode { Stream, Pass }
 
 impl SweepSpec {
+    pub(super) fn streams(&self) -> bool {
+        self.mode == Mode::Stream
+    }
+
     pub(super) fn from_layout(version: u64, positions: Vec<Option<usize>>, mode: &str) -> R<Self> {
         let mode = match mode {
             "stream" => Mode::Stream,
@@ -188,8 +192,8 @@ impl<'a> Delivery<'a> {
     }
 
     pub(super) fn poll(&self,net:&mut UdpBatch,sock:&UdpSocket) {
-        if self.spec.mode == Mode::Stream {
-            net.flush(sock);
+        if self.spec.streams() {
+            net.stream_flush(sock);
         }
     }
 

@@ -594,6 +594,25 @@ fn view_idle_wait(k:u32,bins:usize)->Duration {
  Duration::from_micros((u64::from(k)*bins as u64*1_000_000/(8*61_440_000)).min(64))
 }
 
+fn send_view_datagrams(socket: &std::net::UdpSocket, bytes: &[u8], record_size: usize)
+    -> std::io::Result<usize>
+{
+    let count = bytes.len() / record_size;
+    debug_assert!((1..=view_batch::MAX_SENDMMSG).contains(&count));
+    let mut iov: [libc::iovec; view_batch::MAX_SENDMMSG] = unsafe { std::mem::zeroed() };
+    let mut messages: [libc::mmsghdr; view_batch::MAX_SENDMMSG] = unsafe { std::mem::zeroed() };
+    for (index, packet) in bytes.chunks_exact(record_size).enumerate() {
+        iov[index].iov_base = packet.as_ptr().cast_mut().cast();
+        iov[index].iov_len = packet.len();
+        messages[index].msg_hdr.msg_iov = &mut iov[index];
+        messages[index].msg_hdr.msg_iovlen = 1;
+    }
+    let sent = unsafe {
+        libc::sendmmsg(socket.as_raw_fd(), messages.as_mut_ptr(), count as libc::c_uint, libc::MSG_DONTWAIT)
+    };
+    if sent < 0 { Err(std::io::Error::last_os_error()) } else { Ok(sent as usize) }
+}
+
 fn histogram(h:timing::Histogram)->Value {
  json!({"bins_upper_ns_pow2":h.bins,"max_ns":h.max_ns})
 }
@@ -662,6 +681,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    return Err("managed VIEW needs an IPv4 route MTU".into());
   }
   net.set_path_mtu(mtu as u32);
+  if obn5 && matches!(wire_view_bins,1024|2048) && net.max_records==1 &&
+      control.and_then(|q|q.sweep).is_some_and(SweepSpec::streams) {
+   net.enable_datagram_batch(send_view_datagrams);
+  }
   if net.ip_fragmentation {
    let mode:libc::c_int=libc::IP_PMTUDISC_DONT;
    let len=std::mem::size_of_val(&mode) as libc::socklen_t;
@@ -851,6 +874,9 @@ impl UdpBatch {
   "completion_sent":self.notes_sent,"completion_send_drop":self.notes_lost,
   "send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,
   "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string(),"oldest_view_wait_ns_pow2":self.phase_on.then_some(self.oldest_wait_bins),
+  "datagrams_per_call_limit":if self.datagram_batch.is_some(){view_batch::MAX_SENDMMSG}else{1},
+  "sendmmsg_calls":self.datagram_batch.as_ref().map_or(0,|batch|batch.calls),
+  "datagram_batch_wait":self.datagram_batch.as_ref().map(|batch|histogram(batch.wait)),
   "api_send_ns":self.phase_on.then(||histogram(self.api_send)),
   "batch_oldest_to_api_complete_ns":self.phase_on.then(||histogram(self.oldest_to_send)),})}
 }
