@@ -41,6 +41,7 @@ fn calibrate(
     prefix: &str,
     old: u64,
     stop: &AtomicBool,
+    mut profile_ready: impl FnMut(),
 ) -> Result<(Bank, usize)> {
     let frequency = format!("{prefix}_frequency");
     let mut result = Bank::new();
@@ -77,7 +78,9 @@ fn calibrate(
                     .map(str::parse::<u8>)
                     .collect::<Result<Vec<_>, _>>()?;
                 ensure!(fields.next().is_none(), "invalid fastlock data");
-                (hz, bytes.try_into().map_err(|_| anyhow!("fastlock width"))?)
+                let profile = (hz, bytes.try_into().map_err(|_| anyhow!("fastlock width"))?);
+                profile_ready();
+                profile
             };
             result.insert(requested, profile);
         }
@@ -92,7 +95,7 @@ fn calibrate(
 }
 
 impl Cache {
-    pub fn catalog(state: &Value, shared: &Shared) -> Result<(Self, Value)> {
+    pub fn catalog(&self, state: &Value, shared: &Shared) -> Result<(Self, Value)> {
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
         let bands = parse_antenna_bands(&state["scan"]["antenna_bands"])?;
@@ -109,6 +112,7 @@ impl Cache {
         ensure!(!union.is_empty(), "antenna catalog outside receiver limits");
         let mut full = state.clone();
         full["alternative"] = Value::Null;
+        full["scan"].as_object_mut().unwrap().remove("recalibrate");
         full["scan"]["ranges"] = json!(union.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
         let core = generated::core_tiles(&full)?;
         let grid = if full["grid_27"] == true {
@@ -117,7 +121,12 @@ impl Cache {
             Vec::new()
         };
         let tiles = generated::catalog_profiles(&full, &core, &grid)?;
-        let mut cache = Self::default();
+        let mut cache = Self {
+            snapshot: self.snapshot.clone(),
+            rx: self.rx.clone(),
+            tx: self.tx.clone(),
+            ..Self::default()
+        };
         let (_, desc) = cache.prepare_tiles(&full,shared,tiles,None,start,cpu_start,true)?;
         cache.core = core;
         cache.grid = grid;
@@ -176,7 +185,9 @@ impl Cache {
         let cpu_start = cpu_ns()?;
         let memoize = pending["alternative"].is_null() && pending["scan"]["recalibrate"] != true
             && pending["scan"].get("next_ranges").is_none();
-        let key = json!([pending["scan"],pending["grid_27"],pending["pl_timing_only"],
+        let mut plan_settings = pending["scan"].clone();
+        plan_settings.as_object_mut().unwrap().remove("gain_db");
+        let key = json!([plan_settings,pending["grid_27"],pending["pl_timing_only"],
             pending["xtg1_wait_ticks"],pending["catalog_policy"],pending["route"]["antenna"]]);
         if memoize && let Some(cached)=&self.compiled && cached.key==key && snapshot()?==self.snapshot
             && restore_frequencies()?==cached.restore && attr("out_altvoltage1_TX_LO_powerdown")? == "1" {
@@ -250,7 +261,6 @@ impl Cache {
             tx_keys.len()
         );
         let math_us = start.elapsed().as_micros() as u64;
-        shared.inbox.lock().unwrap().phase = "calibrating";
         let now = Instant::now();
         let snapshot = snapshot()?;
         let invalidation = if pending["scan"]["recalibrate"] == true {
@@ -271,12 +281,26 @@ impl Cache {
             attr("out_altvoltage1_TX_LO_powerdown")? == "1",
             "TX active before preparation"
         );
+        let rx_missing = rx_keys.iter().filter(|key| !self.rx.contains_key(*key)).count();
+        let tx_missing = tx_keys.iter().filter(|key| !self.tx.contains_key(*key)).count();
+        {
+            let mut inbox = shared.inbox.lock().unwrap();
+            inbox.phase = "calibrating";
+            inbox.operation = json!({"kind":"calibration","profiles_done":0,
+                "profiles_total":rx_missing+tx_missing});
+        }
+        let mut profiles_done = 0;
+        let mut profile_ready = || {
+            profiles_done += 1;
+            shared.inbox.lock().unwrap().operation["profiles_done"] = json!(profiles_done);
+        };
         let (rx, rx_cold) = calibrate(
             &rx_keys,
             &self.rx,
             "out_altvoltage0_RX_LO",
             restore[0],
             stop,
+            &mut profile_ready,
         )?;
         let (tx, tx_cold) = calibrate(
             &tx_keys,
@@ -284,6 +308,7 @@ impl Cache {
             "out_altvoltage1_TX_LO",
             restore[1],
             stop,
+            &mut profile_ready,
         )?;
         let prepare_us = now.elapsed().as_micros() as u64;
         let compile = Instant::now();

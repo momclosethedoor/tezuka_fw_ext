@@ -405,6 +405,9 @@ fn validate(v: &Value) -> Result<()> {
                 ensure!(!bands.is_null(), "antenna_bands must be an object");
                 parse_antenna_bands(bands)?;
             }
+            if v.get("gain_db").is_some() {
+                int(v, "gain_db", 0, 71)?;
+            }
             if let Some(ranges) = v.get("next_ranges") {
                 ensure!(run && v["planner_version"] == 2,"NEXT preparation requires v2 scan run");
                 let mut second = v.clone();
@@ -1832,7 +1835,7 @@ fn worker(
                     pending["scan"]["antenna_bands"] = request["antenna_bands"].clone();
                     pending["scan"]["mixer"] = pending["catalog_mixer"].clone();
                     pending["scan_bounds"] = json!(scan_bounds(&c,&parse_antenna_bands(&request["antenna_bands"])?)?);
-                    let (next, info) = calibration::Cache::catalog(&pending,&shared)?;
+                    let (next, info) = calibration.catalog(&pending,&shared)?;
                     let tmp = c.output.join("antennas.json.tmp");
                     fs::write(&tmp, serde_json::to_vec(&request["antenna_bands"])?)?;
                     fs::rename(tmp,c.output.join("antennas.json"))?;
@@ -1895,6 +1898,9 @@ fn worker(
                     if op == "scan" {
                         pending["video"] = Value::Null;
                         pending["return_mode"] = Value::Null;
+                        if request.get("gain_db").is_some() {
+                            pending["scan_rx"] = json!({"agc":"manual","gain_db":request["gain_db"]});
+                        }
                         if pending["catalog_policy"] == true {
                             ensure!(request["run"] != true || !pending["catalog"].is_null(),
                                     "antenna catalog not ready");
@@ -2027,6 +2033,9 @@ fn worker(
             }
             if mode == "scan" {
                 if pending["running"] != true {
+                    if op == "scan" && cmd.get("gain_db").is_some() {
+                        pending["rx_gain_db"] = json!(apply_gain(&pending["scan_rx"])?);
+                    }
                     return Ok(None);
                 }
                 let (bytes, spectrum) = if pending["scan"]["planner_version"] == 2 {
@@ -2862,6 +2871,11 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("scan gain"))?
         .parse::<f64>()?;
+    let scan_rx = if let Some(gain) = c.scan.get("gain_db") {
+        json!({"agc":"manual","gain_db":gain})
+    } else {
+        json!({"agc":scan_agc,"gain_db":scan_gain})
+    };
     let initial_mode = if c.external_mixer.is_some() {
         "analysis"
     } else {
@@ -2890,7 +2904,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "catalog_policy":catalog_policy,"catalog_antennas":c.scan["antenna_bands"],"catalog_mixer":c.scan["mixer"],
         "scan":c.scan,"analysis":c.analysis,"video":null,"return_mode":null,"running":false,"k":c.scan["k"],
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
-        "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
+        "scan_rx":scan_rx,"rx_gain_db":scan_gain,
         "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual,
         "manual_demod_tx_available":demod_tx,
         "scan_bounds":bounds});
@@ -2916,7 +2930,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_bounds = generated::scan_rf_bounds()?;
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
-    let capabilities = json!({"tx_on":manual,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
+    let capabilities = json!({"tx_on":manual,"scan_gain":true,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
         "loop_grid_config":obn5&&c.roi.is_some(),
