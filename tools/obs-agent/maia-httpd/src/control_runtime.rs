@@ -286,10 +286,14 @@ fn view_mode(settings: &Value) -> Result<u32> {
 }
 
 fn check_spectrum_settings(settings: &Value, obn5: bool) -> Result<()> {
-    for key in ["fft_bins", "hold_k", "view_bins"] {
+    for key in ["fft_bins", "hold_k", "view_bins", "spectrum_detector"] {
         if settings.get(key).is_some() {
             ensure!(matches!(settings["op"].as_str(),Some("scan"|"analysis")),"{key} requires scan or analysis");
         }
+    }
+    if let Some(detector) = settings.get("spectrum_detector") {
+        ensure!(obn5, "spectrum_detector requires OBN5");
+        ensure!(matches!(detector.as_str(), Some("avg" | "peak")), "spectrum_detector must be avg or peak");
     }
     if settings.get("hold_k").is_some() { int(settings,"hold_k",1,1023)?; }
     if matches!(settings["op"].as_str(),Some("scan"|"analysis")) {
@@ -1625,7 +1629,7 @@ fn continuous_with_spectrum(
     let mode = view_mode(&json!({"fft_bins":fft,"view_bins":view}))?;
     let cfg = serde_json::to_vec(&json!({
         "boot_id":c.boot_id,"output":c.output.join("demod-spectrum"),"command":"rate",
-        "k":k,"mode":mode,"seconds":1.0,"warmup":0.0,"batch_limit":64,
+        "k":k,"mode":mode,"peak":grid["spectrum_detector"]=="peak","seconds":1.0,"warmup":0.0,"batch_limit":64,
         "stream_config":stream_config,"tx_active":tx_active,"batch_sync":true,"udp":c.view.to_string(),
         "trace_limit":0,"send_after_release":true,
     }))?;
@@ -1879,6 +1883,11 @@ fn worker(
                     pending["alternative"] = Value::Null;
                 }
                 "scan" | "analysis" => {
+                    if request.get("spectrum_detector").is_none() {
+                        if let Some(saved) = pending[op].get("spectrum_detector") {
+                            request["spectrum_detector"] = saved.clone();
+                        }
+                    }
                     if request.get("view_bins").is_none() {
                         let previous=pending[op]["view_bins"].as_u64().unwrap_or(512);
                         let fft=request["fft_bins"].as_u64().unwrap_or(4096);
@@ -2282,7 +2291,8 @@ fn worker(
             let stream_config=if obn5 {
                 Some(match settings["fft_bins"].as_u64().unwrap_or(4096) {4096=>0,2048=>2,1024=>4,_=>bail!("OBN5 FFT length")})
             } else {view_only.then_some(0)};
-            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,"previous_mode":if obn5{0}else{mode_index},
+            let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,
+                "peak":settings["spectrum_detector"]=="peak","previous_mode":if obn5{0}else{mode_index},
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "stream_config":stream_config,"hold_k":settings["hold_k"],"bench_obn3_view_only":view_only,
@@ -2995,6 +3005,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"scan_gain":true,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
+        "spectrum_detector":obn5,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
         "loop_grid_config":obn5&&c.roi.is_some(),

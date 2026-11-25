@@ -729,6 +729,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    if execution.get().is_none(){
     let e=Execution{generation:q.generation,version:q.version,anchor:if c.scan{initial_anchor}else{h.epoch},run:initial.cookie};
     if h.epoch<e.anchor{network.borrow_mut().suppressed+=1;return Ok(())}
+    if h.peak()!=c.peak{return Err("PL spectrum detector differs from requested AVG/PEAK".into())}
     execution.set(Some(e));
     (q.started)(h,e);
    }
