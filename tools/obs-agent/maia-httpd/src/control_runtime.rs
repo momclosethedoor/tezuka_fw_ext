@@ -1603,7 +1603,7 @@ fn continuous_with_spectrum(
     let generation = state["generation"].as_u64().unwrap();
     let version = state["map_version"].as_u64().unwrap_or(0) as u32;
     let k = state["k"].clone();
-    let tx_off = state["tx"]["on"] != true;
+    let tx_active = state["tx"]["on"] == true;
     let grid = &state[state["return_mode"].as_str().unwrap_or("scan")];
     let fft = grid["fft_bins"].as_u64().unwrap_or(4096);
     let stream_config = match fft {
@@ -1617,7 +1617,7 @@ fn continuous_with_spectrum(
     let cfg = serde_json::to_vec(&json!({
         "boot_id":c.boot_id,"output":c.output.join("demod-spectrum"),"command":"rate",
         "k":k,"mode":mode,"seconds":1.0,"warmup":0.0,"batch_limit":64,
-        "stream_config":stream_config,"batch_sync":true,"udp":c.view.to_string(),
+        "stream_config":stream_config,"tx_active":tx_active,"batch_sync":true,"udp":c.view.to_string(),
         "trace_limit":0,"send_after_release":true,
     }))?;
     let cancel_video = AtomicBool::new(false);
@@ -1649,7 +1649,7 @@ fn continuous_with_spectrum(
                 ("k".into(), k.clone()), ("fs_hz".into(), json!(FS)),
                 ("flags".into(), json!(header.flags)), ("fft_bins".into(), json!(header.bins)),
                 ("view_bins".into(), json!(bins)), ("view_power_revision".into(), json!(2)),
-                ("TX_OFF".into(), json!(tx_off)),
+                ("TX_OFF".into(), json!(!tx_active)),
             ]);
             let _ = ready.send(state.clone());
         };
