@@ -1301,6 +1301,7 @@ fn tune(state: &mut Value) -> Result<()> {
     let settings = &state[if video { "video" } else { "analysis" }];
     let center = int(settings, "center_hz", 70_000_000, 18_000_000_000)?;
     let width = int(settings, "width_hz", 120_000, 56_000_000)?;
+    let spectrum_enabled = !video || settings.get("spectrum_k").is_some();
     let mixer = state["route"]["kind"] == "mixer";
     let side = state["route"]["side"].as_i64().unwrap_or(1);
     let offset = if mixer {
@@ -1327,7 +1328,7 @@ fn tune(state: &mut Value) -> Result<()> {
     } else {
         Value::Null
     };
-    if !video || settings.get("spectrum_k").is_some() {
+    if spectrum_enabled {
         let edges = if video {
             let low = (lo as i64 - 28_000_000).max(70_000_000);
             let high = (lo as i64 + 28_000_000).min(6_000_000_000);
