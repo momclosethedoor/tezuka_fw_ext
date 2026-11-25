@@ -2724,12 +2724,24 @@ pub fn check_scan_tx_bank() -> Result<()> {
     ensure!(error.contains("9 TX") && error.contains("/8"),"unexpected bank error: {error}");
     state["pl_timing_only"] = json!(false);
     state["xtg1_wait_ticks"] = json!(256);
-    for attenuation in [3_000, 12_250] {
+    let mut request = state["scan"].clone();
+    request["op"] = json!("scan");
+    request["planner_version"] = json!(2);
+    request["k"] = json!(3);
+    request["run"] = json!(false);
+    request["tx_attenuation_mdb"] = json!(-250);
+    ensure!(validate(&request).is_err(), "negative scan TX attenuation must fail");
+    request["tx_attenuation_mdb"] = json!(0);
+    validate(&request)?;
+    for override_attenuation in [None, Some(0u32), Some(12_250)] {
+        if let Some(attenuation) = override_attenuation {
+            state["scan"]["tx_attenuation_mdb"] = json!(attenuation);
+        }
+        let attenuation = override_attenuation.unwrap_or(30_000);
         let (bytes,desc) = generated::encode(&tiles[..8],&rx,&eight,
             [2_400_000_000,2_450_000_000],&state,128)?;
         ensure!(word(&bytes,bytes.len()-152)==attenuation
                 && desc["tx_attenuation_mdb"]==attenuation,"scan TX attenuation {attenuation}");
-        state["scan"]["tx_attenuation_mdb"] = json!(12_250);
     }
     let [lo, hi] = generated::scan_rf_bounds()?;
     let (threshold, _) = generated::environment()?;

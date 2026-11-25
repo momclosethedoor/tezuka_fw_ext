@@ -531,7 +531,7 @@ pub(super) fn encode(
     // Timing fixture recalls the actual TX bank while the driver keeps RF muted.
     let timing_only = state["pl_timing_only"] == true;
     let tx_rf_on = !tx.is_empty() && !timing_only;
-    let tx_attenuation = state["scan"]["tx_attenuation_mdb"].as_u64().unwrap_or(3_000) as u32;
+    let tx_attenuation = state["scan"]["tx_attenuation_mdb"].as_u64().unwrap_or(30_000) as u32;
     let managed = tx_rf_on && state["xtg1_wait_ticks"].is_number();
     let working_grid = state["grid_27"] == true && state["alternative"].is_null()
         && state["scan"]["bench_overlap_hz"].is_null();
