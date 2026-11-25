@@ -436,6 +436,8 @@ fn validate(v: &Value) -> Result<()> {
                     matches!(v["agc"].as_str(), Some("manual" | "slow_attack")),
                     "unsupported AGC"
                 );
+            } else if v.get("spectrum_k").is_some() {
+                int(v, "spectrum_k", 1, 1023)?;
             }
         }
         Some("return") => {}
@@ -598,6 +600,9 @@ async fn submit(
     }
     if cmd["op"]=="video" && let Err(error)=video_profile::Profile::parse(&cmd,q.capabilities["video_profiles"]==true) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()})));
+    }
+    if cmd["op"] == "video" && cmd.get("spectrum_k").is_some() && q.capabilities["video_spectrum"] != true {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"video spectrum requires OBN5 r2"})));
     }
     if q.applied_id == *id
         || q.failed_id == *id
@@ -1322,8 +1327,17 @@ fn tune(state: &mut Value) -> Result<()> {
     } else {
         Value::Null
     };
-    if !video {
-        state["spectrum"] = json!({"rf_ranges":[[center-width/2,center+width.div_ceil(2)]],
+    if !video || settings.get("spectrum_k").is_some() {
+        let edges = if video {
+            let low = (lo as i64 - 28_000_000).max(70_000_000);
+            let high = (lo as i64 + 28_000_000).min(6_000_000_000);
+            let a = offset + side * low;
+            let b = offset + side * high;
+            json!([a.min(b).max(70_000_000), a.max(b)])
+        } else {
+            json!([center-width/2,center+width.div_ceil(2)])
+        };
+        state["spectrum"] = json!({"rf_ranges":[edges],
             "positions":[{"rx_lo_hz":lo,"rf_center_hz":offset+side*lo as i64,"side_sign":side,"mixer":mixer}]});
     }
     Ok(())
@@ -1380,11 +1394,19 @@ fn continuous(
     id: &Value,
     regs: &Registers,
     profile: &video_profile::Profile,
+    cancel: &AtomicBool,
 ) -> Result<()> {
+    let with_spectrum = state["video"].get("spectrum_k").is_some();
+    let spectrum_status = regs.read(0x64);
+    let stopping = || shared.switch.load(Ordering::Acquire) || cancel.load(Ordering::Acquire);
     ensure!(
-        regs.read(0x64) == 16 && regs.read(0x1e0) == 0 && regs.read(0x284) == 0,
-        "video needs STOP/DRAINED and released DDC"
+        (if with_spectrum { spectrum_status & 1 == 1 } else { spectrum_status == 16 })
+            && regs.read(0x1e0) == 0 && regs.read(0x284) == 0,
+        "video needs the requested FFT state and released DDC"
     );
+    if stopping() {
+        return Ok(());
+    }
     let generation = state["generation"].as_u64().unwrap();
     let mut queue = video_egress::Queue::new(profile.code);
     shared.inbox.lock().unwrap().metrics = video_counters(generation, &queue, false, None);
@@ -1433,7 +1455,7 @@ fn continuous(
                 while !capture_enabled()? {
                     ensure!(
                         start.elapsed() < Duration::from_secs(2)
-                            && !shared.switch.load(Ordering::Acquire),
+                            && !stopping(),
                         "IIO buffer enable timeout"
                     );
                     std::thread::sleep(Duration::from_millis(3));
@@ -1445,7 +1467,7 @@ fn continuous(
                 let mut status_due = Instant::now();
                 let mut sampled_reads = 0;
                 let mut source_progress_at = None;
-                while !shared.switch.load(Ordering::Acquire) {
+                while !stopping() {
                     let previous_sent = queue.counts.frames;
                     let sent = queue.pump(&mut conn).map_err(|e| anyhow!("real8 socket send: {e}"))?;
                     if previous_sent == 0 && queue.counts.frames != 0 {
@@ -1547,6 +1569,96 @@ fn continuous(
     }
     drop(inbox);
     result.and(cleanup)
+}
+
+fn continuous_with_spectrum(
+    c: &Config,
+    shared: &Shared,
+    state: &mut Value,
+    id: &Value,
+    profile: &video_profile::Profile,
+) -> Result<()> {
+    let generation = state["generation"].as_u64().unwrap();
+    let version = state["map_version"].as_u64().unwrap_or(0) as u32;
+    let k = state["k"].clone();
+    let tx_off = state["tx"]["on"] != true;
+    let grid = &state[state["return_mode"].as_str().unwrap_or("scan")];
+    let fft = grid["fft_bins"].as_u64().unwrap_or(4096);
+    let stream_config = match fft {
+        4096 => 0,
+        2048 => 2,
+        1024 => 4,
+        _ => bail!("OBN5 FFT length"),
+    };
+    let view = grid["view_bins"].as_u64().filter(|bins| *bins != 0).unwrap_or(fft / 2);
+    let mode = view_mode(&json!({"fft_bins":fft,"view_bins":view}))?;
+    let cfg = serde_json::to_vec(&json!({
+        "boot_id":c.boot_id,"output":c.output.join("demod-spectrum"),"command":"rate",
+        "k":k,"mode":mode,"seconds":1.0,"warmup":0.0,"batch_limit":64,
+        "stream_config":stream_config,"batch_sync":true,"udp":c.view.to_string(),
+        "trace_limit":0,"send_after_release":true,
+    }))?;
+    let cancel_video = AtomicBool::new(false);
+    let video_finished = AtomicBool::new(false);
+    let (ready, start_video) = std::sync::mpsc::sync_channel::<Value>(1);
+    let state_with_spectrum = RefCell::new(state.clone());
+    let result = std::thread::scope(|scope| {
+        let cancel = &cancel_video;
+        let finished = &video_finished;
+        let video = scope.spawn(move || {
+            let result = (|| {
+                let Ok(actual) = start_video.recv() else { return Ok(()); };
+                let regs = Registers::open()?;
+                continuous(c, shared, &actual, id, &regs, profile, cancel)
+            })();
+            finished.store(true, Ordering::Release);
+            result
+        });
+        let started = |header: crate::system_reader::Header, execution: crate::system_reader::Execution| {
+            let mut state = state_with_spectrum.borrow_mut();
+            let bins = crate::system_reader::view_bins(header);
+            state["epoch"] = json!(execution.anchor);
+            state["dma_run"] = json!(execution.run);
+            state["view_bins"] = json!(bins);
+            let spectrum = state["spectrum"].as_object_mut().unwrap();
+            spectrum.extend([
+                ("generation".into(), json!(generation)), ("version".into(), json!(version)),
+                ("map_epoch".into(), json!(execution.anchor)), ("scan".into(), json!(false)),
+                ("k".into(), k.clone()), ("fs_hz".into(), json!(FS)),
+                ("flags".into(), json!(header.flags)), ("fft_bins".into(), json!(header.bins)),
+                ("view_bins".into(), json!(bins)), ("view_power_revision".into(), json!(2)),
+                ("TX_OFF".into(), json!(tx_off)),
+            ]);
+            let _ = ready.send(state.clone());
+        };
+        let reader = crate::system_reader::run_controlled(&cfg, &crate::system_reader::RunControl {
+            generation, version, stop: &shared.switch, started: &started,
+            trace: &|stage| trace_control(stage, || json!({"id":id,"generation":generation})),
+            route: &|_, _, _, _, _| Ok(None), route_released: &|_, _, _| {},
+            check: &|| {
+                if video_finished.load(Ordering::Acquire) && !shared.switch.load(Ordering::Acquire) {
+                    return Err("real8 worker stopped".into());
+                }
+                Ok(())
+            },
+            progress: &|sample| {
+                let mut inbox = shared.inbox.lock().unwrap();
+                if progress_matches(&sample, &inbox.actual) {
+                    inbox.last_progress = sample.clone();
+                    inbox.progress = sample;
+                }
+            },
+            stalled: &|_| {},
+            bench_stall: false, bench_stall_after_next: false, sweep: None, next: None, roi: None,
+        });
+        cancel_video.store(true, Ordering::Release);
+        drop(ready);
+        let video = video.join().map_err(|_| anyhow!("real8 worker panicked"))?;
+        video?;
+        reader.map_err(anyhow::Error::msg)
+    });
+    *state = state_with_spectrum.into_inner();
+    result
 }
 
 fn stop_video_reader(child: &mut std::process::Child) -> Result<()> {
@@ -1867,7 +1979,11 @@ fn worker(
                 pending["map_version"] = json!((generation % 0x7fff_fffd) + 1);
             }
             let mode = pending["mode"].as_str().unwrap().to_owned();
-            pending["k"] = pending[&mode]["k"].clone();
+            pending["k"] = if mode == "video" {
+                pending["video"]["spectrum_k"].clone()
+            } else {
+                pending[&mode]["k"].clone()
+            };
             pending["running"] = json!(mode != "scan" || pending["scan"]["run"] == true);
             if let Some(mixer) = &c.external_mixer {
                 ensure!(
@@ -1939,9 +2055,12 @@ fn worker(
                 } else {
                     None
                 };
-                let a=actual.borrow();
+                let mut a=actual.borrow_mut();
                 let profile=video_profile::Profile::parse(&a["video"],regs.read(0x50)==0x354e424f)?;
-                return continuous(&c, &shared, &a, id, &regs, &profile);
+                if a["video"].get("spectrum_k").is_some() {
+                    return continuous_with_spectrum(&c, &shared, &mut a, id, &profile);
+                }
+                return continuous(&c, &shared, &a, id, &regs, &profile, &shared.switch);
             }
             let mut sweep = None;
             let mut next_spectrum = None;
@@ -2779,6 +2898,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
         "loop_grid_config":obn5&&c.roi.is_some(),
         "resident_field":c.resident_field.is_some(),"video_profiles":obn5,
+        "video_spectrum":obn5 && regs.read(0xe4)==2,
         "view_power_revision":if obn5 {regs.read(0xe4)} else {1},
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
