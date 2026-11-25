@@ -109,13 +109,16 @@ def main():
                         help="wait 30 to 150 seconds for transmitter readiness (default 90)")
     parser.add_argument("--cached-dma", action="store_true", help="owned cacheable DMA with exact range sync")
     parser.add_argument("--fsb1", action="store_true", help="use the PL-FIELD-STREAM-001 RAM image and streaming sink")
-    parser.add_argument("--obn5", action="store_true", help="use the OBN5 r1 RAM image and streaming FIELD sink")
+    parser.add_argument("--obn5", action="store_true", help="use the OBN5 RAM image and streaming FIELD sink")
+    parser.add_argument("--obn5-r2", action="store_true", help="select the verified OBN5 r2 image")
     parser.add_argument("--fsb1-dmac-trace", action="store_true", help="save read-only ADI DMAC samples before a FIELD fault")
     parser.add_argument("--fsb1-iio-buffers", type=int, choices=(4, 8), default=4,
                         help="compare ADI IIO queue depths during the DMAC diagnostic")
     parser.add_argument("--fsb1-capture-worker", choices=("normal", "priority"),
                         help="separate IIO return from FIELD formatting and TCP")
     args = parser.parse_args()
+    if args.obn5_r2 and not args.obn5:
+        parser.error("--obn5-r2 requires --obn5")
     if args.obn5_layout_check and (not args.obn5 or args.managed or args.capture_layout):
         parser.error("--obn5-layout-check requires a standalone OBN5 run")
     if args.cap2_probe and (not args.obn5 or args.managed or args.capture_layout or args.obn5_layout_check):
@@ -169,7 +172,8 @@ def main():
     sys.path.insert(0, str(args.stand.resolve()))
     import run_live as stand
 
-    image_hash = ("5515cc9fd0156e5cf41974499ea467b4904ed6ca8926f95462a657a857c8627f" if args.obn5 else
+    image_hash = ("0a735a0d69f9a889948c0fb91635c3a88a864dca7245d15c694458668a9c91f4" if args.obn5_r2 else
+                  "5515cc9fd0156e5cf41974499ea467b4904ed6ca8926f95462a657a857c8627f" if args.obn5 else
                   "0bd534f83e452fdce6e3c69ffb7acf82c10361000b107c25f9ec68a4ad140ce1" if args.fsb1 else
                   "830d6a8268b96d2661b985eb767b247f7398ae67ffcf208cd297f52b68bd6159")
     if stand.digest(args.image) != image_hash:
@@ -206,10 +210,11 @@ def main():
     prepare = log / "loader/prepare-r3.sh"
     code = prepare.read_bytes()
     if args.obn5:
+        revision = 2 if args.obn5_r2 else 1
         code = code.replace(b"0x324E424F", b"0x354E424F")
-        code = code.replace(b'0x7c4600e4)" = 0x00000003', b'0x7c4600e4)" = 0x00000001')
+        code = code.replace(b'0x7c4600e4)" = 0x00000003', f'0x7c4600e4)" = 0x{revision:08X}'.encode())
         code = code.replace(b'0x7c4601c8)" = 0x00000800', b'0x7c4601c8)" = 0x00001000')
-        code = code.replace(b"OBS006C_R3_GEOMETRY_VERIFIED", b"OBN5_R1_GEOMETRY_VERIFIED")
+        code = code.replace(b"OBS006C_R3_GEOMETRY_VERIFIED", f"OBN5_R{revision}_GEOMETRY_VERIFIED".encode())
         code += (b'\ntest "$(devmem 0x7c4600e0)" = 0x000001FF\n'
                  b'test "$(devmem 0x7c460398)" = 0x000003FF\n'
                  b'test "$(devmem 0x7c46039c)" = 0x000003FF\n')
@@ -227,7 +232,8 @@ def main():
         stand.uart("load")
         if args.obn5_layout_check:
             stand.upload(args.obn5_layout_check, remote, "obn5-layout-check")
-            result=stand.ssh(f"cd {remote}; chmod 700 obn5-layout-check && timeout 10 ./obn5-layout-check 2>&1; echo status=$?")
+            probe = "timeout 45 ./obn5-layout-check --wrap" if args.obn5_r2 else "timeout 10 ./obn5-layout-check"
+            result = stand.ssh(f"cd {remote}; chmod 700 obn5-layout-check && {probe} 2>&1; echo status=$?")
             (log / "direct-layout.log").write_text(result, encoding="utf-8")
             print(result, flush=True)
             if not result.strip().endswith("status=0"):
