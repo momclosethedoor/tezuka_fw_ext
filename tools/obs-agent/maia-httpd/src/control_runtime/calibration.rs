@@ -141,7 +141,7 @@ impl Cache {
         }
         full["scan"]["ranges"] = json!(profile_ranges.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
         if fixed_profiles {
-            full["scan"]["antenna_bands"] = json!({"0":[[scan_min,scan_max]]});
+            generated::fixed_profile_request(&mut full)?;
         }
         let core = generated::core_tiles(&full)?;
         let grid = if full["grid_27"] == true {

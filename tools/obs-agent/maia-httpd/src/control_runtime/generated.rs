@@ -100,6 +100,14 @@ pub(super) fn working_grid(state: &Value, core: &[Tile]) -> Result<Vec<Tile>> {
     grid_bench::schedule(core, 9_000_000, 27_000_000, Some(state))
 }
 
+pub(super) fn fixed_profile_request(state: &mut Value) -> Result<()> {
+    let [lo, hi] = scan_rf_bounds()?;
+    state["scan"]["ranges"] = json!([{"lo_hz":lo,"hi_hz":hi,"enabled":true}]);
+    state["scan"]["antenna_bands"] = Value::Null;
+    state["route"]["antenna"] = json!(0);
+    Ok(())
+}
+
 pub(super) fn catalog_subset(
     state: &Value, core: &[Tile], grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
 ) -> Result<Vec<Tile>> {

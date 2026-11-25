@@ -2714,8 +2714,8 @@ pub fn check_scan_tx_bank() -> Result<()> {
     let fixed = if lo + 200_000_000 < threshold && threshold + 200_000_000 < hi {
         let mut state = json!({"map_version":1,"generation":1,"catalog_policy":true,"grid_27":true,
             "xtg1_wait_ticks":256,"route":{"antenna":0},"scan":{"k":3,
-            "ranges":[{"enabled":true,"lo_hz":lo,"hi_hz":hi,"path":"auto"}],
-            "antenna_bands":{"0":[[lo,hi]]},"mixer":{"pll_range_hz":[2_250_000_000u64,4_500_000_000u64]}}});
+            "mixer":{"pll_range_hz":[2_250_000_000u64,4_500_000_000u64]}}});
+        generated::fixed_profile_request(&mut state)?;
         let core = generated::core_tiles(&state)?;
         let grid = generated::working_grid(&state,&core)?;
         let rx = grid.iter().map(|t| (t.rx,(t.rx,[0;16]))).collect::<calibration::Bank>();
@@ -2726,7 +2726,10 @@ pub fn check_scan_tx_bank() -> Result<()> {
             state["scan"]["antenna_bands"] = json!({"0":[[lo,upper]]});
             state["scan"]["antenna_bands"][id] = json!([[threshold - 200_000_000,hi]]);
             let visits = generated::retarget_fixed_catalog(&state,&grid,&rx,&tx)?;
-            let (_, desc) = generated::encode(&visits,&rx,&tx,[2_400_000_000,2_450_000_000],&state,0)?;
+            let used_rx = visits.iter().map(|t| (t.rx,rx[&t.rx])).collect::<calibration::Bank>();
+            let used_tx = visits.iter().filter_map(|t| t.tx.map(|t| t.pll as u64))
+                .map(|pll| (pll,tx[&pll])).collect::<calibration::Bank>();
+            let (_, desc) = generated::encode(&visits,&used_rx,&used_tx,[2_400_000_000,2_450_000_000],&state,0)?;
             let positions = desc["positions"].as_array().unwrap();
             let antenna = id.parse::<u64>()?;
             ensure!(positions.iter().any(|p| p["marker_route"]==antenna && p["hold_boundary"]==true),
