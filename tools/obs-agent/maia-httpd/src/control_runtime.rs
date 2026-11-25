@@ -704,6 +704,23 @@ fn tx_conflict(cmd: &Value, state: &Value, available: bool) -> Option<&'static s
     if !available {
         return Some("TX owned by external adapter or unavailable");
     }
+    if state["mode"] == "video" {
+        let video = &state["video"];
+        if state["manual_demod_tx_available"] != true || video.get("spectrum_k").is_none() {
+            return Some("manual TX in video requires demod support");
+        }
+        if state["route"]["kind"] == "mixer" && cmd["on"] == true {
+            let center = video["center_hz"].as_u64().unwrap();
+            let width = video["width_hz"].as_u64().unwrap();
+            let lo = cmd["frequency_hz"].as_u64().unwrap() as i64;
+            let (offset, side) = mixer_transform(&state["route"], lo);
+            let a = (center.saturating_sub(width / 2) as i64 - offset) * side;
+            let b = ((center + width.div_ceil(2)) as i64 - offset) * side;
+            if a.min(b) < 70_000_000 || a.max(b) > 6_000_000_000 {
+                return Some("TX frequency leaves the demod channel outside RX coverage");
+            }
+        }
+    }
     None
 }
 
@@ -1296,6 +1313,16 @@ impl Drop for Registers {
     }
 }
 
+fn mixer_transform(route: &Value, tx_hz: i64) -> (i64, i64) {
+    let side = route["side"].as_i64().unwrap_or(1);
+    let offset = if route["kind"] == "mixer" {
+        route["multiplier"].as_i64().unwrap_or(1) * tx_hz
+    } else {
+        0
+    };
+    (offset, side)
+}
+
 fn tune(state: &mut Value) -> Result<()> {
     let video = state["mode"] == "video";
     let settings = &state[if video { "video" } else { "analysis" }];
@@ -1303,13 +1330,7 @@ fn tune(state: &mut Value) -> Result<()> {
     let width = int(settings, "width_hz", 120_000, 56_000_000)?;
     let spectrum_enabled = !video || settings.get("spectrum_k").is_some();
     let mixer = state["route"]["kind"] == "mixer";
-    let side = state["route"]["side"].as_i64().unwrap_or(1);
-    let offset = if mixer {
-        (state["route"]["multiplier"].as_u64().unwrap()
-            * state["tx"]["frequency_hz"].as_u64().unwrap()) as i64
-    } else {
-        0
-    };
+    let (offset, side) = mixer_transform(&state["route"], state["tx"]["frequency_hz"].as_i64().unwrap_or(0));
     let to_if = |rf: u64| (rf as i64 - offset) * side;
     let intermediate = to_if(center);
     let a = to_if(center - width / 2);
@@ -1908,6 +1929,9 @@ fn worker(
                     ensure!(previous_mode == "video", "no active video");
                     pending["mode"] = pending["return_mode"].take();
                     pending["video"] = Value::Null;
+                    if pending["mode"] == "scan" && carrier.on() {
+                        pending["tx"] = carrier.off()?;
+                    }
                 }
                 "route" => {
                     ensure!(c.external_mixer.is_none(), "external fixture owns route");
@@ -1969,10 +1993,6 @@ fn worker(
                         "TX owned by external adapter or unavailable"
                     );
                     pending["tx"] = carrier.apply(&request)?;
-                    if previous_mode == "video" {
-                        pending["mode"] = pending["return_mode"].take();
-                        pending["video"] = Value::Null;
-                    }
                 }
                 _ => bail!("observation already finished"),
             };
@@ -1995,7 +2015,7 @@ fn worker(
             }
             if mode != "scan" && pending["route"]["kind"] == "mixer" && pending["tx"]["on"] != true
             {
-                ensure!(mode != "video", "mixer LO off");
+                ensure!(mode != "video" || pending["video"].get("spectrum_k").is_some(), "mixer LO off");
                 pending["running"] = json!(false);
                 pending["waiting"] = json!("mixer LO off");
                 return Ok(None);
@@ -2859,6 +2879,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     ensure!(!pl_timing_only || (c.external_mixer.is_none() && c.field_preview.is_none() && c.resident_field.is_none()
             && c.scan["planner_version"] == 2), "PL timing fixture requires a v2 scan-only configuration");
     let guard_info = guard_cmd(&guard_fd, 0x4605)?;
+    let demod_tx = manual && obn5 && regs.read(0xe4) == 2 && guard_info[126] == 1;
     let xtg1 = if c.scan["xtg1_wait_ticks"].is_null() { None } else {
         ensure!(guard_info[117] == XTG1 && guard_info[114] == 1 && c.scan["planner_version"] == 2
                 && c.external_mixer.is_none(), "XTG1 opt-in requires compatible PL, RF guard and v2 scan");
@@ -2871,6 +2892,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "fs_hz":FS,"ddc_fs_hz":null,"spectrum":null,"rx_lo_hz":null,"if_hz":null,"ddc_hz":null,
         "scan_rx":{"agc":scan_agc,"gain_db":scan_gain},"rx_gain_db":scan_gain,
         "route":route,"analysis_route":route,"scan_antenna":0,"tx":tx_readback,"manual_tx_available":manual,
+        "manual_demod_tx_available":demod_tx,
         "scan_bounds":bounds});
     initial["xtg1_wait_ticks"] = json!(xtg1);
     let grid_27 = match c.scan["sweep_geometry"].as_str() {
@@ -2900,6 +2922,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "loop_grid_config":obn5&&c.roi.is_some(),
         "resident_field":c.resident_field.is_some(),"video_profiles":obn5,
         "video_spectrum":obn5 && regs.read(0xe4)==2,
+        "video_manual_tx":demod_tx,
         "view_power_revision":if obn5 {regs.read(0xe4)} else {1},
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
