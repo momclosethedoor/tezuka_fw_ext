@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 pub(super) type Bank = BTreeMap<u64, (u64, [u8; 16])>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Cache {
     snapshot: Vec<String>,
     rx: Bank,
@@ -15,8 +15,10 @@ pub(super) struct Cache {
     keep_rx: BTreeSet<u64>,
     keep_tx: BTreeSet<u64>,
     compiled: Option<CompiledPlan>,
+    fixed_profiles: bool,
 }
 
+#[derive(Clone)]
 struct CompiledPlan {
     key: Value,
     bytes: Vec<u8>,
@@ -95,6 +97,12 @@ fn calibrate(
 }
 
 impl Cache {
+    fn fixed_profiles_ready(&self) -> Result<bool> {
+        Ok(self.fixed_profiles && snapshot()? == self.snapshot
+            && self.keep_rx.iter().all(|key| self.rx.contains_key(key))
+            && self.keep_tx.iter().all(|key| self.tx.contains_key(key)))
+    }
+
     pub fn catalog(&self, state: &Value, shared: &Shared) -> Result<(Self, Value)> {
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
@@ -110,10 +118,31 @@ impl Cache {
             } else { union.push(r); }
         }
         ensure!(!union.is_empty(), "antenna catalog outside receiver limits");
+        let fixed_profiles = state["grid_27"] == true && state["pl_timing_only"] != true;
         let mut full = state.clone();
         full["alternative"] = Value::Null;
         full["scan"].as_object_mut().unwrap().remove("recalibrate");
-        full["scan"]["ranges"] = json!(union.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
+        let profile_ranges = if fixed_profiles { vec![[scan_min, scan_max]] } else { union.clone() };
+        if fixed_profiles && self.fixed_profiles {
+            ensure!(self.fixed_profiles_ready()? && self.mixer == full["scan"]["mixer"],
+                "antenna update requires the calibrated RF profile bank");
+            let mut next = self.clone();
+            next.bands = full["scan"]["antenna_bands"].clone();
+            next.compiled = None;
+            let mut info = state["catalog"].clone();
+            info["rf_intervals_hz"] = json!(union);
+            info["profile_bounds_hz"] = json!(profile_ranges);
+            info["preparation"] = json!({"planner_version":2,"math_us":start.elapsed().as_micros() as u64,
+                "prepare_us":0,"worker_cpu_ns":cpu_ns()?.saturating_sub(cpu_start),
+                "rx_calibrated":0,"tx_calibrated":0,"rx_cached":next.keep_rx.len(),"tx_cached":next.keep_tx.len(),
+                "rx_required":next.keep_rx.len(),"tx_required":next.keep_tx.len(),
+                "rx_catalog_count":next.keep_rx.len(),"profile_bank_reused":true});
+            return Ok((next,info));
+        }
+        full["scan"]["ranges"] = json!(profile_ranges.iter().map(|r|json!({"lo_hz":r[0],"hi_hz":r[1],"enabled":true})).collect::<Vec<_>>());
+        if fixed_profiles {
+            full["scan"]["antenna_bands"] = json!({"0":[[scan_min,scan_max]]});
+        }
         let core = generated::core_tiles(&full)?;
         let grid = if full["grid_27"] == true {
             generated::working_grid(&full, &core)?
@@ -125,16 +154,17 @@ impl Cache {
             snapshot: self.snapshot.clone(),
             rx: self.rx.clone(),
             tx: self.tx.clone(),
+            fixed_profiles,
             ..Self::default()
         };
         let (_, desc) = cache.prepare_tiles(&full,shared,tiles,None,start,cpu_start,true)?;
         cache.core = core;
         cache.grid = grid;
-        cache.bands = full["scan"]["antenna_bands"].clone();
+        cache.bands = state["scan"]["antenna_bands"].clone();
         cache.mixer = full["scan"]["mixer"].clone();
         cache.keep_rx = cache.rx.keys().copied().collect();
         cache.keep_tx = cache.tx.keys().copied().collect();
-        let info = json!({"rf_intervals_hz":union,"primary_tiles":cache.core.len(),
+        let info = json!({"rf_intervals_hz":union,"profile_bounds_hz":profile_ranges,"primary_tiles":cache.core.len(),
             "preparation":desc["preparation"],"rx_bandwidth_hz":attr("in_voltage_rf_bandwidth")?.parse::<u64>()?,
             "tx_powerdown":attr("out_altvoltage1_TX_LO_powerdown")?.parse::<u32>()?});
         Ok((cache,info))
@@ -145,6 +175,21 @@ impl Cache {
         let ranges = scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?;
         ensure!(ranges.iter().filter(|r| r["enabled"]==true).all(|r| r["tx_slot"].is_null()),
                 "v2 selects TX from RF");
+        if self.fixed_profiles {
+            let (threshold, _) = generated::environment()?;
+            let fixed_routes = ranges.iter().filter(|r| r["enabled"] == true).all(|r| {
+                match r["path"].as_str().unwrap_or("auto") {
+                    "direct" => r["hi_hz"].as_u64().is_some_and(|hz| hz <= threshold),
+                    "mixer" => r["lo_hz"].as_u64().is_some_and(|hz| hz >= threshold),
+                    _ => true,
+                }
+            });
+            if pending["alternative"].is_null() && self.mixer == scan["mixer"] && fixed_routes
+                && scan["bench_overlap_hz"].is_null() && pending["grid_27"] == true {
+                return generated::retarget_fixed_catalog(pending, &self.grid, &self.rx, &self.tx);
+            }
+            return generated::tiles(pending);
+        }
         let same_routes = self.bands == scan["antenna_bands"] && self.mixer == scan["mixer"]
             && ranges.iter().all(|r| r["path"].is_null() || r["path"]=="auto");
         let catalog = !self.core.is_empty() && pending["alternative"].is_null();
@@ -181,6 +226,20 @@ impl Cache {
     }
 
     pub fn prepare(&mut self, pending: &Value, shared: &Shared) -> Result<(Vec<u8>, Value)> {
+        let refreshed;
+        let pending = if self.fixed_profiles
+            && (pending["scan"]["recalibrate"] == true || !self.fixed_profiles_ready()?) {
+            let (next, _) = Self::default().catalog(pending, shared)?;
+            *self = next;
+            refreshed = {
+                let mut state = pending.clone();
+                state["scan"].as_object_mut().unwrap().remove("recalibrate");
+                state
+            };
+            &refreshed
+        } else {
+            pending
+        };
         let start = Instant::now();
         let cpu_start = cpu_ns()?;
         let memoize = pending["alternative"].is_null() && pending["scan"]["recalibrate"] != true

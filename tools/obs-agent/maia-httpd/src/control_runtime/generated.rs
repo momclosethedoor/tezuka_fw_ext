@@ -113,7 +113,44 @@ pub(super) fn catalog_subset(
         if choices.is_empty() { choices.push(working_grid(state, row)?); }
         rows.push(choices);
     }
-    catalog_map(state, rows)
+    catalog_map(state, rows, false)
+}
+
+pub(super) fn retarget_fixed_catalog(
+    state: &Value, grid: &[Tile], rx: &calibration::Bank, tx: &calibration::Bank,
+) -> Result<Vec<Tile>> {
+    let (threshold, mult) = environment()?;
+    let scan = &state["scan"];
+    let bands = parse_antenna_bands(&scan["antenna_bands"])?;
+    let mut rows = Vec::new();
+    for (row, range) in scan["ranges"].as_array().unwrap().iter().enumerate()
+        .filter(|(_, range)| range["enabled"] == true) {
+        let mut lo = range["lo_hz"].as_u64().unwrap();
+        let hi = range["hi_hz"].as_u64().unwrap();
+        while lo < hi {
+            let (antenna, edge) = bands.iter()
+                .flat_map(|(&id, intervals)| intervals.iter().map(move |span| (id, span)))
+                .filter(|(_, span)| span[0] <= lo && lo < span[1])
+                .map(|(id, span)| (id, span[1].min(hi)))
+                .max_by_key(|&(id, edge)| {
+                    (id == 0 && lo < threshold && edge >= threshold.min(hi), edge, std::cmp::Reverse(id))
+                })
+                .ok_or_else(|| anyhow!("missing antenna coverage at {lo} Hz"))?;
+            let bounds = [lo, edge];
+            let options = grid_bench::choices(grid, rx, tx, bounds, row, mult, |tile, mut clip, _| {
+                if !(tile.channel_bridge && lo < threshold && threshold < edge
+                    && clip[0] < threshold && threshold < clip[1]) {
+                    if tile.tx.is_some() { clip[0] = clip[0].max(threshold); }
+                    else { clip[1] = clip[1].min(threshold); }
+                }
+                (clip[0] < clip[1]).then_some((clip, antenna))
+            });
+            ensure!(!options.is_empty(), "calibrated grid cannot cover antenna {antenna} at [{lo},{edge}) Hz");
+            rows.push(options);
+            lo = edge;
+        }
+    }
+    catalog_map(state, rows, true)
 }
 
 pub(super) fn retarget_catalog(
@@ -168,7 +205,7 @@ pub(super) fn retarget_catalog(
         }
         rows.push(choices);
     }
-    let map = catalog_map(state, rows)?;
+    let map = catalog_map(state, rows, false)?;
     if map.iter().filter_map(|t| t.tx.map(|t| t.pll))
         .collect::<std::collections::BTreeSet<_>>().len() > 8 {
         return tiles(state);
@@ -176,7 +213,7 @@ pub(super) fn retarget_catalog(
     Ok(map)
 }
 
-fn catalog_map(state: &Value, rows: Vec<Vec<Vec<Tile>>>) -> Result<Vec<Tile>> {
+fn catalog_map(state: &Value, rows: Vec<Vec<Vec<Tile>>>, fixed_profiles: bool) -> Result<Vec<Tile>> {
     let phase = |p: &Tile| usize::from(p.grid.is_some_and(|(label, _)| label != "main"));
     let costs = rows.iter().map(|options| options.iter().map(|map|
         tx_schedule::Span::of(map.iter().map(|v| (phase(v), v.tx.map(|t| t.pll)))))
@@ -192,7 +229,19 @@ fn catalog_map(state: &Value, rows: Vec<Vec<Vec<Tile>>>) -> Result<Vec<Tile>> {
         }
     }
     first.extend(second);
-    transitions(state, &first)
+    if !fixed_profiles {
+        return transitions(state, &first);
+    }
+    let mut previous = first.last().cloned().ok_or_else(|| anyhow!("empty calibrated map"))?;
+    for tile in &mut first {
+        next_route(&previous, tile);
+        previous = tile.clone();
+    }
+    if Some(first[0].antenna) != state["route"]["antenna"].as_u64() {
+        first[0].notify = Some(first[0].antenna);
+        first[0].hold = true;
+    }
+    Ok(first)
 }
 
 fn mixer_limits(scan: &Value) -> Result<[i64; 2]> {
