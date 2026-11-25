@@ -531,6 +531,7 @@ pub(super) fn encode(
     // Timing fixture recalls the actual TX bank while the driver keeps RF muted.
     let timing_only = state["pl_timing_only"] == true;
     let tx_rf_on = !tx.is_empty() && !timing_only;
+    let tx_attenuation = state["scan"]["tx_attenuation_mdb"].as_u64().unwrap_or(3_000) as u32;
     let managed = tx_rf_on && state["xtg1_wait_ticks"].is_number();
     let working_grid = state["grid_27"] == true && state["alternative"].is_null()
         && state["scan"]["bench_overlap_hz"].is_null();
@@ -553,7 +554,7 @@ pub(super) fn encode(
         (24, 512),
         (tail, (!tx.is_empty()) as u32),
         (tail + 4, tx_rf_on as u32),
-        (tail + 8, if tx_rf_on { 3000 } else { 89750 }),
+        (tail + 8, if tx_rf_on { tx_attenuation } else { 89750 }),
         (tail + 156, if managed {1 | (state["xtg1_wait_ticks"].as_u64().unwrap() as u32) << 16} else {0}),
     ] {
         put(&mut bytes, p, v);
@@ -679,7 +680,8 @@ pub(super) fn encode(
     );
     let mut desc = json!({"rf_ranges":ranges,"requested_ranges":state["scan"]["ranges"],"positions":positions,"planner_version":2,
         "pl_timing_only":timing_only,"mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,
-        "first_tx_pll_hz":first.or_else(|| (!txkeys.is_empty()).then_some(0)).map(|s|tx[&txkeys[s]].0)});
+        "first_tx_pll_hz":first.or_else(|| (!txkeys.is_empty()).then_some(0)).map(|s|tx[&txkeys[s]].0),
+        "tx_attenuation_mdb":tx_rf_on.then_some(tx_attenuation)});
     if working_grid {
         grid_bench::validate_cover(&desc)?;
         desc["sweep_geometry"] = json!({"half_pass_hz":27_000_000,"overlap_hz":9_000_000,

@@ -332,6 +332,12 @@ fn roi_source(spectrum: &Value, request: crate::system_reader::RoiRequest) -> Op
 fn validate(v: &Value) -> Result<()> {
     ensure!(v.get("loop").is_none(), "loop requires a running v2 scan with grid policy support");
     ensure!(v["op"] == "scan" || v.get("roi").is_none(), "embedded ROI requires scan");
+    if v.get("tx_attenuation_mdb").is_some() {
+        ensure!(v["op"] == "scan" && v["planner_version"] == 2,
+            "tx_attenuation_mdb requires v2 scan");
+        ensure!(int(v, "tx_attenuation_mdb", 0, 89_750)? % 250 == 0,
+            "tx_attenuation_mdb must be a multiple of 250");
+    }
     if v["op"]=="roi" {
         roi_request(v,0)?;
         return Ok(());
@@ -1901,6 +1907,11 @@ fn worker(
                         if request.get("gain_db").is_some() {
                             pending["scan_rx"] = json!({"agc":"manual","gain_db":request["gain_db"]});
                         }
+                        if request["planner_version"] == 2 && request.get("tx_attenuation_mdb").is_none() {
+                            if let Some(saved) = pending["scan"].get("tx_attenuation_mdb") {
+                                request["tx_attenuation_mdb"] = saved.clone();
+                            }
+                        }
                         if pending["catalog_policy"] == true {
                             ensure!(request["run"] != true || !pending["catalog"].is_null(),
                                     "antenna catalog not ready");
@@ -2697,9 +2708,11 @@ pub fn check_scan_tx_bank() -> Result<()> {
         tiles.push(tile);
     }
     let last = *tx.keys().last().unwrap();
-    let (bytes,descriptors) = generated::encode(&tiles[..8],&rx,&tx.range(..last).map(|(k,v)|(*k,*v)).collect(),
+    let eight = tx.range(..last).map(|(k,v)|(*k,*v)).collect();
+    let (bytes,descriptors) = generated::encode(&tiles[..8],&rx,&eight,
         [2_400_000_000,2_450_000_000],&state,128)?;
     let tail = bytes.len()-160;
+    ensure!(word(&bytes,tail+8)==89_750 && descriptors["tx_attenuation_mdb"].is_null(), "muted TX bank");
     for (i,position) in descriptors["positions"].as_array().unwrap().iter().enumerate() {
         ensure!(position["tx_slot"]==i && bytes[tail+24+16*i..tail+40+16*i]==[i as u8;16],"TX slot {i}");
         for page in [40+4096,40+8192] {
@@ -2709,6 +2722,15 @@ pub fn check_scan_tx_bank() -> Result<()> {
     let error = generated::encode(&tiles,&rx,&tx,[2_400_000_000,2_450_000_000],&state,128)
         .expect_err("nine TX profiles must be rejected").to_string();
     ensure!(error.contains("9 TX") && error.contains("/8"),"unexpected bank error: {error}");
+    state["pl_timing_only"] = json!(false);
+    state["xtg1_wait_ticks"] = json!(256);
+    for attenuation in [3_000, 12_250] {
+        let (bytes,desc) = generated::encode(&tiles[..8],&rx,&eight,
+            [2_400_000_000,2_450_000_000],&state,128)?;
+        ensure!(word(&bytes,bytes.len()-152)==attenuation
+                && desc["tx_attenuation_mdb"]==attenuation,"scan TX attenuation {attenuation}");
+        state["scan"]["tx_attenuation_mdb"] = json!(12_250);
+    }
     let [lo, hi] = generated::scan_rf_bounds()?;
     let (threshold, _) = generated::environment()?;
     let fixed = if lo + 200_000_000 < threshold && threshold + 200_000_000 < hi {
@@ -2970,7 +2992,8 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "view_power_revision":if obn5 {regs.read(0xe4)} else {1},
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
-        "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
+        "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_tx_attenuation":rf_guard && manual,
+        "planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),
         "xtg1":guard_info[117]==XTG1,"xtg1_opt_in":xtg1.is_some(),"visit_ack_version":4,
         "mixer_threshold_hz":threshold,"mixer_input_multiplier":mult,"scan_rf_bounds_hz":rf_bounds,
