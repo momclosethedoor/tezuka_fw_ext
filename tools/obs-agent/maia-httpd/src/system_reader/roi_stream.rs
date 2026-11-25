@@ -176,7 +176,7 @@ impl Stream {
     }
 
     pub(super) fn prepare(&mut self, h: Header, raw: &[u8], view: &[u8],
-                          anchor: u64, next_anchor: Option<u64>) -> R<()> {
+                          anchor: u64, next_anchor: Option<u64>, view_power_revision: u32) -> R<()> {
         if !self.full_scan && self.request.is_none() {return Ok(());}
         if self.production && (self.socket.is_none() || self.connecting) {return Ok(());}
         let Some((map,anchor,relative))=Self::locate(&self.initial,self.next.as_ref(),h,anchor,next_anchor) else { return Ok(()); };
@@ -237,7 +237,7 @@ impl Stream {
             frame.extend_from_slice(raw);
         } else {
             if view_source {
-                frame.extend_from_slice(&view_prefix(h));
+                frame.extend_from_slice(&view_prefix(h,view_power_revision));
             } else {
                 frame.extend_from_slice(&raw[..obn3::COMPACT_PREFIX_BYTES]);
             }
@@ -351,12 +351,12 @@ impl Stream {
     }
 }
 
-fn view_prefix(h: Header) -> [u8; obn3::COMPACT_PREFIX_BYTES] {
+fn view_prefix(h: Header, revision: u32) -> [u8; obn3::COMPACT_PREFIX_BYTES] {
     let mut prefix = [0; obn3::COMPACT_PREFIX_BYTES];
     for (offset, value) in [
-        (0,obn3::OBN5_ID),(4,0x0040_0001),(32,h.bins as u32),(36,h.k),
+        (0,obn3::OBN5_ID),(4,0x0040_0000 | revision),(32,h.bins as u32),(36,h.k),
         (40,super::continuous::TICK_HZ as u32),(44,h.flags),(48,3),
-        (52,obn3::Format::Obn5(h.bins).active_bytes() as u32),
+        (52,obn3::Format::Obn5(h.bins,revision).active_bytes() as u32),
     ] {
         prefix[offset..offset+4].copy_from_slice(&value.to_le_bytes());
     }

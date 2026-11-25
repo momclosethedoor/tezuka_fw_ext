@@ -1976,7 +1976,7 @@ fn worker(
                         "resident FIELD requires FLD2/FFM1 and the physical A/B map");
                     let directory=c.output.join(format!("field-{generation}"));
                     fs::create_dir(&directory)?;
-                    let joint_rows = regs.read(0x50) == 0x354e424f && regs.read(0xe4) == 1
+                    let joint_rows = regs.read(0x50) == 0x354e424f && matches!(regs.read(0xe4), 1 | 2)
                         && regs.read(0xe0) & 0x100 != 0;
                     let stride=(setup.len()-200)/3;
                     let count=word(setup,8) as usize;
@@ -2151,6 +2151,7 @@ fn worker(
                     ("k", k.clone()),
                     ("scan", json!(scan)),
                     ("fs_hz", json!(FS)),
+                    ("view_power_revision", json!(if obn5 {regs.read(0xe4)} else {1})),
                     ("flags", json!(h.flags)),
                     ("fft_bins", json!(h.bins)),
                     (
@@ -2200,6 +2201,7 @@ fn worker(
                 let mut a = actual.borrow_mut();
                 let mut s = next_spectrum.as_ref().unwrap().clone();
                 for (key,value) in [("generation",json!(next_gen)),("map_epoch",json!(anchor)),
+                    ("view_power_revision",json!(if obn5 {regs.read(0xe4)} else {1})),
                     ("k",k.clone()),("scan",json!(true)),("fs_hz",json!(FS)),("flags",json!(h.flags)),
                     ("fft_bins",json!(h.bins)),("view_bins",json!(crate::system_reader::view_bins(h))),("TX_OFF",Value::Null)] {
                     s[key]=value;
@@ -2672,7 +2674,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         );
     }
     let regs = Registers::open()?;
-    let obn5 = regs.read(0x50)==0x354e424f && regs.read(0xe4)==1 && regs.read(0xe0)&0x1ff==0x1ff;
+    let obn5 = regs.read(0x50)==0x354e424f && matches!(regs.read(0xe4), 1 | 2) && regs.read(0xe0)&0x1ff==0x1ff;
     let obn3 = regs.read(0x50)==0x334e424f && regs.read(0xe4)==4 && regs.read(0xe0)&0x60==0x60;
     let stream002 = (obn3 || obn5) && regs.read(0x280)==0x32444c46 && regs.read(0x350)==0x314d4646;
     let legacy = regs.read(0x50) == 0x324e424f && regs.read(0xe4) == 3;
@@ -2777,6 +2779,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
         "loop_grid_config":obn5&&c.roi.is_some(),
         "resident_field":c.resident_field.is_some(),"video_profiles":obn5,
+        "view_power_revision":if obn5 {regs.read(0xe4)} else {1},
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
         "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,

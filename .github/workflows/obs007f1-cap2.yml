@@ -1,7 +1,7 @@
 name: OBS007F1 CAP2 RAM modules
 on:
   push:
-    branches: [build/obs007f1-cap2-a9, build/arm-planner-001, build/arm-scan-control-003, build/arm-process-rf-owner, build/arm-scan-stream-002, build/pl-fft-hold-002]
+    branches: [build/obn5-r2-view, build/obs007f1-cap2-a9, build/arm-planner-001, build/arm-scan-control-003, build/arm-process-rf-owner, build/arm-scan-stream-002, build/pl-fft-hold-002]
     paths: ['tools/obs-dma/**', 'tools/obs-guard/**', '.github/workflows/obs007f1-cap2.yml']
   workflow_dispatch:
 permissions:
@@ -31,6 +31,8 @@ jobs:
           make -C "$kernel" M="$PWD/tools/obs-dma" ARCH=arm CROSS_COMPILE="$cross" modules
           make -C "$kernel" M="$PWD/tools/obs-guard" ARCH=arm CROSS_COMPILE="$cross" modules
           "${cross}gcc" -O2 -Wall -Wextra tools/obs-guard/obs-fl-ctl.c -o artifact/obs-fl-ctl
+          "${cross}gcc" -O2 -Wall -Wextra -Werror tools/obs-dma/obn5-layout-check.c -o artifact/obn5-layout-check
+          "${cross}gcc" -O2 -Wall -Wextra -Werror tools/obs-dma/cap2_run.c -o artifact/cap2-run
           cp tools/obs-dma/obs_dma.ko tools/obs-guard/obs_ad9361.ko artifact/
           for module in artifact/*.ko; do
             vermagic=$(modinfo -F vermagic "$module")
@@ -39,7 +41,7 @@ jobs:
           done
           git rev-parse HEAD > artifact/commit.txt
           cd artifact
-          sha256sum obs_dma.ko obs_ad9361.ko obs-fl-ctl commit.txt kernel-check.txt vermagic.txt > SHA256SUMS
+          sha256sum obs_dma.ko obs_ad9361.ko obs-fl-ctl obn5-layout-check cap2-run commit.txt kernel-check.txt vermagic.txt > SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
           name: obs007f1-cap2-modules

@@ -225,7 +225,7 @@ static void joint_case(const char *mode, const char *config, const char *iq_path
 	bool first = !strcmp(mode, "cap2-first");
 	bool cancel = !strcmp(mode, "field-cancel");
 	bool mismatch = !strcmp(mode, "field-mismatch");
-	check(csr[0x50 / 4] == 0x354e424f && csr[0xe4 / 4] == 1 &&
+	check(csr[0x50 / 4] == 0x354e424f && (csr[0xe4 / 4] == 1 || csr[0xe4 / 4] == 2) &&
 	      (csr[0xe0 / 4] & 0x100) && csr[0x39c / 4] == 1023, "OBN5 joint ABI and handoff history");
 	struct obs_cap2_submit submit = {job, n, 187500, info.payload_offset, (n + 31) / 32, job};
 	struct obs_cap2_receipt r = {0};

@@ -12,7 +12,7 @@ pub const COMPACT_BYTES: usize = COMPACT_PREFIX_BYTES + M45E3_WORD_BYTES * BINS;
 pub enum Format {
     Native,
     Compact,
-    Obn5(usize),
+    Obn5(usize, u32),
 }
 
 impl Format {
@@ -28,29 +28,30 @@ impl Format {
         match self {
             Self::Native => BYTES,
             Self::Compact => COMPACT_BYTES,
-            Self::Obn5(bins) => COMPACT_PREFIX_BYTES + M45E3_WORD_BYTES * bins,
+            Self::Obn5(bins, _) => COMPACT_PREFIX_BYTES + M45E3_WORD_BYTES * bins,
         }
     }
 
-    pub fn obn5_config(config: u32) -> Result<Self, String> {
+    pub fn obn5_config(config: u32, revision: u32) -> Result<Self, String> {
+        if !matches!(revision, 1 | 2) { return Err("OBN5 revision".into()); }
         match config {
-            0 | 1 => Ok(Self::Obn5(4096)),
-            2 | 3 => Ok(Self::Obn5(2048)),
-            4 | 5 => Ok(Self::Obn5(1024)),
+            0 | 1 => Ok(Self::Obn5(4096, revision)),
+            2 | 3 => Ok(Self::Obn5(2048, revision)),
+            4 | 5 => Ok(Self::Obn5(1024, revision)),
             _ => Err("OBN5 FFT configuration".into()),
         }
     }
 
     pub fn bins(self) -> usize {
         match self {
-            Self::Obn5(bins) => bins,
+            Self::Obn5(bins, _) => bins,
             _ => BINS,
         }
     }
 
     pub fn view_stride(self) -> usize {
         match self {
-            Self::Obn5(_) => OBN5_VIEW_STRIDE,
+            Self::Obn5(..) => OBN5_VIEW_STRIDE,
             _ => super::view::VIEW_BYTES,
         }
     }
@@ -58,7 +59,7 @@ impl Format {
     pub fn prefix_bytes(self) -> usize {
         match self {
             Self::Native => 512,
-            Self::Compact | Self::Obn5(_) => COMPACT_PREFIX_BYTES,
+            Self::Compact | Self::Obn5(..) => COMPACT_PREFIX_BYTES,
         }
     }
 
@@ -71,7 +72,7 @@ impl Format {
                     *dst = word[7];
                 }
             }
-            Self::Compact | Self::Obn5(_) => {
+            Self::Compact | Self::Obn5(..) => {
                 header.copy_from_slice(&prefix[..64]);
                 if prefix[64..].iter().any(|&byte| byte != 0) {
                     return Err("compact reserved padding".into());
@@ -82,10 +83,10 @@ impl Format {
         let u64_at = |i| u64::from_le_bytes(header[i..i + 8].try_into().unwrap());
         let expected_format = match self {
             Self::Native => 2,
-            Self::Compact | Self::Obn5(_) => 3,
+            Self::Compact | Self::Obn5(..) => 3,
         };
         let (id, revision, allowed_flags) = match self {
-            Self::Obn5(_) => (OBN5_ID, 1, 0xff),
+            Self::Obn5(_, revision) => (OBN5_ID, revision, 0xff),
             _ => (ID, 4, 0x3f),
         };
         if u32_at(0) != id || u32_at(4) != ((64 << 16) | revision)
@@ -105,7 +106,7 @@ impl Format {
         Ok(Header {
             first_seq,
             // OBN5 groups can span missing IQ windows. Only first_seq is known.
-            last_seq: if matches!(self, Self::Obn5(_)) { first_seq }
+            last_seq: if matches!(self, Self::Obn5(..)) { first_seq }
                 else { first_seq.checked_add(u64::from(k) - 1).ok_or("OBN3 sequence overflow")? },
             epoch: u64_at(16),
             first_tick: u64_at(24),
@@ -142,7 +143,7 @@ mod tests {
     #[test]
     fn obn5_geometry_and_split_view_mode_bits() {
         for (config,bins) in [(0,4096),(2,2048),(4,1024)] {
-            let format=Format::obn5_config(config).unwrap();
+            let format=Format::obn5_config(config, 1).unwrap();
             let mut data=[0;COMPACT_PREFIX_BYTES];
             for (offset,value) in [(0,OBN5_ID),(4,(64<<16)|1),(32,bins),(36,1023),
                 (40,TICK_HZ as u32),(48,3),(52,128+6*bins)] {
@@ -158,6 +159,6 @@ mod tests {
             }
             assert!(Format::Compact.header(&data).is_err());
         }
-        assert!(Format::obn5_config(6).is_err());
+        assert!(Format::obn5_config(6, 1).is_err());
     }
 }

@@ -16,6 +16,8 @@
 enum { SLOTS = 1024, FULL = 32768, VIEW = 4096, OBN5 = 0x354e424f, SHIFT = 544 * 8 };
 static volatile uint32_t *regs;
 static const uint8_t *full, *views;
+static unsigned revision;
+static uint64_t full_dma, view_dma;
 
 static void check(bool ok, const char *message)
 {
@@ -50,7 +52,7 @@ static void print_locations(unsigned first, unsigned count)
         unsigned slot = (first + index - 1) % SLOTS;
         const uint8_t *p = full + slot * FULL;
         for (unsigned i = 0; i + 64 <= FULL; i += 8)
-            if (le(p+i, 4) == OBN5 && le(p+i+4, 4) == 0x400001)
+            if (le(p+i, 4) == OBN5 && le(p+i+4, 4) == (0x400000u | revision))
                 printf("header physical_slot=%u offset=%u ordinal=%" PRIu64 "\n",
                        slot, i, le(p+i+56, 8));
     }
@@ -58,7 +60,7 @@ static void print_locations(unsigned first, unsigned count)
 
 static bool has_header(const uint8_t *p, uint64_t ordinal)
 {
-    return le(p, 4) == OBN5 && le(p+4, 4) == 0x400001 && le(p+56, 8) == ordinal;
+    return le(p, 4) == OBN5 && le(p+4, 4) == (0x400000u | revision) && le(p+56, 8) == ordinal;
 }
 
 static bool bind_split(uint64_t ordinal, unsigned *last_length, unsigned *last_view)
@@ -80,7 +82,7 @@ static bool bind_split(uint64_t ordinal, unsigned *last_length, unsigned *last_v
 
 static void validate(uint64_t first, uint64_t end, unsigned bins, unsigned mode)
 {
-    unsigned divisor = mode == 4 ? 1 : 4;
+    unsigned divisor = 1u << (4 - mode);
     unsigned length = 128 + 6 * bins;
     unsigned last_length = 0, last_view = 0;
     bool split = !has_header(full + (first % SLOTS) * FULL, first);
@@ -97,9 +99,13 @@ static void validate(uint64_t first, uint64_t end, unsigned bins, unsigned mode)
         unsigned slot = ordinal % SLOTS;
         const uint8_t *p = full + slot * FULL;
         const uint8_t *overview = views + slot * VIEW;
+        uint64_t header_address = full_dma + slot * FULL;
+        uint64_t view_address = view_dma + slot * VIEW;
         if (split) {
             unsigned prev = (slot + SLOTS - 1) % SLOTS;
             unsigned prefix = SHIFT - last_view;
+            header_address = full_dma + prev * FULL + last_length - prefix;
+            view_address = full_dma + slot * FULL + length - SHIFT;
             memcpy(reconstruction, full + prev * FULL + last_length - prefix, prefix);
             memcpy(reconstruction + prefix, views + prev * VIEW, last_view);
             memcpy(reconstruction + SHIFT, p, length - SHIFT);
@@ -112,7 +118,7 @@ static void validate(uint64_t first, uint64_t end, unsigned bins, unsigned mode)
             print_locations(first % SLOTS, (unsigned)(end-first));
         check(has_header(p, ordinal), "FULL header placement/ordinal");
         unsigned flags = le(p+44, 4);
-        check(le(p+4, 4) == 0x400001 && le(p+32, 4) == bins && le(p+36, 4) == 64 &&
+        check(le(p+4, 4) == (0x400000u | revision) && le(p+32, 4) == bins && le(p+36, 4) == 64 &&
               le(p+40, 4) == 62500000 && le(p+48, 4) == 3 && le(p+52, 4) == length &&
               flags == (1u | ((mode & 3) << 3) | ((mode & 4) << 5)), "FULL ABI/geometry/K/flags");
         for (unsigned i = 64; i < 128; ++i)
@@ -123,18 +129,30 @@ static void validate(uint64_t first, uint64_t end, unsigned bins, unsigned mode)
                 uint64_t word = le(p + 128 + 6 * (bin + i), 6);
                 uint64_t mantissa = word & ((UINT64_C(1) << 45) - 1);
                 unsigned code = mantissa ? 64 - __builtin_clzll(mantissa) + 2 * (word >> 45) : 0;
+                if (revision == 2 && mantissa) {
+                    unsigned b = 63 - __builtin_clzll(mantissa);
+                    code = (code << 2) | (((mantissa << 2) >> b) & 3);
+                }
                 if (max_code < code) max_code = code;
             }
             check(overview[bin / divisor] == max_code, "VIEW reduction or placement");
         }
         uint64_t seq = le(p+8, 8);
+        if (ordinal == first || slot == 1023 || slot == 0)
+            printf("verified ordinal=%" PRIu64 " slot=%u N=%u divisor=%u prefix=%08" PRIx64
+                   " FULL_first=%08" PRIx64 " VIEW=%08" PRIx64 "\n", ordinal, slot, bins,
+                   divisor, header_address, header_address+128, view_address);
         check(ordinal == first || seq - previous_seq == 64, "static FFT cadence");
         previous_seq = seq;
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    bool want_wrap = argc == 2 && !strcmp(argv[1], "--wrap");
+    bool crossed = false;
+    uint64_t origin = 0;
+    check(argc == 1 || want_wrap, "usage: obn5-layout-check [--wrap]");
     struct { uint64_t full, view; uint32_t full_len, view_len, cached, line, abi, reserved; } info;
     int lease = open("/run/maia-observation.lock", O_CREAT | O_RDWR, 0600);
     check(lease >= 0 && !flock(lease, LOCK_EX | LOCK_NB), "spectral owner busy");
@@ -151,16 +169,22 @@ int main(void)
            regs[0x50/4], regs[0x64/4], regs[0x284/4], regs[0x1e0/4], regs[0x354/4]);
     check(regs[0x50/4] == OBN5 && regs[0x64/4] == 16 && !regs[0x354/4] && !regs[0x1e0/4],
           "stopped OBN5 with no other owner");
+    revision = regs[0xe4/4];
+    check(revision == 1 || revision == 2, "unsupported OBN5 revision");
+    full_dma = info.full;
+    view_dma = info.view;
     regs[0x284/4] = 0;
     check(!regs[0x284/4], "stop unowned real8 stream before the static reference");
     printf("DMA full=0x%08" PRIx64 " view=0x%08" PRIx64 " cached=%u\n", info.full, info.view, info.cached);
-    for (unsigned test = 0; test < 6; ++test) {
+    for (unsigned test = 0; test < 12 || (want_wrap && !crossed); ++test) {
+        check(test < 512, "wrap observation deadline");
         unsigned config = 2 * (test % 3);
         unsigned bins = 4096 >> (test % 3);
-        unsigned mode = test < 3 ? 2 : 4;
+        unsigned mode = 1 + (test/3) % 4;
         unsigned hold = test < 3 ? 1 : 1023;
         regs[0x54/4] = 32;
         uint64_t first = reg64(0x100);
+        if (test == 0) origin = first;
         check(first == reg64(0x110) && first == reg64(0x108), "empty starting cursor");
         regs[0x1b8/4] = 0;
         regs[0x1a8/4] = info.full;
@@ -190,6 +214,9 @@ int main(void)
         uint32_t view_sync[] = {1, 0, info.view_len, 1};
         check(!ioctl(dma, 0x4f02, full_sync) && !ioctl(dma, 0x4f02, view_sync), "DMA sync");
         validate(first, end, bins, mode);
+        crossed |= (end-1)/SLOTS > origin/SLOTS;
+        full_sync[3] = view_sync[3] = 0;
+        check(!ioctl(dma, 0x4f02, full_sync) && !ioctl(dma, 0x4f02, view_sync), "return ranges to DMA");
         check(!regs[0x140/4] && !regs[0x144/4] && !regs[0x160/4], "spectrum loss counters");
         regs[0xe8/4] = end;
         regs[0xec/4] = end >> 32;

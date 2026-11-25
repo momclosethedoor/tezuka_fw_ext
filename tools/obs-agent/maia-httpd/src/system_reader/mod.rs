@@ -125,11 +125,11 @@ impl Hardware{
    return Err("VIEW mode 4 and hold_k require OBN5".into());
   }
   match (h.r(0x50),h.r(0xe4)) {
-   (obn3::OBN5_ID,1) if h.r(0xe0)&0x1ff==0x1ff => {
+   (obn3::OBN5_ID,revision @ (1 | 2)) if h.r(0xe0)&0x1ff==0x1ff => {
     if c.shift544 || c.discard_cold || c.diagnostic_sync.is_some() || c.bench_obn3_layout || c.bench_obn3_view_only {
      return Err("OBN5 requires its native compact DMA layout".into());
     }
-    h.stream_format=Some(obn3::Format::obn5_config(h.r(0x34c))?);
+    h.stream_format=Some(obn3::Format::obn5_config(h.r(0x34c),revision)?);
    }
    (obn3::ID,4) if h.r(0xe0)&0x60==0x60 => {
     if c.shift544 || c.discard_cold || c.diagnostic_sync.is_some() {
@@ -188,7 +188,7 @@ impl Hardware{
     self.copy(0,head,&mut full[..start])?;
     let h=format.header(&full[..start])?;
     if keep.is_some_and(|accept| !accept(h)) {
-     if !matches!(format,obn3::Format::Obn5(_)) {
+     if !matches!(format,obn3::Format::Obn5(..)) {
       self.previous_view=view::view_len(h);
       self.previous_full_len=length;
       sink(h,&[],&[])?;
@@ -220,10 +220,10 @@ impl Hardware{
   }
  fn prepare(&mut self,c:&Config)->R<()>{let s=self.snapshot()?;if s.running||s.dma_busy||!s.drained||s.committed!=s.released||s.reserved!=s.committed||s.fault{return Err("START needs STOP/DRAINED/released/nonfatal".into())}
   if let Some(format)=self.stream_format {
-   let is_obn5=matches!(format,obn3::Format::Obn5(_));
+   let is_obn5=matches!(format,obn3::Format::Obn5(..));
    let config=c.stream_config.unwrap_or(if is_obn5 {0} else {2});
    if is_obn5 {
-    obn3::Format::obn5_config(config)?;
+    obn3::Format::obn5_config(config,self.r(0xe4))?;
     let hold=c.hold_k.unwrap_or(1023);
     if !(1..=1023).contains(&hold){return Err("hold_k must be 1 through 1023".into());}
     self.w(0x398,hold);
@@ -240,8 +240,8 @@ impl Hardware{
   if let Some(staged)=staged {
    let effective=self.r(0x34c);
    if effective!=staged{return Err("OBN3 configuration was not latched at START".into());}
-   self.stream_format=Some(if matches!(self.stream_format,Some(obn3::Format::Obn5(_))) {
-    obn3::Format::obn5_config(effective)?
+   self.stream_format=Some(if matches!(self.stream_format,Some(obn3::Format::Obn5(..))) {
+    obn3::Format::obn5_config(effective,self.r(0xe4))?
    } else {obn3::Format::from_config(effective)?});
   }
   self.last_release=Instant::now();Ok(())}
@@ -258,7 +258,7 @@ impl Hardware{
   Ok(())
  }
  fn cold_split(&mut self,control:Option<&RunControl>,c:&Config)->R<Value>{
-  if self.bench_obn3_layout || matches!(self.stream_format,Some(obn3::Format::Obn5(_))) {
+  if self.bench_obn3_layout || matches!(self.stream_format,Some(obn3::Format::Obn5(..))) {
    return self.bind_stream_layout(control,c);
   }
   let initial=self.snapshot()?;
@@ -312,7 +312,7 @@ impl Hardware{
   let initial=self.snapshot()?;
   let cold=initial.cookie==1 && initial.released==0;
   let format=self.stream_format.ok_or("compact layout without a stream ABI")?;
-  let auto=matches!(format,obn3::Format::Obn5(_));
+  let auto=matches!(format,obn3::Format::Obn5(..));
   let start=Instant::now();
   loop {
    if STOP.load(Ordering::Relaxed)||control.is_some_and(|q|q.stop.load(Ordering::Acquire)){
@@ -358,8 +358,9 @@ impl Hardware{
  }
  fn find_stream_prefix(&mut self,format:obn3::Format,ordinal:u64,c:&Config)->R<Option<(usize,usize,Header)>>{
   let slot=ordinal.wrapping_sub(1) as usize&(view::SLOTS-1);
-  let auto=matches!(format,obn3::Format::Obn5(_));
-  let shapes:&[obn3::Format]=if auto {&[obn3::Format::Obn5(4096),obn3::Format::Obn5(2048),obn3::Format::Obn5(1024)]}
+  let auto=matches!(format,obn3::Format::Obn5(..));
+  let revision=self.r(0xe4);
+  let shapes:&[obn3::Format]=if auto {&[obn3::Format::Obn5(4096,revision),obn3::Format::Obn5(2048,revision),obn3::Format::Obn5(1024,revision)]}
        else {&[obn3::Format::Compact,obn3::Format::Native]};
   for shape in shapes {
    let previous_active=shape.active_bytes();
@@ -630,8 +631,9 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
  std::fs::create_dir_all(&c.output).map_err(|e|e.to_string())?;
  let mut io=Hardware::open(c,control.is_some())?;
- let obn5=matches!(io.stream_format,Some(obn3::Format::Obn5(_)));
- let fft_bins=if obn5 {obn3::Format::obn5_config(c.stream_config.unwrap_or(0))?.bins()} else {continuous::BINS};
+ let obn5=matches!(io.stream_format,Some(obn3::Format::Obn5(..)));
+ let view_power_revision=if obn5 {io.r(0xe4)} else {1};
+ let fft_bins=if obn5 {obn3::Format::obn5_config(c.stream_config.unwrap_or(0),io.r(0xe4))?.bins()} else {continuous::BINS};
  let wire_view_bins=view::mode_bins(fft_bins,c.mode);
  let stream002=io.stream_format.is_some();
  let roi_control=control.and_then(|q|q.roi.as_ref());
@@ -717,7 +719,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    let next_at=filtered.unwrap_or_else(&next_for_record);
    if let Some(zoom)=zoom.borrow_mut().as_mut(){
     if !header_only || roi_control.is_some_and(|config|config.production) {
-     zoom.prepare(h,_owned_full,overview,initial_anchor,next_at)?;
+     zoom.prepare(h,_owned_full,overview,initial_anchor,next_at,view_power_revision)?;
     }
     zoom.pump();
    }

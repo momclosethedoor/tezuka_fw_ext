@@ -28,7 +28,7 @@ static u32 view_stride, spectrum_id, spectrum_revision;
 static u32 spectrum_view_stride(void)
 {
  u32 id=readl(csr+0x50), revision=readl(csr+0xe4);
- if (id==0x354e424f && revision==1 && (readl(csr+0xe0)&0x1ff)==0x1ff)
+ if (id==0x354e424f && (revision==1 || revision==2) && (readl(csr+0xe0)&0x1ff)==0x1ff)
   return 4096;
  if ((id==0x324e424f && revision==3) ||
      (id==0x334e424f && revision==4 && (readl(csr+0xe0)&0x60)==0x60))
