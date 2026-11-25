@@ -352,6 +352,11 @@ fn validate(v: &Value) -> Result<()> {
     }
     check_spectrum_settings(v,true)?;
     match v["op"].as_str() {
+        Some("scan_ranges") => {
+            ensure!(v.as_object().is_some_and(|o| o.keys().all(|key| matches!(key.as_str(), "op" | "id" | "ranges"))),
+                "scan_ranges changes only ranges");
+            validate(&json!({"op":"scan","planner_version":2,"k":1,"run":false,"ranges":v["ranges"]}))?;
+        }
         Some("scan") => {
             if let Some(delivery) = v.get("view_delivery") {
                 ensure!(matches!(delivery.as_str(),Some("stream" | "pass")),
@@ -610,6 +615,9 @@ async fn submit(
     }
     if cmd["op"]=="analysis" && cmd["width_hz"].as_u64()>q.capabilities["analysis_max_width_hz"].as_u64() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"analysis width exceeds the spectral ABI limit"})));
+    }
+    if cmd["op"] == "scan_ranges" && q.actual["mode"] != "analysis" {
+        return (StatusCode::CONFLICT, Json(json!({"error":"scan_ranges requires analysis"})));
     }
     if cmd["op"]=="video" && let Err(error)=video_profile::Profile::parse(&cmd,q.capabilities["video_profiles"]==true) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":error.to_string()})));
@@ -1882,6 +1890,10 @@ fn worker(
                     pending["scan"] = resume_scan.as_ref().unwrap().clone();
                     pending["alternative"] = Value::Null;
                 }
+                "scan_ranges" => {
+                    ensure!(previous_mode == "analysis", "scan_ranges requires analysis");
+                    pending["scan"]["ranges"] = request["ranges"].clone();
+                }
                 "scan" | "analysis" => {
                     if request.get("spectrum_detector").is_none() {
                         if let Some(saved) = pending[op].get("spectrum_detector") {
@@ -3005,7 +3017,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"scan_gain":true,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
-        "spectrum_detector":obn5,
+        "spectrum_detector":obn5,"analysis_scan_ranges":true,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),
         "loop_grid_config":obn5&&c.roi.is_some(),
