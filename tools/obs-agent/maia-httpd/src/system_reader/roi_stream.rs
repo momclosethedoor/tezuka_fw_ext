@@ -366,7 +366,7 @@ fn view_prefix(h: Header, revision: u32) -> [u8; obn3::COMPACT_PREFIX_BYTES] {
     prefix
 }
 
-pub(super) fn connect_nonblocking(peer: SocketAddrV4) -> io::Result<TcpStream> {
+fn connect_nonblocking(peer: SocketAddrV4) -> io::Result<TcpStream> {
     let fd=unsafe { libc::socket(libc::AF_INET,libc::SOCK_STREAM|libc::SOCK_NONBLOCK|libc::SOCK_CLOEXEC,0) };
     if fd < 0 { return Err(io::Error::last_os_error()); }
     let socket=unsafe { TcpStream::from_raw_fd(fd) };

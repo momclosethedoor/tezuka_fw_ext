@@ -1,14 +1,28 @@
-//! GVIEW4 frames retain their original encoding. GSWEEP1 is an independent
-//! UDP completion record for one executed pass.
-use super::{Header, R, UdpBatch, view_batch::ViewOutput};
+//! A/B pass delivery. Adjacent passes carry the prior outcome in VIEW headers.
+use super::{Header, R, UdpBatch};
+use std::net::UdpSocket;
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
+const OUTCOME_COPIES: usize = 3;
+const MAX_DROPS: u64 = (1 << 14) - 1;
+pub(super) const HEADER_BYTES: usize = 40;
+
+pub(super) fn header(h: Header, generation: u64, outcome: u32) -> [u8; HEADER_BYTES] {
+    let mut out = [0; HEADER_BYTES];
+    out[..4].copy_from_slice(b"GVW5");
+    out[4..12].copy_from_slice(&generation.to_le_bytes());
+    out[12..20].copy_from_slice(&h.epoch.to_le_bytes());
+    out[20..28].copy_from_slice(&h.first_tick.to_le_bytes());
+    out[28..32].copy_from_slice(&(h.ordinal as u32).to_le_bytes());
+    out[32..34].copy_from_slice(&(h.k as u16).to_le_bytes());
+    out[34..36].copy_from_slice(&(h.flags as u16).to_le_bytes());
+    out[36..40].copy_from_slice(&outcome.to_le_bytes());
+    out
+}
 
 pub(crate) struct SweepSpec {
-    version: u64,
     positions: Vec<Option<usize>>,
     route_to: Vec<usize>,
-    first: [usize;2],
     last: [usize;2],
     count: [u64;2],
     mode: Mode,
@@ -17,67 +31,56 @@ pub(crate) struct SweepSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::UdpSocket;
     use std::time::Duration;
 
-    #[derive(Debug, PartialEq)]
-    struct Closed(u64, u64, u64, Vec<u64>, bool);
-
-    fn replay(versions: &[(u64,u64)], epochs: &[u64], final_epoch: u64) -> Vec<Closed> {
-        let receiver=UdpSocket::bind("127.0.0.1:0").unwrap();
+    fn run(epochs: &[u64], final_epoch: u64) -> Vec<Vec<u8>> {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let sender=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         sender.connect(receiver.local_addr().unwrap()).unwrap();
-        let mut network=UdpBatch::configured(0,false,1,576);
-        let specs=versions.iter().map(|&(version,_)|
-            SweepSpec::from_layout(version,vec![Some(0),Some(0),Some(1),Some(1)],"pass").unwrap())
-            .collect::<Vec<_>>();
-        let mut index=0;
-        let mut notes=0;
-        let mut delivery=Delivery::new(&specs[index],versions[index].1,1,&mut network).unwrap();
+        let mut net = UdpBatch::configured(0,false,1,552);
+        let spec = SweepSpec::from_layout(vec![Some(0),Some(0),Some(1),Some(1)],"pass").unwrap();
+        let mut delivery = Delivery::new(&spec,100,7,&mut net).unwrap();
         for (ordinal,&epoch) in epochs.iter().enumerate() {
-            if versions.get(index+1).is_some_and(|&(_,anchor)|epoch>=anchor) {
-                delivery.finish(&mut network,&sender,true);
-                notes+=delivery.notes_sent;
-                index+=1;
-                delivery=Delivery::new(&specs[index],versions[index].1,2,&mut network).unwrap();
-            }
             delivery.accept(Header{first_seq:ordinal as u64*2,last_seq:ordinal as u64*2+1,
-                ordinal:ordinal as u64,epoch,first_tick:epoch*100,bins:4096,k:2,flags:9},&[0;512],&mut network,&sender);
+                ordinal:ordinal as u64,epoch,first_tick:epoch*100,bins:4096,k:2,flags:9},&[0;512],&mut net,&sender);
         }
-        delivery.finish_drained(&mut network,&sender,final_epoch);
-        notes+=delivery.notes_sent;
-        assert_eq!(network.sent,epochs.len() as u64);
-        assert_eq!((network.pending,network.suppressed),(0,0));
-        let mut result=Vec::new();
-        let mut ordinals=Vec::new();
-        let mut bytes=[0;576];
-        while result.len()<notes as usize {
-            let n=receiver.recv(&mut bytes).unwrap();
-            let word=|at: usize|u64::from_le_bytes(bytes[at..at+8].try_into().unwrap());
-            if n==112 && &bytes[..8]==b"GSWEEP1\0" {
-                result.push(Closed(word(16),word(32)/2,word(40),std::mem::take(&mut ordinals),word(104)&1==1));
-            } else {
-                assert_eq!((n,&bytes[..8]),(576,&b"GVIEW4\0\0"[..]));
-                ordinals.push(word(8));
-            }
-        }
-        assert!(ordinals.is_empty());
-        result
+        delivery.finish_drained(&mut net,&sender,final_epoch);
+        assert_eq!((net.sent,net.pending,net.suppressed),(epochs.len() as u64,0,0));
+        (0..net.sent+delivery.notes_sent).map(|_| {
+            let mut buf = vec![0;576];
+            let received = receiver.recv(&mut buf).unwrap();
+            buf.truncate(received);
+            buf
+        }).collect()
+    }
+
+    fn summary(packet: &[u8]) -> u32 {
+        let offset = if &packet[..4] == b"GVW5" {36} else {20};
+        u32::from_le_bytes(packet[offset..offset+4].try_into().unwrap())
     }
 
     #[test]
-    fn replays_the_four_pass_publication_vectors() {
-        // Commit epochs from PL-SCAN-STREAM-002/evidence/pass-publication-vectors.json.
-        // Recall alone changes no publication state.
-        assert_eq!(replay(&[(11,1)],&[1,2,2,2,3,4,4,5],5),[
-            Closed(11,0,0,vec![0,1,2,3],true),Closed(11,0,1,vec![4,5,6],true),
-            Closed(11,1,0,vec![7],false)]);
-        assert_eq!(replay(&[(21,100),(22,104)],&[100,101,102,103,103,104,105,105],105),[
-            Closed(21,0,0,vec![0,1],true),Closed(21,0,1,vec![2,3,4],true),
-            Closed(22,0,0,vec![5,6,7],true)]);
-        assert_eq!(replay(&[(31,300)],&[300,300],300),[Closed(31,0,0,vec![0,1],false)]);
-        assert!(replay(&[(34,1)],&[],0).is_empty());
+    fn embeds_prior_outcome_and_preserves_hold_and_terminal() {
+        let data = run(&[100,101,101,101,102,103,104],104);
+        assert_eq!(data.iter().map(|packet| packet.len()).collect::<Vec<_>>(), [552;7].into_iter().chain([24]).collect::<Vec<_>>());
+        assert_eq!(data.iter().map(|packet|summary(packet)).collect::<Vec<_>>(),
+                   [0,0,0,0,0xc0000002,0xc0000002,0xc0000002,0x80000001]);
+        assert_eq!(&data[0][..4],b"GVW5");
+        assert_eq!(&data[0][4..12],&7u64.to_le_bytes());
+        assert_eq!(&data[0][12..20],&100u64.to_le_bytes());
+        assert_eq!(&data[7][..4],b"GEND");
+        assert_eq!(&data[7][12..20],&2u64.to_le_bytes());
+    }
+
+    #[test]
+    fn a_missing_pass_uses_an_explicit_identity() {
+        let data = run(&[100,101,104,105],105);
+        assert_eq!(&data[2][..4],b"GEND");
+        assert_eq!(&data[2][12..20],&0u64.to_le_bytes());
+        assert_eq!(summary(&data[3]),0);
+        assert_eq!(summary(&data[5]),0xc0000002);
+        assert!(run(&[],100).is_empty());
     }
 }
 
@@ -89,7 +92,7 @@ impl SweepSpec {
         self.mode == Mode::Stream
     }
 
-    pub(super) fn from_layout(version: u64, positions: Vec<Option<usize>>, mode: &str) -> R<Self> {
+    pub(super) fn from_layout(positions: Vec<Option<usize>>, mode: &str) -> R<Self> {
         let mode = match mode {
             "stream" => Mode::Stream,
             "pass" => Mode::Pass,
@@ -105,7 +108,7 @@ impl SweepSpec {
             last[phase] = i;
             count[phase] += 1;
         }
-        if count.contains(&0) || last[0] >= first[1] {
+        if positions.len() > u16::MAX as usize || count.contains(&0) || last[0] >= first[1] {
             return Err("invalid A/B boundary".into());
         }
         let mut next = 2;
@@ -114,18 +117,22 @@ impl SweepSpec {
             if let Some(p) = phase {next=*p;}
             route_to[i]=next;
         }
-        Ok(Self {version,positions,route_to,first,last,count,mode})
+        Ok(Self {positions,route_to,last,count,mode})
     }
 }
 
 struct Pass {
     id: u64,
     phase: usize,
-    first_epoch: u64,
     last_epoch: u64,
-    last_tick: u64,
     observed: u64,
     drops_before: u64,
+}
+
+struct Outcome {
+    ident: u64,
+    summary: u32,
+    copies: usize,
 }
 
 pub(super) struct Delivery<'a> {
@@ -134,6 +141,7 @@ pub(super) struct Delivery<'a> {
     generation: u64,
     pass: Option<Pass>,
     completed: Option<u64>,
+    outcome: Option<Outcome>,
     pub notes_sent: u64,
     pub notes_lost: u64,
     pub peak_bytes: usize,
@@ -148,10 +156,10 @@ impl<'a> Delivery<'a> {
             }
             net.bytes.reserve(bytes);
         }
-        Ok(Self{spec,anchor,generation,pass:None,completed:None,notes_sent:0,notes_lost:0,peak_bytes:0})
+        Ok(Self{spec,anchor,generation,pass:None,completed:None,outcome:None,notes_sent:0,notes_lost:0,peak_bytes:0})
     }
 
-    pub(super) fn accept(&mut self,h:Header,view:&[u8],net:&mut UdpBatch,sock:&impl ViewOutput) {
+    pub(super) fn accept(&mut self,h:Header,view:&[u8],net:&mut UdpBatch,sock:&UdpSocket) {
         let Some(relative) = h.epoch.checked_sub(self.anchor) else {return};
         let count = self.spec.positions.len() as u64;
         let position = (relative%count) as usize;
@@ -159,14 +167,11 @@ impl<'a> Delivery<'a> {
         let phase = assigned % 2;
         let id = 2*(relative/count)+assigned as u64;
         if self.completed.is_some_and(|old| id<=old) {net.suppressed+=1;return;}
-        if self.pass.as_ref().is_some_and(|p| p.id != id) {self.finish(net,sock,true);}
-        let pass = self.pass.get_or_insert(Pass{id,phase,first_epoch:h.epoch,last_epoch:h.epoch,
-            last_tick:h.first_tick,observed:0,drops_before:net.dropped});
+        if self.pass.as_ref().is_some_and(|p| p.id != id) {self.close(net,sock,true,Some(id));}
+        let pass = self.pass.get_or_insert(Pass{id,phase,last_epoch:h.epoch,observed:0,drops_before:net.dropped});
         if self.spec.positions[position].is_some() {
-            if pass.observed == 0 {pass.first_epoch=h.epoch;}
             if pass.observed == 0 || pass.last_epoch != h.epoch {pass.observed+=1;}
             pass.last_epoch = h.epoch;
-            pass.last_tick = h.first_tick;
         }
         if self.spec.positions[position].is_none() {net.transition+=1;}
         if view.is_empty() {
@@ -174,30 +179,27 @@ impl<'a> Delivery<'a> {
         }
         if net.bytes.len()+net.record_size() <= MAX_BYTES {
             if net.pending==0 {net.start_record();}
-            net.bytes.extend_from_slice(&self.header(h));
+            let summary = match self.outcome.as_mut() {
+                Some(outcome) if outcome.copies < OUTCOME_COPIES * net.max_records => {
+                    outcome.copies += 1;
+                    outcome.summary
+                }
+                _ => 0,
+            };
+            net.bytes.extend_from_slice(&header(h,self.generation,summary));
             net.bytes.extend_from_slice(view);
             net.pending+=1;
             self.peak_bytes=self.peak_bytes.max(net.bytes.len());
         } else {net.rejected_before_queue+=1;net.dropped+=1;}
     }
 
-    fn header(&self,h:Header)->[u8;64] {
-        let mut out = [0;64];
-        out[..8].copy_from_slice(b"GVIEW4\0\0");
-        for (p,n) in out[8..].chunks_exact_mut(8).zip([
-            h.ordinal,h.first_seq,h.epoch,h.first_tick,u64::from(h.k),u64::from(h.flags),self.generation]) {
-            p.copy_from_slice(&n.to_le_bytes());
-        }
-        out
-    }
-
-    pub(super) fn poll(&self,net:&mut UdpBatch,sock:&impl ViewOutput) {
+    pub(super) fn poll(&self,net:&mut UdpBatch,sock:&UdpSocket) {
         if self.spec.streams() {
             net.stream_flush(sock);
         }
     }
 
-    pub(super) fn finish_drained(&mut self, net: &mut UdpBatch, sock: &impl ViewOutput, final_epoch: u64) {
+    pub(super) fn finish_drained(&mut self, net: &mut UdpBatch, sock: &UdpSocket, final_epoch: u64) {
         let executed = self.pass.as_ref().is_some_and(|pass| {
             let base = self.anchor + (pass.id / 2) * self.spec.positions.len() as u64;
             final_epoch >= base + self.spec.last[pass.phase] as u64
@@ -205,23 +207,34 @@ impl<'a> Delivery<'a> {
         self.finish(net, sock, executed);
     }
 
-    pub(super) fn finish(&mut self,net:&mut UdpBatch,sock:&impl ViewOutput,executed:bool) {
+    pub(super) fn finish(&mut self,net:&mut UdpBatch,sock:&UdpSocket,executed:bool) {
+        self.close(net,sock,executed,None);
+    }
+
+    fn close(&mut self,net:&mut UdpBatch,sock:&UdpSocket,executed:bool,next:Option<u64>) {
         let Some(pass) = self.pass.take() else {return};
         net.flush(sock);
-        let base = self.anchor + (pass.id/2) * self.spec.positions.len() as u64;
-        let expected = self.spec.count[pass.phase];
-        let dropped = net.dropped.saturating_sub(pass.drops_before);
-        let mut message = [0;112];
-        message[..8].copy_from_slice(b"GSWEEP1\0");
-        for (word,value) in message[8..].chunks_exact_mut(8).zip([
-            self.generation,self.spec.version,self.anchor,pass.id,pass.phase as u64,
-            base+self.spec.first[pass.phase] as u64,base+self.spec.last[pass.phase] as u64,
-            pass.first_epoch,pass.last_epoch,pass.last_tick,expected,pass.observed,
-            (dropped<<1)|u64::from(executed)]) {
-            word.copy_from_slice(&value.to_le_bytes());
+        if let Some(previous) = self.outcome.take().filter(|outcome| outcome.copies == 0) {
+            self.send_outcome(net,sock,&previous);
         }
+        let dropped = net.dropped.saturating_sub(pass.drops_before).min(MAX_DROPS) as u32;
+        let summary = (1 << 31) | (u32::from(executed) << 30) | (dropped << 16) | pass.observed as u32;
+        let outcome = Outcome {ident:pass.id,summary,copies:0};
+        if pass.id.checked_add(1) == next {
+            self.outcome = Some(outcome);
+        } else {
+            self.send_outcome(net,sock,&outcome);
+        }
+        self.completed = Some(pass.id);
+    }
+
+    fn send_outcome(&mut self,net:&mut UdpBatch,sock:&UdpSocket,outcome:&Outcome) {
+        let mut message = [0;24];
+        message[..4].copy_from_slice(b"GEND");
+        message[4..12].copy_from_slice(&self.generation.to_le_bytes());
+        message[12..20].copy_from_slice(&outcome.ident.to_le_bytes());
+        message[20..].copy_from_slice(&outcome.summary.to_le_bytes());
         if net.completion(sock,&message) {self.notes_sent+=1;}
         else {self.notes_lost+=1;}
-        self.completed = Some(pass.id);
     }
 }

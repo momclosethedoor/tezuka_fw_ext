@@ -13,7 +13,7 @@ mod video_egress;
 mod video_profile;
 
 use anyhow::{Result, anyhow, bail, ensure};
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{Json, Router, extract::{Query, State}, http::StatusCode, routing::get};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -56,7 +56,6 @@ struct Config {
     setup: PathBuf,
     output: PathBuf,
     view: SocketAddr,
-    view_tcp: Option<std::net::SocketAddrV4>,
     video: SocketAddr,
     route: SocketAddr,
     #[serde(default)]
@@ -497,12 +496,42 @@ fn validate(v: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn status(State(shared): State<Arc<Shared>>) -> Json<Value> {
+#[derive(Deserialize)]
+struct StatusQuery { map_ref: Option<String> }
+
+fn status_actual(actual: &Value, session: &str, known: Option<&str>) -> (Value, Option<String>) {
+    let spectrum = &actual["spectrum"];
+    let map_ref = if spectrum["positions"].is_array() {
+        match (spectrum["generation"].as_u64(), spectrum["version"].as_u64(), spectrum["map_epoch"].as_u64()) {
+            (Some(generation), Some(version), Some(epoch)) =>
+                Some(format!("{session}/{generation}/{version}/{epoch}")),
+            _ => None,
+        }
+    } else { None };
+    if map_ref.is_none() || map_ref.as_deref() != known {
+        return (actual.clone(), map_ref);
+    }
+    let mut status = serde_json::Map::new();
+    for (key, value) in actual.as_object().unwrap() {
+        if key == "spectrum" {
+            let descriptor = spectrum.as_object().unwrap().iter()
+                .filter(|(key, _)| key.as_str() != "positions")
+                .map(|(key, value)| (key.clone(), value.clone())).collect();
+            status.insert(key.clone(), Value::Object(descriptor));
+        } else {
+            status.insert(key.clone(), value.clone());
+        }
+    }
+    (Value::Object(status), map_ref)
+}
+
+async fn status(State(shared): State<Arc<Shared>>, Query(query): Query<StatusQuery>) -> Json<Value> {
     let loop_config = shared.loop_config.as_ref().map(|config| config.lock().unwrap().status());
     let q = shared.inbox.lock().unwrap();
+    let (actual, map_ref) = status_actual(&q.actual, &shared.clock_session, query.map_ref.as_deref());
     let reader = crate::system_reader::status();
     Json(
-        json!({"abi":1,"kind":"guarded-control","origin":"hardware","actual":q.actual,
+        json!({"abi":1,"kind":"guarded-control","origin":"hardware","actual":actual,"map_ref":map_ref,
         "pending_id":q.next.as_ref().or(q.pending.as_ref()).map(|v|&v["id"])
             .or(q.next_map_request.as_ref().map(|(v,_)|&v["id"])),
         "applied_id":q.applied_id,"failed_id":q.failed_id,"error":q.error,
@@ -1639,8 +1668,7 @@ fn continuous_with_spectrum(
     let cfg = serde_json::to_vec(&json!({
         "boot_id":c.boot_id,"output":c.output.join("demod-spectrum"),"command":"rate",
         "k":k,"mode":mode,"peak":grid["spectrum_detector"]=="peak","seconds":1.0,"warmup":0.0,"batch_limit":64,
-        "stream_config":stream_config,"tx_active":tx_active,"batch_sync":true,
-        "udp":c.view_tcp.is_none().then(||c.view.to_string()),"view_tcp":c.view_tcp,
+        "stream_config":stream_config,"tx_active":tx_active,"batch_sync":true,"udp":c.view.to_string(),
         "trace_limit":0,"send_after_release":true,
     }))?;
     let cancel_video = AtomicBool::new(false);
@@ -1672,6 +1700,7 @@ fn continuous_with_spectrum(
                 ("k".into(), k.clone()), ("fs_hz".into(), json!(FS)),
                 ("flags".into(), json!(header.flags)), ("fft_bins".into(), json!(header.bins)),
                 ("view_bins".into(), json!(bins)), ("view_power_revision".into(), json!(2)),
+                ("view_wire_version".into(), json!(5)),
                 ("TX_OFF".into(), json!(!tx_active)),
             ]);
             let _ = ready.send(state.clone());
@@ -2143,11 +2172,13 @@ fn worker(
                     sweep = crate::system_reader::SweepSpec::from_descriptor(&a["spectrum"],&delivery)
                         .map_err(|e|anyhow!(e))?;
                     a["spectrum"]["view_delivery"] = json!(delivery);
+                    a["spectrum"]["sweep_wire_version"] = json!(2);
                     if let Some(mut second) = a["spectrum"].as_object_mut().unwrap().remove("prepared_next") {
                         ensure!(c.field_preview.is_none(),"NEXT cannot replace an active FIELD watch");
                         next_sweep = crate::system_reader::SweepSpec::from_descriptor(&second,&delivery)
                             .map_err(|e|anyhow!(e))?;
                         second["view_delivery"] = json!(delivery);
+                        second["sweep_wire_version"] = json!(2);
                         second["overview_enabled"] = json!(!roi_only);
                         a["prepared_next_version"] = second["version"].clone();
                         next_spectrum = Some(second);
@@ -2155,7 +2186,7 @@ fn worker(
                 }
                 if !targets.is_empty() {
                     ensure!(c.resident_field.is_some() && regs.read(0x350)==0x314d4646
-                        && a["spectrum"]["sweep_wire_version"]==1,
+                        && a["spectrum"]["sweep_wire_version"]==2,
                         "resident FIELD requires FLD2/FFM1 and the physical A/B map");
                     let directory=c.output.join(format!("field-{generation}"));
                     fs::create_dir(&directory)?;
@@ -2310,8 +2341,7 @@ fn worker(
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "stream_config":stream_config,"hold_k":settings["hold_k"],"bench_obn3_view_only":view_only,
-                "udp":(!roi_only && c.view_tcp.is_none()).then(||c.view.to_string()),
-                "view_tcp":if roi_only{None}else{c.view_tcp},"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
+                "udp":(!roi_only).then(||c.view.to_string()),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
             let started = |h: crate::system_reader::Header, execution: crate::system_reader::Execution| {
@@ -2337,6 +2367,7 @@ fn worker(
                     ("scan", json!(scan)),
                     ("fs_hz", json!(FS)),
                     ("view_power_revision", json!(if obn5 {regs.read(0xe4)} else {1})),
+                    ("view_wire_version", json!(5)),
                     ("flags", json!(h.flags)),
                     ("fft_bins", json!(h.bins)),
                     (
@@ -2386,6 +2417,7 @@ fn worker(
                 let mut a = actual.borrow_mut();
                 let mut s = next_spectrum.as_ref().unwrap().clone();
                 for (key,value) in [("generation",json!(next_gen)),("map_epoch",json!(anchor)),
+                    ("view_wire_version",json!(5)),
                     ("view_power_revision",json!(if obn5 {regs.read(0xe4)} else {1})),
                     ("k",k.clone()),("scan",json!(true)),("fs_hz",json!(FS)),("flags",json!(h.flags)),
                     ("fft_bins",json!(h.bins)),("view_bins",json!(crate::system_reader::view_bins(h))),("TX_OFF",Value::Null)] {
@@ -3129,7 +3161,6 @@ mod tests {
             setup: "setup".into(),
             output: "out".into(),
             view: "127.0.0.1:1".parse().unwrap(),
-            view_tcp: None,
             video: "127.0.0.1:2".parse().unwrap(),
             route: "127.0.0.1:3".parse().unwrap(),
             positions: vec![
