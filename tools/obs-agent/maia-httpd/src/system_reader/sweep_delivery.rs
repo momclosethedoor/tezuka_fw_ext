@@ -1,7 +1,6 @@
 //! GVIEW4 frames retain their original encoding. GSWEEP1 is an independent
 //! UDP completion record for one executed pass.
-use super::{Header, R, UdpBatch};
-use std::net::UdpSocket;
+use super::{Header, R, UdpBatch, view_batch::ViewOutput};
 
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
@@ -18,6 +17,7 @@ pub(crate) struct SweepSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket;
     use std::time::Duration;
 
     #[derive(Debug, PartialEq)]
@@ -151,7 +151,7 @@ impl<'a> Delivery<'a> {
         Ok(Self{spec,anchor,generation,pass:None,completed:None,notes_sent:0,notes_lost:0,peak_bytes:0})
     }
 
-    pub(super) fn accept(&mut self,h:Header,view:&[u8],net:&mut UdpBatch,sock:&UdpSocket) {
+    pub(super) fn accept(&mut self,h:Header,view:&[u8],net:&mut UdpBatch,sock:&impl ViewOutput) {
         let Some(relative) = h.epoch.checked_sub(self.anchor) else {return};
         let count = self.spec.positions.len() as u64;
         let position = (relative%count) as usize;
@@ -191,13 +191,13 @@ impl<'a> Delivery<'a> {
         out
     }
 
-    pub(super) fn poll(&self,net:&mut UdpBatch,sock:&UdpSocket) {
+    pub(super) fn poll(&self,net:&mut UdpBatch,sock:&impl ViewOutput) {
         if self.spec.streams() {
             net.stream_flush(sock);
         }
     }
 
-    pub(super) fn finish_drained(&mut self, net: &mut UdpBatch, sock: &UdpSocket, final_epoch: u64) {
+    pub(super) fn finish_drained(&mut self, net: &mut UdpBatch, sock: &impl ViewOutput, final_epoch: u64) {
         let executed = self.pass.as_ref().is_some_and(|pass| {
             let base = self.anchor + (pass.id / 2) * self.spec.positions.len() as u64;
             final_epoch >= base + self.spec.last[pass.phase] as u64
@@ -205,7 +205,7 @@ impl<'a> Delivery<'a> {
         self.finish(net, sock, executed);
     }
 
-    pub(super) fn finish(&mut self,net:&mut UdpBatch,sock:&UdpSocket,executed:bool) {
+    pub(super) fn finish(&mut self,net:&mut UdpBatch,sock:&impl ViewOutput,executed:bool) {
         let Some(pass) = self.pass.take() else {return};
         net.flush(sock);
         let base = self.anchor + (pass.id/2) * self.spec.positions.len() as u64;

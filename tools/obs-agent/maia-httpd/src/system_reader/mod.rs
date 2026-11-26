@@ -3,6 +3,7 @@ mod continuous;
 mod view;
 mod discard;
 mod view_batch;
+mod view_tcp;
 mod sweep_delivery;
 mod progress;
 mod obn3;
@@ -35,7 +36,7 @@ impl RoiRequest {
 }
 pub(crate) use progress::{Execution, LOST as PROGRESS_LOST};
 pub(crate) use sweep_delivery::SweepSpec;
-use view_batch::UdpBatch;
+use view_batch::{UdpBatch, ViewOutput};
 pub(crate) use continuous::Header;
 use continuous::Snapshot;
 use view::PairIo;
@@ -78,6 +79,7 @@ impl SweepSpec {
  #[serde(default)]batch_sync:bool,#[serde(default)]direct:bool,#[serde(default)]release_only:bool,
  #[serde(default="batchdefault")]batch_limit:usize,
  #[serde(default)]tx_active:bool,#[serde(default)]managed_tx:bool,#[serde(default)]aligned:bool,#[serde(default)]hot:bool,#[serde(default)]udp:Option<String>,#[serde(default)]neon:bool,
+ #[serde(default)]view_tcp:Option<std::net::SocketAddrV4>,
 }
 fn batchdefault()->usize{32}
 fn tracedefault()->usize{400000}
@@ -626,6 +628,7 @@ fn udp_socket_queue(socket:&std::net::UdpSocket)->Option<i32> {
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  if (c.trace_limit==0&&control.is_none())||c.trace_limit>400000||c.batch_limit==0||c.batch_limit>64||(c.direct||c.release_only)&&(!c.shift544||(c.release_only&&(c.mode!=0||c.check||c.save_ordinal.is_some()))) {return Err("strategy bounds: trace1..400000 (0 for managed control); header-only OFF without check/save; batch1..64".into())}
  if !(1..=1023).contains(&c.k)||c.mode>4||c.previous_mode>3||!c.seconds.is_finite()||c.seconds<=0.||c.seconds>120.||!c.warmup.is_finite()||c.warmup<0.||c.warmup>15.{return Err("bounded config".into())}
+ if c.view_tcp.is_some() && (control.is_none() || c.udp.is_some()) {return Err("VIEW TCP requires managed delivery and no UDP destination".into());}
  if c.diagnostic_sync.is_some(){return discard::execute(c)}
  if c.owned_pipeline{return Err("full-copy experiment rejected; use immediate release reader".into())}
  if c.check||c.save_ordinal.is_some()||c.release_only{return Err("immediate release reader requires complete reads; offline checks use saved rings".into())}
@@ -670,10 +673,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
  let initial=io.snapshot()?;
  let mut reader=view::PairReader::attach(initial)?;
  let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
- let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
+ let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(view_tcp::Output::Udp(sock))}
+ else{c.view_tcp.map(|peer|view_tcp::Output::Tcp(view_tcp::Tcp::new(peer)))};
  let record_bytes=(if control.is_some(){64}else{56})+wire_view_bins;
- let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
- if control.is_some() && let Some(sock)=&socket{
+ let network=std::cell::RefCell::new(if c.view_tcp.is_some() {UdpBatch::configured(0,false,8,record_bytes)} else {UdpBatch::new(record_bytes)});
+ let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
+ if control.is_some() && let Some(sock)=socket.as_ref().and_then(ViewOutput::udp){
   let mut net=network.borrow_mut();
   net.coalesce_us=0;
   let mut mtu:libc::c_int=0;
@@ -695,6 +700,13 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
   }
  }
+ if let Some(output)=&socket{output.pump();}
+ let network_stats=|net:&UdpBatch|{
+  let mut stats=net.counts();
+  stats["socket_pending_bytes"]=json!(socket.as_ref().and_then(ViewOutput::udp).and_then(udp_socket_queue));
+  if c.view_tcp.is_some(){stats["tcp"]=socket.as_ref().map_or(Value::Null,view_tcp::Output::tcp_stats);}
+  stats
+ };
  let initial_anchor=io.live64(0x238);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
@@ -790,8 +802,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
     if let Err(e)=io.check_progress(&mut progress,start,&s,q,execution.get(),map){route_failure=Some(e);break;}
    }
    if let Ok(mut v)=mark(&mut io,&reader,start){
-    v["network"]=network.borrow().counts();
-    v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
+    v["network"]=network_stats(&network.borrow());
     if io.phase_on {
      v["observed_to_payload"]=histogram(reader.observed_to_payload);
      v["release"]=histogram(reader.release);
@@ -806,6 +817,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   if let Some(sock)=&socket {
    let mut net=network.borrow_mut();
    if let Some(sweep)=sweeps.borrow().as_ref(){sweep.poll(&mut net,sock);}else{net.flush_due(sock);}
+   sock.pump();
    if let Some(q)=control && !first_view_sent && net.sent>0{first_view_sent=true;(q.trace)("first_view_sent");}
   }
   max_service_us=max_service_us.max(t.elapsed().as_micros()as u64);
@@ -827,6 +839,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }else{net.flush(sock);}
   }
   if drained{break}if stop.elapsed()>Duration::from_secs(5){return Err("reader stop/drain timeout; allocation remains pinned".into())}}
+ if let Some(output)=&socket{output.finish();}
  if let Some(zoom)=zoom.borrow_mut().as_mut(){
   let deadline=Instant::now()+Duration::from_secs(1);
   while zoom.pending() && Instant::now()<deadline {
@@ -836,8 +849,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   zoom.close();
  }
  if let Ok(mut v)=mark(&mut io,&reader,start){
-  v["network"]=network.borrow().counts();
-  v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
+  v["network"]=network_stats(&network.borrow());
   if io.phase_on {
    v["observed_to_payload"]=histogram(reader.observed_to_payload);
    v["release"]=histogram(reader.release);

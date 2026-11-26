@@ -56,6 +56,7 @@ struct Config {
     setup: PathBuf,
     output: PathBuf,
     view: SocketAddr,
+    view_tcp: Option<std::net::SocketAddrV4>,
     video: SocketAddr,
     route: SocketAddr,
     #[serde(default)]
@@ -1638,7 +1639,8 @@ fn continuous_with_spectrum(
     let cfg = serde_json::to_vec(&json!({
         "boot_id":c.boot_id,"output":c.output.join("demod-spectrum"),"command":"rate",
         "k":k,"mode":mode,"peak":grid["spectrum_detector"]=="peak","seconds":1.0,"warmup":0.0,"batch_limit":64,
-        "stream_config":stream_config,"tx_active":tx_active,"batch_sync":true,"udp":c.view.to_string(),
+        "stream_config":stream_config,"tx_active":tx_active,"batch_sync":true,
+        "udp":c.view_tcp.is_none().then(||c.view.to_string()),"view_tcp":c.view_tcp,
         "trace_limit":0,"send_after_release":true,
     }))?;
     let cancel_video = AtomicBool::new(false);
@@ -2308,7 +2310,8 @@ fn worker(
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
                 "stream_config":stream_config,"hold_k":settings["hold_k"],"bench_obn3_view_only":view_only,
-                "udp":(!roi_only).then(||c.view.to_string()),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
+                "udp":(!roi_only && c.view_tcp.is_none()).then(||c.view.to_string()),
+                "view_tcp":if roi_only{None}else{c.view_tcp},"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
             let started = |h: crate::system_reader::Header, execution: crate::system_reader::Execution| {
@@ -3126,6 +3129,7 @@ mod tests {
             setup: "setup".into(),
             output: "out".into(),
             view: "127.0.0.1:1".parse().unwrap(),
+            view_tcp: None,
             video: "127.0.0.1:2".parse().unwrap(),
             route: "127.0.0.1:3".parse().unwrap(),
             positions: vec![
