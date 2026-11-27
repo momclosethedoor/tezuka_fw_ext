@@ -122,6 +122,10 @@ def main(images, agent):
     assert b'bench_split544: false' in init
     assert init.index(b'sh ./prepare-r3.sh') < init.index(b'devmem 0x7c460050')
     assert prepare.index(b'devmem 0x7c460008 32 0') < prepare.index(b'devmem 0x7c460050')
+    assert b'ready_dir=/tmp/pl-uart-obs-session' in init
+    readiness = init.index(b'printf \'%s\\n\' OBS_READY')
+    assert init.index(b'test -c /dev/obs_fl_guard') < readiness
+    assert readiness < init.index(b'mv "$phase" "$ready_dir/phase"') < init.index(b'exec /usr/bin/maia-delivery')
     verify_label(files['opt/vfat.img'][1])
 
     boot = frm(images / 'boot.frm', 0x100000 + 0x20000 + 1024 + 33)

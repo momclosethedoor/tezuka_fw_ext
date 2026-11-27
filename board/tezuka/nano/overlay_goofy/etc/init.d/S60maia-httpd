@@ -46,6 +46,15 @@ prepare_radio() {
             view: ($host + ":18010"), roi: ($host + ":18011"),
             resident_field: {collector: $collector, timeout_ms: 90}
         }' "$payload/owner.json" >"$run_dir/owner.json"
+
+    # Both the control service and its reader use the same readiness marker.
+    test -c /dev/obs_cap2
+    test -c /dev/obs_fl_guard
+    ready_dir=/tmp/pl-uart-obs-session
+    mkdir -p "$ready_dir"
+    phase=$(mktemp "$ready_dir/.phase.XXXXXX")
+    printf '%s\n' OBS_READY >"$phase"
+    mv "$phase" "$ready_dir/phase"
     exec /usr/bin/maia-delivery --system-control "$run_dir/owner.json" --listen 0.0.0.0:18080
 }
 
