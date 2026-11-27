@@ -39,9 +39,6 @@ run-name: >-
       || format('CI ({0})', inputs.boards || 'all') }}
 
 jobs:
-  zefir-arm:
-    uses: ./.github/workflows/system-agent.yml
-
   matrix:
     runs-on: ubuntu-22.04
     permissions:
@@ -130,7 +127,7 @@ jobs:
           if-no-files-found: warn
 
   tezuka:
-    needs: [matrix, zefir-arm]
+    needs: matrix
     runs-on: ubuntu-22.04
     name: ${{ matrix.defconfig }}
     permissions:
@@ -192,12 +189,15 @@ jobs:
         with:
           name: obs007c-main-agent
           path: zefir-arm
+          run-id: 46048677905
+          github-token: ${{ github.token }}
 
       - name: Stage ZEFIR ARM runtime
         if: matrix.board == 'nano'
         run: |
           set -euo pipefail
-          (cd zefir-arm && sha256sum -c SHA256SUMS)
+          (cd zefir-arm && sha256sum -c SHA256SUMS &&
+            echo 'b73e3bbef686c5f5a0e3a17ac905fcf816f821d0ad7a7fa20442d0c5f194c7bf  maia-httpd' | sha256sum -c -)
           overlay=board/tezuka/nano/overlay_goofy
           install -Dm755 zefir-arm/maia-httpd "$overlay/usr/bin/maia-delivery"
           install -Dm755 zefir-arm/obs-ffm1-iio "$overlay/usr/libexec/zefir/obs-ffm1-iio"

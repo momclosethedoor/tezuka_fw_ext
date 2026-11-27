@@ -126,6 +126,8 @@ def main(images, agent):
     readiness = init.index(b'printf \'%s\\n\' OBS_READY')
     assert init.index(b'test -c /dev/obs_fl_guard') < readiness
     assert readiness < init.index(b'mv "$phase" "$ready_dir/phase"') < init.index(b'exec /usr/bin/maia-delivery')
+    assert b'video_packing: true' in init
+    assert b'field_video: ($host + ":18009")' in init
     verify_label(files['opt/vfat.img'][1])
 
     boot = frm(images / 'boot.frm', 0x100000 + 0x20000 + 1024 + 33)
