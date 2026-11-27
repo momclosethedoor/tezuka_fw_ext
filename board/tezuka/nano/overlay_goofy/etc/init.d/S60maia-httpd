@@ -10,17 +10,19 @@ prepare_radio() {
     exec >>"$run_dir/boot.log" 2>&1
     cd "$payload"
     test "$(uname -r)" = 6.12.77
+
+    if [ ! -c /dev/obs_dma ]; then
+        # The OBN5 register bank acknowledges reads only after SDR reset is released.
+        sh ./prepare-r3.sh
+        insmod ./obs_dma.ko cached=0
+    fi
+    test -c /dev/obs_dma
     test "$(devmem 0x7c460050)" = 0x354E424F
     test "$(devmem 0x7c4600e4)" = 0x00000002
     test "$(devmem 0x7c4601c0)" = 0x00000400
     test "$(devmem 0x7c4601c4)" = 0x00008000
     test "$(devmem 0x7c4601c8)" = 0x00001000
 
-    if [ ! -c /dev/obs_dma ]; then
-        sh ./prepare-r3.sh
-        insmod ./obs_dma.ko cached=0
-    fi
-    test -c /dev/obs_dma
     if [ "$(basename "$(readlink /sys/bus/spi/devices/spi0.0/driver)")" = ad9361 ]; then
         sh ./guard-rebind.sh
     fi

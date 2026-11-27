@@ -117,7 +117,11 @@ def main(images, agent):
         assert mode & 0o111 and file_data == (agent / built).read_bytes(), path
     for path in ('obs_dma.ko', 'obs_ad9361.ko', 'obs-fl-ctl'):
         assert files['usr/libexec/zefir/' + path][1].startswith(b'\x7fELF')
-    assert b'bench_split544: false' in files['etc/init.d/S60maia-httpd'][1]
+    init = files['etc/init.d/S60maia-httpd'][1]
+    prepare = files['usr/libexec/zefir/prepare-r3.sh'][1]
+    assert b'bench_split544: false' in init
+    assert init.index(b'sh ./prepare-r3.sh') < init.index(b'devmem 0x7c460050')
+    assert prepare.index(b'devmem 0x7c460008 32 0') < prepare.index(b'devmem 0x7c460050')
     verify_label(files['opt/vfat.img'][1])
 
     boot = frm(images / 'boot.frm', 0x100000 + 0x20000 + 1024 + 33)
