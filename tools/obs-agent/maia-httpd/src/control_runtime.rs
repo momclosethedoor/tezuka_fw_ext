@@ -57,6 +57,10 @@ struct Config {
     output: PathBuf,
     view: SocketAddr,
     video: SocketAddr,
+    #[serde(default)]
+    field_video: Option<SocketAddr>,
+    #[serde(default)]
+    video_packing: bool,
     route: SocketAddr,
     #[serde(default)]
     positions: Vec<u64>,
@@ -1486,7 +1490,15 @@ fn continuous(
     // Connect before admitting samples. A slow or absent receiver cannot fill
     // IIO during connection setup.
     let socket = TcpStream::connect_timeout(&c.video, Duration::from_millis(100))
-        .and_then(|conn| { conn.set_nonblocking(true)?; Ok(conn) });
+        .and_then(|mut conn| {
+            if c.video_packing {
+                conn.set_write_timeout(Some(Duration::from_millis(100)))?;
+                std::io::Write::write_all(&mut conn, b"R8H1")?;
+                conn.set_write_timeout(None)?;
+            }
+            conn.set_nonblocking(true)?;
+            Ok(conn)
+        });
     let mut conn = match socket {
         Ok(conn) => conn,
         Err(error) => {
@@ -1540,6 +1552,7 @@ fn continuous(
                 let mut status_due = Instant::now();
                 let mut sampled_reads = 0;
                 let mut source_progress_at = None;
+                let mut packing = video_egress::Packing::Raw;
                 while !stopping() {
                     let previous_sent = queue.counts.frames;
                     let sent = queue.pump(&mut conn).map_err(|e| anyhow!("real8 socket send: {e}"))?;
@@ -1568,7 +1581,10 @@ fn continuous(
                     have += n;
                     if have >= video_egress::MIN_BLOCK_BYTES {
                         let len = have & !3;
-                        queue.push(generation, &bytes[..len], Instant::now())?;
+                        if c.video_packing && queue.counts.packed_frames % 4 == 0 {
+                            packing.poll(&mut conn)?;
+                        }
+                        queue.push(generation, &bytes[..len], Instant::now(), packing)?;
                         bytes.copy_within(len..have, 0);
                         have -= len;
                     }
@@ -2315,7 +2331,7 @@ fn worker(
             if let Some(directory)=field_directory.as_ref() {
                 let mut renewed=Instant::now();
                 let session=resident_field::Session::start(c.resident_field.as_ref().unwrap(),
-                    directory,c.video,&regs,||{
+                    directory,c.field_video.unwrap_or(c.video),&regs,||{
                         ensure!(!shared.switch.load(Ordering::Acquire),"FFM1 startup cancelled");
                         if guard_rf && renewed.elapsed()>=Duration::from_millis(80) {
                             guard_cmd(&guard_fd,0x4606)?;
@@ -2379,7 +2395,7 @@ fn worker(
                     s.insert(k.into(), v);
                 }
                 if scan && let Some(field) = &c.field_preview {
-                    match field::Watch::start(field, &c.output, &c.boot_id, c.video, &a["spectrum"])
+                    match field::Watch::start(field, &c.output, &c.boot_id, c.field_video.unwrap_or(c.video), &a["spectrum"])
                     {
                         Ok(Some((child, identity))) => {
                             *watch.borrow_mut() = Some(child);

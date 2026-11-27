@@ -1,7 +1,7 @@
 name: OBS007A integrated ARM agent
 on:
   push:
-    branches: [build/obn5-r2-view, build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-scan-stream-002, build/pl-field-stream-001, build/pl-fft-hold-002]
+    branches: [build/obn5-r2-view, build/obs007c-arm-mode, build/obs007f1-cap2-a9, build/host-scan-control-001, build/arm-planner-001, build/arm-scan-027-accept-001, build/arm-scan-control-002, build/arm-scan-control-003, build/arm-egress-control-001, build/arm-process-rf-owner, build/arm-view-opt-001, build/arm-scan-stream-002, build/pl-field-stream-001, build/pl-fft-hold-002, build/real8-native-egress]
     paths: ['tools/obs-agent/**', 'tools/obs-guard/obs-field1.c', 'tools/obs-guard/obs-ffm1-iio.c', 'tools/obs-guard/obs-field-*.h', 'tools/obs-guard/obs-fsb1-stream.h', '.github/workflows/system-agent.yml']
   workflow_dispatch:
   workflow_call:
@@ -20,6 +20,10 @@ jobs:
           $env:OBS_VIEW_VECTOR_ROOT='tools/obs-agent/maia-httpd/tests/view'
           $env:OBS_OBN2_VECTOR_ROOT='tools/obs-agent/maia-httpd/tests/observation-continuous'
           ./planner-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc +1.94.0 --edition=2024 --test tools/obs-agent/maia-httpd/src/control_runtime/video_egress.rs -o real8-queue-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./real8-queue-tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           rustc +1.94.0 --edition=2024 tools/obs-agent/mixer-check.rs -o mixer-check.exe
       - uses: actions/upload-artifact@v7
@@ -66,6 +70,8 @@ jobs:
           export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
           export PKG_CONFIG=/usr/bin/pkg-config
           export OPENBLAS_CC="$PWD/output/nano/host/bin/arm-linux-gcc"
+          export CC_armv7_unknown_linux_gnueabihf="$OPENBLAS_CC"
+          export AR_armv7_unknown_linux_gnueabihf="$PWD/output/nano/host/bin/arm-linux-ar"
           export OPENBLAS_FC="$PWD/output/nano/host/bin/arm-linux-gfortran"
           if ! test -x "$OPENBLAS_FC"; then export OPENBLAS_FC=arm-linux-gnueabihf-gfortran; fi
           export BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--sysroot=$($OPENBLAS_CC -print-sysroot)"
