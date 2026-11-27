@@ -327,9 +327,9 @@ impl Hardware{
     if auto && let Some(h)=self.stream_header_at(format,first as usize & (view::SLOTS-1),0,first)? {
      return Ok(json!({"run":initial.cookie,"layout":"native","ordinal":first,"epoch":h.epoch}));
     }
-    binding=self.find_stream_prefix(format,first,c)?;
+    if !auto {binding=self.find_stream_prefix(format,first,c)?;}
    }
-   if binding.is_none() && cold && s.committed>=2 {
+   if !auto && binding.is_none() && cold && s.committed>=2 {
     first=1;
     binding=self.find_stream_prefix(format,first,c)?;
    }
@@ -343,6 +343,7 @@ impl Hardware{
         "unrecoverable_cold_records":first-initial.released}));
    }
    if s.committed-initial.released>=2 || start.elapsed()>STREAM_PREFIX_TIMEOUT{
+    if auto {return Err("OBN5 native layout requires a valid header at the first committed ordinal".into());}
     return Err("could not bind the committed spectrum layout".into());
    }
    std::thread::sleep(STREAM_PREFIX_POLL);

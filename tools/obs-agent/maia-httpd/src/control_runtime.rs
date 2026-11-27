@@ -3061,7 +3061,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
         "video_manual_tx":demod_tx,
         "view_power_revision":if obn5 {regs.read(0xe4)} else {1},
         "spectrum_abi":if obn5 {"OBN5"} else if obn3 {"OBN3"} else {"OBN2"},
-        "ring_layout":if obn5{"detected on START"}else if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
+        "ring_layout":if c.bench_obn3_layout{"obn3-ram-displaced"}else if c.bench_split544{"split544"}else{"native"},"ps_tx_process_owner":guard_info[126]==1,"mixer":c.external_mixer.is_none(),"finite_field":c.field_preview.is_some()||c.resident_field.is_some(),"bench_roi":c.bench_roi.is_some(),
         "scan_tx_profiles":profiles,"scan_tx_rf":false,"scan_tx_attenuation":rf_guard && manual,
         "planner_v2":{"direct":true,"guarded_rf":rf_guard && manual,
         "path_ack_version":1,"path_ack_required_by_config":c.scan["path_ack_version"]==1 || xtg1.is_some(),

@@ -1,0 +1,32 @@
+{
+  "scan": {
+    "op": "scan",
+    "run": false,
+    "k": 2,
+    "ranges": [
+      {"lo_hz": 100000000, "hi_hz": 6000000000, "enabled": true, "path": "direct"}
+    ],
+    "fft_bins": 4096,
+    "view_bins": 1024,
+    "hold_k": 1023,
+    "view_delivery": "stream",
+    "antenna_bands": {
+      "0": [[70000000, 6000000000]],
+      "1": [[5000000000, 12000000000]]
+    },
+    "planner_version": 2,
+    "path_ack_version": 1,
+    "sweep_geometry": "27/9",
+    "xtg1_wait_ticks": 256
+  },
+  "analysis": {
+    "op": "analysis",
+    "center_hz": 5865000000,
+    "width_hz": 24000000,
+    "k": 500,
+    "fft_bins": 4096,
+    "view_bins": 4096,
+    "gain_db": 35,
+    "agc": "manual"
+  }
+}

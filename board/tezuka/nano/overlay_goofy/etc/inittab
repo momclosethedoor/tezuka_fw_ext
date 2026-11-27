@@ -33,7 +33,6 @@ null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
 
 # goofy (PL-4a): сторож аренды TX и сторож блока видео PL (E:/pl/docs/FW_BUILD.md, раздел 3)
 null::respawn:/usr/sbin/goofy_svc lease
-null::respawn:/usr/sbin/goofy_svc video
 
 # Put a getty on the serial port
 ttyPS0::respawn:/sbin/getty -L  ttyPS0 0 vt100 # GENERIC_SERIAL

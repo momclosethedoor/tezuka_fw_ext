@@ -1,0 +1,71 @@
+#!/bin/sh
+set -eu
+
+run_dir=/run/zefir
+payload=/usr/libexec/zefir
+pidfile=$run_dir/agent.pid
+
+prepare_radio() {
+    mkdir -p "$run_dir"
+    exec >>"$run_dir/boot.log" 2>&1
+    cd "$payload"
+    test "$(uname -r)" = 6.12.77
+    test "$(devmem 0x7c460050)" = 0x354E424F
+    test "$(devmem 0x7c4600e4)" = 0x00000002
+    test "$(devmem 0x7c4601c0)" = 0x00000400
+    test "$(devmem 0x7c4601c4)" = 0x00008000
+    test "$(devmem 0x7c4601c8)" = 0x00001000
+
+    if [ ! -c /dev/obs_dma ]; then
+        sh ./prepare-r3.sh
+        insmod ./obs_dma.ko cached=0
+    fi
+    test -c /dev/obs_dma
+    if [ "$(basename "$(readlink /sys/bus/spi/devices/spi0.0/driver)")" = ad9361 ]; then
+        sh ./guard-rebind.sh
+    fi
+    test "$(basename "$(readlink /sys/bus/spi/devices/spi0.0/driver)")" = ad9361-obs006d
+    sh ./calibrate.sh >"$run_dir/profiles.txt"
+    sh ./ddc4.sh
+    devmem 0x7c460284 32 0
+    test "$(devmem 0x7c460284)" = 0x00000000
+    test "$(cat /sys/bus/iio/devices/iio:device0/out_altvoltage1_TX_LO_powerdown)" = 1
+
+    host=$(fw_printenv -n ipaddr_host 2>/dev/null || echo 192.168.2.10)
+    if ! printf '%s\n' "$host" | awk -F. 'NF == 4 { for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1; valid=1 } END { if (!valid) exit 1 }'; then
+        echo "Invalid ipaddr_host"
+        exit 1
+    fi
+    jq --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --arg host "$host" \
+        --arg output "$run_dir/control" --arg collector "$payload/obs-ffm1-iio" '
+        . + {
+            boot_id: $boot, output: $output, bench_split544: false,
+            route: ($host + ":18008"), video: ($host + ":18009"),
+            view: ($host + ":18010"), roi: ($host + ":18011"),
+            resident_field: {collector: $collector, timeout_ms: 90}
+        }' "$payload/owner.json" >"$run_dir/owner.json"
+    exec /usr/bin/maia-delivery --system-control "$run_dir/owner.json" --listen 0.0.0.0:18080
+}
+
+case "${1:-}" in
+    start)
+        if grep -q dma_test_skip /proc/cmdline; then
+            exit 0
+        fi
+        mkdir -p "$run_dir"
+        start-stop-daemon -S -b -m -p "$pidfile" -x "$0" -- prepare
+        ;;
+    prepare)
+        prepare_radio
+        ;;
+    stop)
+        if [ -s "$pidfile" ]; then
+            start-stop-daemon -K -p "$pidfile" || true
+            /usr/sbin/goofy_tx_off zefir-stop 2
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac

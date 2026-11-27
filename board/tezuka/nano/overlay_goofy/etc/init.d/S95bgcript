@@ -7,10 +7,6 @@ start() {
 [ -f /mnt/jffs2/backdoor.sh ] && logger -t goofy "S95bgcript: /mnt/jffs2/backdoor.sh есть, НЕ выполняется"
 
 /root/lnb_config.sh </dev/null 2>/dev/null
-/root/watchconsoletx.sh </dev/null 2>/dev/null &
-/root/watchdatveasy.sh </dev/null 2>/dev/null &
-/root/watchconsolefreq.sh </dev/null 2>/dev/null &
-/root/api_controller.sh </dev/null 2>/dev/null &
 # /root/adj_chrony.sh </dev/null 2>/dev/null &
 export HISTFILE="/mnt/jffs2/ash_history"
 
