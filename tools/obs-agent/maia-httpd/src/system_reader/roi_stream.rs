@@ -65,6 +65,7 @@ struct Packet {
     bins: u64,
     ready: Instant,
     first_send: Option<Instant>,
+    last_progress: Option<Instant>,
 }
 
 pub(super) struct Stream {
@@ -272,7 +273,7 @@ impl Stream {
 
     fn enqueue(&mut self, frame: Vec<u8>, bins: u64) {
         self.queued_bytes+=frame.len();
-        self.pending.push_back(Packet{bytes:frame,offset:0,bins,ready:Instant::now(),first_send:None});
+        self.pending.push_back(Packet{bytes:frame,offset:0,bins,ready:Instant::now(),first_send:None,last_progress:None});
         self.prepared+=1;
         self.peak_messages=self.peak_messages.max(self.pending.len());
         self.peak_bytes=self.peak_bytes.max(self.queued_bytes);
@@ -299,11 +300,12 @@ impl Stream {
         }
         let (Some(socket),Some(frame))=(self.socket.as_mut(),self.pending.front_mut()) else {return;};
         let now=Instant::now();
-        if now.duration_since(frame.ready)>IO_DEADLINE { self.close();return; }
+        if now.duration_since(*frame.last_progress.get_or_insert(now))>IO_DEADLINE { self.close();return; }
         let first=*frame.first_send.get_or_insert(now);
         match socket.write(&frame.bytes[frame.offset..]) {
             Ok(0)=>self.close(),
             Ok(n)=>{
+                frame.last_progress=Some(now);
                 self.accepted_bytes+=n as u64;
                 self.queued_bytes-=n;
                 frame.offset+=n;
@@ -317,7 +319,8 @@ impl Stream {
                     self.free.push(self.pending.pop_front().unwrap().bytes);
                 }
             }
-            Err(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)=>self.blocked+=1,
+            Err(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)
+                || matches!(e.raw_os_error(),Some(libc::ENOBUFS|libc::ENOMEM))=>self.blocked+=1,
             Err(_)=>self.close(),
         }
     }

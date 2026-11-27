@@ -1,8 +1,10 @@
-use std::{io,net::UdpSocket,time::{Duration,Instant}};
+use std::{io,net::{SocketAddrV4,UdpSocket},time::{Duration,Instant}};
 use super::timing::Histogram;
+use super::view_pace::{self, ResultOfSend};
 pub(super) const MAX_SENDMMSG:usize=8;
 const MAX_BATCH_WAIT:Duration=Duration::from_millis(4);
 type SendDatagrams=fn(&UdpSocket,&[u8],usize)->io::Result<usize>;
+pub(super) type SendPackets = fn(&UdpSocket, Option<SocketAddrV4>, &[&[u8]]) -> io::Result<usize>;
 pub(super) struct DatagramBatch {
  pub calls:u64,pub wait:Histogram,
  send:SendDatagrams,
@@ -17,6 +19,11 @@ pub struct UdpBatch {
  pub rejected_before_queue:u64,pub suppressed:u64,
  pub(super) api_send:Histogram,pub(super) oldest_to_send:Histogram,
  pub(super) datagram_batch:Option<DatagramBatch>,
+ pub(super) paced:Option<view_pace::Queue>,
+ pub(super) unconnected:Option<SocketAddrV4>,
+ pub(super) send_packets:Option<SendPackets>,
+ pub(super) paced_batch_calls:u64,
+ pub(super) paced_batch_high:usize,
  first:Option<Instant>,record_size:usize,
 }
 impl UdpBatch {
@@ -26,7 +33,8 @@ impl UdpBatch {
    phase_on,send_ns:0,coalesce_us,max_wait_ns:0,first:None,record_size,send_calls:0,mtu:None,ip_fragmentation:false,oldest_wait_bins:[0;32],
    sent_bytes:0,high_records:0,would_block:0,send_errors:0,last_errno:None,
    notes_sent:0,notes_lost:0,transition:0,rejected_before_queue:0,suppressed:0,
-   api_send:Histogram::default(),oldest_to_send:Histogram::default(),datagram_batch:None}
+   api_send:Histogram::default(),oldest_to_send:Histogram::default(),datagram_batch:None,paced:None,unconnected:None,
+   send_packets:None,paced_batch_calls:0,paced_batch_high:0}
  }
  pub fn new(record_size:usize)->Self {
   let delay=std::env::var("OBS_VIEW_COALESCE_US").ok().and_then(|s|s.parse::<u64>().ok()).filter(|v|*v<=10000).unwrap_or(0);
@@ -34,6 +42,91 @@ impl UdpBatch {
   Self::configured(delay,std::env::var("OBS_PHASE_TIMING").as_deref()==Ok("1"),count,record_size)
  }
  pub fn record_size(&self)->usize{self.record_size}
+ #[cfg(test)]
+ pub(super) fn enable_paced(&mut self, rate: view_pace::Rate) {
+  self.paced = Some(view_pace::Queue::new(rate));
+ }
+ pub(super) fn configure_paced(&mut self, settings: view_pace::Settings, send: SendPackets) {
+  self.paced = Some(view_pace::Queue::configured(settings));
+  self.send_packets = Some(send);
+ }
+ pub(super) fn enqueue_paced(&mut self, header: &[u8], payload: &[u8]) {
+  if self.paced.as_mut().unwrap().push_record(header, payload, self.max_records, Instant::now()) {
+   self.pending += 1;
+   self.high_records = self.high_records.max(self.pending);
+  } else {
+   self.dropped += 1;
+   self.rejected_before_queue += 1;
+  }
+ }
+ pub(super) fn paced_completion(&mut self, bytes: &[u8; 24]) -> bool {
+  if self.paced.as_mut().unwrap().completion(bytes, Instant::now()) { true }
+  else { self.notes_lost += 1; false }
+ }
+ pub(super) fn finish_paced(&mut self, socket: &UdpSocket) {
+  let deadline = Instant::now() + Duration::from_millis(100);
+  while self.paced.as_ref().is_some_and(|queue| !queue.is_empty()) {
+   if Instant::now() >= deadline {
+    let (records, completions) = self.paced.as_mut().unwrap().cancel();
+    self.pending -= records;
+    self.dropped += records;
+    self.notes_lost += completions;
+    break;
+   }
+   if !self.flush_paced(socket) { std::thread::sleep(Duration::from_micros(100)); }
+  }
+ }
+ fn flush_paced(&mut self, socket: &UdpSocket) -> bool {
+  let now = Instant::now();
+  let peer = self.unconnected;
+  let send_one = |bytes: &[u8]| match peer {
+   Some(address) => socket.send_to(bytes, address),
+   None => socket.send(bytes),
+  };
+  let queue = self.paced.as_mut().unwrap();
+  let result = if let Some(send) = self.send_packets {
+   let calls = &mut self.paced_batch_calls;
+   queue.pump_many(now, |packets| {
+    if packets.len() == 1 {
+     send_one(packets[0]).map(|n| usize::from(n == packets[0].len()))
+    } else {
+     *calls += 1;
+     send(socket, peer, packets)
+    }
+   })
+  } else {
+   queue.pump(now, send_one)
+  };
+  match result {
+   ResultOfSend::Idle => return false,
+   ResultOfSend::Deferred(errno) => {
+    self.would_block += 1;
+    self.last_errno = errno;
+   }
+   ResultOfSend::Failed { records, errno } => {
+    self.pending -= records;
+    self.dropped += records;
+    self.notes_lost += u64::from(records == 0);
+    self.send_errors += 1;
+    self.last_errno = errno;
+   }
+   ResultOfSend::Sent { bytes, records, datagrams, age } => {
+    self.paced_batch_high = self.paced_batch_high.max(datagrams);
+    if records == 0 {
+     self.notes_sent += 1;
+    } else {
+     self.pending -= records;
+     self.sent += records;
+     self.datagrams += datagrams as u64;
+     self.sent_bytes += bytes as u64;
+    }
+    self.max_wait_ns = self.max_wait_ns.max(age.as_nanos());
+   }
+  }
+  self.send_calls += 1;
+  if self.phase_on { self.send_ns += now.elapsed().as_nanos(); }
+  true
+ }
  pub fn set_path_mtu(&mut self,mtu:u32){
   self.mtu=Some(mtu);
   let budget=mtu.saturating_sub(28) as usize; // IPv4 and UDP headers
@@ -47,13 +140,14 @@ impl UdpBatch {
  pub fn timer_due(&self,now:Instant)->bool {
   self.first.is_some_and(|t|now.saturating_duration_since(t)>=Duration::from_micros(self.coalesce_us))
  }
- pub fn flush_due(&mut self,s:&UdpSocket){if self.due(Instant::now()){self.flush(s);}}
+ pub fn flush_due(&mut self,s:&UdpSocket){if self.paced.is_some() || self.due(Instant::now()){self.flush(s);}}
  pub(super) fn enable_datagram_batch(&mut self,send:SendDatagrams){
   assert_eq!(self.max_records,1);
   self.bytes.reserve(self.record_size * MAX_SENDMMSG);
   self.datagram_batch=Some(DatagramBatch{calls:0,wait:Histogram::default(),send});
  }
  pub(super) fn stream_flush(&mut self,s:&UdpSocket){
+  if self.paced.is_some(){self.flush(s);return;}
   if self.datagram_batch.is_some() && self.pending<MAX_SENDMMSG as u64 &&
       self.first.is_some_and(|first|first.elapsed()<MAX_BATCH_WAIT){
    return;
@@ -63,6 +157,7 @@ impl UdpBatch {
  #[cfg(feature="scan-stream-bench")]
  pub(super) fn suppress_pending(&mut self){
   self.suppressed+=self.pending;
+  if let Some(queue) = self.paced.as_mut() { queue.discard(); }
   self.bytes.clear();self.pending=0;self.first=None;
  }
  pub fn completion(&mut self,s:&UdpSocket,bytes:&[u8])->bool {
@@ -80,6 +175,12 @@ impl UdpBatch {
   }
  }
  pub fn flush(&mut self,s:&UdpSocket){
+  if self.paced.is_some() {
+   for _ in 0..MAX_SENDMMSG {
+    if !self.flush_paced(s) { break; }
+   }
+   return;
+  }
   if self.pending==0{return}
   self.high_records=self.high_records.max(self.pending);
   let now=Instant::now();
