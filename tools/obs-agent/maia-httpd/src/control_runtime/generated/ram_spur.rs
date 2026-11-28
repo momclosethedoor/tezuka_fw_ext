@@ -4,8 +4,6 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Plan {
-    #[serde(default)]
-    all_mixer: bool,
     ranges: Value,
     antennas: Value,
     slots: Vec<i64>,
@@ -18,6 +16,7 @@ struct Visit {
     antenna: u64,
     rx: u64,
     pll: i64,
+    tx_gate_on: Option<bool>,
     side: i64,
     phase: String,
     segment: [u64; 2],
@@ -47,10 +46,12 @@ pub(super) fn load(state: &Value) -> Result<Option<Vec<Tile>>> {
     {
         return Ok(None);
     }
-    ensure!(state["xtg1_wait_ticks"].is_number(), "spur RAM scan requires managed TX gating");
+    if !state["xtg1_wait_ticks"].is_number() {
+        return Ok(None);
+    }
     let (threshold, mult) = environment()?;
     let [pll_min,pll_max] = mixer_limits(scan)?;
-    if plan.all_mixer && plan.slots.iter().any(|&pll| pll < pll_min || pll > pll_max) {
+    if plan.slots.iter().any(|&pll| pll < pll_min || pll > pll_max) {
         return Ok(None);
     }
     let slots = plan.visits.iter().filter_map(|v| (v.pll != 0).then_some(v.pll))
@@ -76,12 +77,13 @@ pub(super) fn load(state: &Value) -> Result<Option<Vec<Tile>>> {
             && bands.get(&v.antenna).is_some_and(|rs| rs.iter().any(|r| r[0] <= lo && hi <= r[1])),
             "invalid spur RAM RF interval");
         ensure!((70_000_000..=6_000_000_000).contains(&v.rx), "invalid spur RAM RX");
-        let tx = if v.pll == 0 {
-            ensure!(!plan.all_mixer && v.side == 1 && b <= threshold, "invalid spur RAM direct route");
+        let gate_on = v.tx_gate_on.unwrap_or(v.pll != 0);
+        let tx = if !gate_on {
+            ensure!(v.side == 1 && b <= threshold, "invalid spur RAM direct route");
             None
         } else {
             ensure!((pll_min..=pll_max).contains(&v.pll) && matches!(v.side,-1 | 1)
-                && (plan.all_mixer || a >= threshold), "invalid spur RAM mixer route");
+                && a >= threshold, "invalid spur RAM mixer route");
             let mixer_lo = (v.pll + OFFSET) * mult;
             let mut if_edges = [a as i64,b as i64].map(|f| v.side*(f-mixer_lo));
             if_edges.sort_unstable();
@@ -91,18 +93,12 @@ pub(super) fn load(state: &Value) -> Result<Option<Vec<Tile>>> {
         let tone = tx.map(|t| t.pll+OFFSET);
         let clean = grid_bench::lobes(v.segment,center,tx.map_or(0,|t| t.mixer_lo),v.side,tone);
         ensure!(clean.iter().any(|r| r[0] <= a && b <= r[1]), "spur RAM witness is outside capture");
-        tiles.push(Tile { rf:v.rf, antenna:v.antenna, tx, rx:v.rx, notify:None, hold:false,
+        let muted_tx_pll = (!gate_on && v.pll != 0).then_some(v.pll);
+        tiles.push(Tile { rf:v.rf, antenna:v.antenna, tx, muted_tx_pll, rx:v.rx, notify:None, hold:false,
             transition_only:false, handover:"none", grid:Some((phase,v.segment)),
             marker_path:None, rf_row:v.row, channel_bridge:v.bridge });
     }
     ensure!(offset_phase && tiles[0].grid.is_some_and(|(phase,_)| phase=="main"),
         "spur RAM plan requires both phases");
-    let mut tiles = transitions(state,&tiles)?;
-    if plan.all_mixer && state["route"]["kind"] != "mixer" {
-        let first = &mut tiles[0];
-        first.notify = Some(first.antenna);
-        first.hold = true;
-        first.marker_path = Some("mixer");
-    }
-    Ok(Some(tiles))
+    Ok(Some(transitions(state,&tiles)?))
 }

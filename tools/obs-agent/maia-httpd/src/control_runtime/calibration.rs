@@ -313,7 +313,7 @@ impl Cache {
         let joined = || tiles.iter().chain(next.iter().flat_map(|(_,tiles)| tiles));
         let rx_keys = joined().map(|v| v.rx).collect::<BTreeSet<_>>();
         let tx_keys = joined()
-            .filter_map(|v| v.tx.map(|t| t.pll as u64))
+            .filter_map(|v| v.recall_pll().map(|pll| pll as u64))
             .collect::<BTreeSet<_>>();
         ensure!(
             tiles.len() <= 65535 && rx_keys.len() <= 65535 && (catalog_only || tx_keys.len() <= 8),

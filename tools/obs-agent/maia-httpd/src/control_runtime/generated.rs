@@ -31,6 +31,7 @@ pub(super) struct Tile {
     pub rf: [u64; 2],
     pub antenna: u64,
     pub tx: Option<Tuning>,
+    muted_tx_pll: Option<i64>,
     pub rx: u64,
     notify: Option<u64>,
     hold: bool,
@@ -40,6 +41,12 @@ pub(super) struct Tile {
     marker_path: Option<&'static str>,
     pub rf_row: usize,
     channel_bridge: bool,
+}
+
+impl Tile {
+    pub(super) fn recall_pll(&self) -> Option<i64> {
+        self.tx.map(|t| t.pll).or(self.muted_tx_pll)
+    }
 }
 
 pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
@@ -358,6 +365,7 @@ pub(super) fn core_tiles(state: &Value) -> Result<Vec<Tile>> {
                 previous = Some(t.pll);
             }
             tiles.push(Tile {
+                muted_tx_pll: None,
                 rf: [lo, hi],
                 antenna,
                 tx,
@@ -586,14 +594,16 @@ pub(super) fn encode(
     let mut ranges = Vec::new();
     let first = tiles
         .iter()
-        .find_map(|v| v.tx)
-        .map(|t| txkeys.binary_search(&(t.pll as u64)).unwrap());
+        .find_map(Tile::recall_pll)
+        .map(|pll| txkeys.binary_search(&(pll as u64)).unwrap());
     put(&mut bytes, tail + 12, first.unwrap_or(0) as u32);
     for (i, v) in tiles.iter().enumerate() {
         let [a, b] = v.rf;
         let rx_hz = rx[&v.rx].0;
-        let slot = v.tx.map(|t| txkeys.binary_search(&(t.pll as u64)).unwrap());
-        let pll = slot.map(|s| tx[&txkeys[s]].0 as i64);
+        let slot = v.recall_pll().map(|pll| txkeys.binary_search(&(pll as u64)).unwrap());
+        let mixer = v.tx.is_some();
+        let recall_pll = slot.map(|s| tx[&txkeys[s]].0 as i64);
+        let pll = recall_pll.filter(|_| mixer);
         let tone = pll.map(|p| p + OFFSET);
         let offset = tone.map_or(0, |f| f * mult);
         let side = v.tx.map_or(1, |t| t.side);
@@ -623,7 +633,7 @@ pub(super) fn encode(
         let flags = slot.map_or(0, |s| 4 | ((s as u32) << 8))
             | v.notify.map_or(0, |id| 1 | ((id as u32) << 16))
             | if v.hold { 2 } else { 0 }
-            | if managed && slot.is_some() { 16 } else { 0 };
+            | if managed && mixer { 16 } else { 0 };
         for page in [40 + stride, 40 + 2 * stride] {
             let at = page + i * 32;
             put(&mut bytes, at, rxkeys.binary_search(&v.rx).unwrap() as u32);
@@ -647,7 +657,8 @@ pub(super) fn encode(
             ranges.extend(useful.iter().copied());
         }
         positions.push(json!({"rf_ranges":[v.rf],"rx_lo_hz":rx_hz,"rf_center_hz":center,"antenna":v.antenna,
-            "side_sign":side,"mixer":slot.is_some(),"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
+            "side_sign":side,"mixer":mixer,"tx_slot":slot,"tx_pll_hz":pll,"tx_tone_hz":tone,
+            "tx_recall_pll_hz":recall_pll,
             "mixer_lo_hz":tone.map(|_|offset),"if_edges_hz":if side==1 {[a as i64-offset,b as i64-offset]}else{[offset-b as i64,offset-a as i64]},
             "ddc_hz":0,"dc_clearance_hz":mixer_math::DC_CLEARANCE,"image_rf_hz":tone.map(|_|[2*offset-b as i64,2*offset-a as i64]),
             "image_in_antenna":tone.and_then(|_|antennas.get(&v.antenna).map(|bands|bands.iter().any(|r|
@@ -662,7 +673,7 @@ pub(super) fn encode(
         }
         let row = positions.last_mut().unwrap();
         row["marker_path"] = json!(v.marker_path);
-        row["tx_gate_requested"] = if managed {json!(slot.is_some())} else {Value::Null};
+        row["tx_gate_requested"] = if managed {json!(mixer)} else {Value::Null};
         if working_grid {
             row["rf_ranges"] = json!(useful);
             row["useful_if_ranges_hz"] = json!(useful.iter().map(|&[l,h]| {
