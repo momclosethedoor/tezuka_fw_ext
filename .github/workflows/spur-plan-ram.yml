@@ -1,0 +1,105 @@
+name: Spur planner ARM RAM build
+on:
+  push:
+    branches: [build/spur-plan-ram]
+    paths: ['tools/obs-agent/**']
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  pentium-math:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          rustc +1.94.0 --edition=2024 --test tools/obs-agent/owned-reader-tests.rs -o planner-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:OBS_VIEW_VECTOR_ROOT='tools/obs-agent/maia-httpd/tests/view'
+          $env:OBS_OBN2_VECTOR_ROOT='tools/obs-agent/maia-httpd/tests/observation-continuous'
+          ./planner-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc +1.94.0 --edition=2024 --test tools/obs-agent/maia-httpd/src/control_runtime/video_egress.rs -o real8-queue-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./real8-queue-tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc +1.94.0 --edition=2024 tools/obs-agent/mixer-check.rs -o mixer-check.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pentium-math
+          path: |
+            planner-tests.exe
+            mixer-check.exe
+  agent:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: obs-kernel-kit
+          path: kit
+          run-id: 43645241286
+          github-token: ${{ github.token }}
+      - name: Pinned6.12.77 toolchain
+        run: |
+          echo 'b16edd12130158ebdd41c816c644afdf221a5eda45fa17d432a892bf89c4140e  kit/kernel-kit.tar.zst' | sha256sum -c -
+          tar --zstd -xf kit/kernel-kit.tar.zst
+          sudo apt-get update -qq
+          sudo apt-get install -y libclang-dev libssl-dev pkg-config gfortran-arm-linux-gnueabihf
+          rustup toolchain install 1.94.0 --profile minimal --target armv7-unknown-linux-gnueabihf
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/obs-agent/maia-httpd/target
+          key: obs007a-agent-rust194-${{ hashFiles('tools/obs-agent/maia-httpd/Cargo.lock') }}
+      - name: Build main agent with in-process reader and preview
+        run: |
+          set -euo pipefail
+          rustc +1.94.0 --edition=2024 --test tools/obs-agent/owned-reader-tests.rs -o /tmp/owned-reader-tests
+          OBS_VIEW_VECTOR_ROOT=tools/obs-agent/maia-httpd/tests/view \
+          OBS_OBN2_VECTOR_ROOT=tools/obs-agent/maia-httpd/tests/observation-continuous \
+          /tmp/owned-reader-tests --nocapture
+          export PATH="$PWD/output/nano/host/bin:$PATH"
+          export OPENBLAS_TARGET=armv7 OPENBLAS_HOSTCC=gcc
+          export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
+          export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_INCLUDE_DIR=/usr/include
+          export PKG_CONFIG=/usr/bin/pkg-config
+          export OPENBLAS_CC="$PWD/output/nano/host/bin/arm-linux-gcc"
+          export CC_armv7_unknown_linux_gnueabihf="$OPENBLAS_CC"
+          export AR_armv7_unknown_linux_gnueabihf="$PWD/output/nano/host/bin/arm-linux-ar"
+          export OPENBLAS_FC="$PWD/output/nano/host/bin/arm-linux-gfortran"
+          if ! test -x "$OPENBLAS_FC"; then export OPENBLAS_FC=arm-linux-gnueabihf-gfortran; fi
+          export BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--sysroot=$($OPENBLAS_CC -print-sysroot)"
+          $OPENBLAS_CC -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-agent/maia-httpd/src/system_native/neon_sum.c -o "$PWD/agent-neon.o"
+          $OPENBLAS_CC -c -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard tools/obs-agent/maia-httpd/src/system_native/preview.c -o "$PWD/agent-preview.o"
+          export RUSTFLAGS="-C target-cpu=cortex-a9 -C link-arg=$PWD/agent-neon.o -C link-arg=$PWD/agent-preview.o -C link-arg=-ldl -C link-arg=-lm"
+          bench_args=()
+          ffm_args=()
+          if [[ "$GITHUB_REF_NAME" == build/arm-scan-stream-002 || "$GITHUB_REF_NAME" == build/pl-field-stream-001 || "$GITHUB_REF_NAME" == build/pl-fft-hold-002 ]]; then
+            bench_args=(--features scan-stream-bench)
+            ffm_args=(-DOBS_SCAN_STREAM_BENCH)
+          fi
+          cargo +1.94.0 build --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd --config "target.armv7-unknown-linux-gnueabihf.linker=\"$OPENBLAS_CC\"" "${bench_args[@]}"
+          mkdir agent-artifact
+          cp tools/obs-agent/maia-httpd/target/armv7-unknown-linux-gnueabihf/release/maia-httpd agent-artifact/
+          $OPENBLAS_CC -O2 -Wall tools/obs-guard/obs-field1.c -ldl -o agent-artifact/obs-field1
+          $OPENBLAS_CC -O2 -Wall -Wextra -Werror "${ffm_args[@]}" tools/obs-guard/obs-ffm1-iio.c -pthread -ldl -o agent-artifact/obs-ffm1-iio
+          output/nano/host/bin/arm-linux-readelf -h -A agent-artifact/maia-httpd > agent-artifact/elf.txt
+          if [[ ${#bench_args[@]} -ne 0 ]]; then
+            cargo +1.94.0 check --locked --release --target armv7-unknown-linux-gnueabihf --manifest-path tools/obs-agent/maia-httpd/Cargo.toml --bin maia-httpd
+          fi
+          find tools/obs-agent/maia-httpd/src -type f -exec sha256sum '{}' + > agent-artifact/source-sha256.txt
+          sha256sum tools/obs-guard/obs-field1.c tools/obs-guard/obs-ffm1-iio.c tools/obs-guard/obs-field-{capture,egress,preview}.h tools/obs-guard/obs-fsb1-stream.h tools/obs-guard/obs-watch-{io,policy}.h >> agent-artifact/source-sha256.txt
+          cp board/tezuka/nano/overlay_goofy/usr/sbin/goofy_lease.sh agent-artifact/
+          cd agent-artifact
+          sha256sum maia-httpd obs-field1 obs-ffm1-iio goofy_lease.sh elf.txt source-sha256.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: obs007c-main-agent
+          path: agent-artifact/
+
