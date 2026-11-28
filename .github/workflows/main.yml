@@ -189,7 +189,7 @@ jobs:
         with:
           name: obs007c-main-agent
           path: zefir-arm
-          run-id: 46048677905
+          run-id: 46084602519
           github-token: ${{ github.token }}
 
       - name: Stage ZEFIR ARM runtime
@@ -197,7 +197,9 @@ jobs:
         run: |
           set -euo pipefail
           (cd zefir-arm && sha256sum -c SHA256SUMS &&
-            echo 'b73e3bbef686c5f5a0e3a17ac905fcf816f821d0ad7a7fa20442d0c5f194c7bf  maia-httpd' | sha256sum -c -)
+            printf '%s\n' \
+              '45c63996541abe83a7fb1e638bdf2b911fbba0dbcfc76cc31aff6c31f01c1e80  maia-httpd' \
+              '45d809ecb4d4d92f0a801ea75e632e07a933675bdeae9e8f490243958f2a0fa6  obs-ffm1-iio' | sha256sum -c -)
           overlay=board/tezuka/nano/overlay_goofy
           install -Dm755 zefir-arm/maia-httpd "$overlay/usr/bin/maia-delivery"
           install -Dm755 zefir-arm/obs-ffm1-iio "$overlay/usr/libexec/zefir/obs-ffm1-iio"

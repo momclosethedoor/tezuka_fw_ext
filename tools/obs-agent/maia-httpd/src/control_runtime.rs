@@ -340,6 +340,10 @@ fn roi_source(spectrum: &Value, request: crate::system_reader::RoiRequest) -> Op
 fn validate(v: &Value) -> Result<()> {
     ensure!(v.get("loop").is_none(), "loop requires a running v2 scan with grid policy support");
     ensure!(v["op"] == "scan" || v.get("roi").is_none(), "embedded ROI requires scan");
+    if let Some(settings) = v.get("view_egress") {
+        ensure!(v["op"] == "scan", "VIEW egress requires scan");
+        crate::system_reader::view_egress_numbers(settings).map_err(anyhow::Error::msg)?;
+    }
     if v.get("tx_attenuation_mdb").is_some() {
         ensure!(v["op"] == "scan" && v["planner_version"] == 2,
             "tx_attenuation_mdb requires v2 scan");
@@ -1294,7 +1298,8 @@ fn acknowledge(
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted)
+                || matches!(e.raw_os_error(), Some(libc::ENOBUFS | libc::ENOMEM)) => return Ok(None),
             Err(_) => { r.stream = None; return Ok(None); }
         }
     }
@@ -1302,7 +1307,7 @@ fn acknowledge(
     match stream.read(&mut data) {
         Ok(0) => { r.stream = None; return Ok(None); }
         Ok(n) => r.input.extend_from_slice(&data[..n]),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => return Ok(None),
         Err(_) => { r.stream = None; return Ok(None); }
     }
     if r.input.len() > 512 {
@@ -1457,7 +1462,8 @@ fn video_counters(generation: u64, queue: &video_egress::Queue, finished: bool, 
         "send_would_block":c.would_block,"last_socket_errno":c.last_socket_errno,
         "queue_frames":queue.frames(),"queue_payload_bytes":queue.payload_bytes(),
         "queue_high_frames":c.high_frames,"queue_high_payload_bytes":c.high_payload_bytes,
-        "queue_overflow":c.overflow,"ready_to_send_ns":c.ready_to_send_ns.to_string(),
+        "queue_overflow":c.overflow,"queue_overflow_bytes":c.overflow_bytes,"reconnects":c.reconnects,
+        "ready_to_send_ns":c.ready_to_send_ns.to_string(),
         "max_ready_to_send_ns":c.max_ready_to_send_ns.to_string(),
         "finished":finished,"error":error,
         "source_bytes_not_packed":c.source_bytes-c.packed_bytes,
@@ -1489,17 +1495,7 @@ fn continuous(
     shared.inbox.lock().unwrap().metrics = video_counters(generation, &queue, false, None);
     // Connect before admitting samples. A slow or absent receiver cannot fill
     // IIO during connection setup.
-    let socket = TcpStream::connect_timeout(&c.video, Duration::from_millis(100))
-        .and_then(|mut conn| {
-            if c.video_packing {
-                conn.set_write_timeout(Some(Duration::from_millis(100)))?;
-                std::io::Write::write_all(&mut conn, b"R8H1")?;
-                conn.set_write_timeout(None)?;
-            }
-            conn.set_nonblocking(true)?;
-            Ok(conn)
-        });
-    let mut conn = match socket {
+    let mut link = match video_egress::Link::open(c.video, c.video_packing) {
         Ok(conn) => conn,
         Err(error) => {
             queue.counts.send_errors += 1;
@@ -1555,7 +1551,7 @@ fn continuous(
                 let mut packing = video_egress::Packing::Raw;
                 while !stopping() {
                     let previous_sent = queue.counts.frames;
-                    let sent = queue.pump(&mut conn).map_err(|e| anyhow!("real8 socket send: {e}"))?;
+                    let sent = link.pump(&mut queue);
                     if previous_sent == 0 && queue.counts.frames != 0 {
                         receipt(shared, state, id, None);
                     }
@@ -1581,8 +1577,13 @@ fn continuous(
                     have += n;
                     if have >= video_egress::MIN_BLOCK_BYTES {
                         let len = have & !3;
-                        if c.video_packing && queue.counts.packed_frames % 4 == 0 {
-                            packing.poll(&mut conn)?;
+                        if c.video_packing && queue.counts.packed_frames % 4 == 0
+                            && let Some(stream) = link.stream.as_mut()
+                            && let Err(error) = packing.poll(stream)
+                        {
+                            queue.counts.send_errors += 1;
+                            queue.counts.last_socket_errno = error.raw_os_error();
+                            link.disconnect(&mut queue);
                         }
                         queue.push(generation, &bytes[..len], Instant::now(), packing)?;
                         bytes.copy_within(len..have, 0);
@@ -1613,7 +1614,8 @@ fn continuous(
                     if !sent && n == 0 {
                         let mut fds = [
                             libc::pollfd {fd, events:libc::POLLIN, revents:0},
-                            libc::pollfd {fd:conn.as_raw_fd(), events:libc::POLLOUT, revents:0},
+                            libc::pollfd {fd:link.stream.as_ref().map_or(-1, |stream| stream.as_raw_fd()),
+                                          events:libc::POLLOUT, revents:0},
                         ];
                         let count = if queue.frames() == 0 {1} else {2};
                         if unsafe { libc::poll(fds.as_mut_ptr(), count, 4) } < 0 {
@@ -1972,6 +1974,9 @@ fn worker(
                     if op == "scan" {
                         pending["video"] = Value::Null;
                         pending["return_mode"] = Value::Null;
+                        if request.get("view_egress").is_none() && let Some(saved) = pending["scan"].get("view_egress") {
+                            request["view_egress"] = saved.clone();
+                        }
                         if request.get("gain_db").is_some() {
                             pending["scan_rx"] = json!({"agc":"manual","gain_db":request["gain_db"]});
                         }
@@ -2352,11 +2357,13 @@ fn worker(
             let stream_config=if obn5 {
                 Some(match settings["fft_bins"].as_u64().unwrap_or(4096) {4096=>0,2048=>2,1024=>4,_=>bail!("OBN5 FFT length")})
             } else {view_only.then_some(0)};
+            let view_egress = settings.get("view_egress").map(crate::system_reader::view_egress_numbers)
+                .transpose().map_err(anyhow::Error::msg)?;
             let cfg = json!({"boot_id":c.boot_id,"output":work,"command":"rate","k":k,"mode":mode_index,
                 "peak":settings["spectrum_detector"]=="peak","previous_mode":if obn5{0}else{mode_index},
                 "seconds":1.0,"warmup":0.0,"shift544":c.bench_split544,"bench_obn3_layout":c.bench_obn3_layout,"settling":0,"batch_limit":64,"direct":c.bench_split544,"batch_sync":true,
                 "neon":true,"hot":scan,"scan":scan,"tx_active":tx_active,
-                "stream_config":stream_config,"hold_k":settings["hold_k"],"bench_obn3_view_only":view_only,
+                "stream_config":stream_config,"hold_k":settings["hold_k"],"view_egress":view_egress,"bench_obn3_view_only":view_only,
                 "udp":(!roi_only).then(||c.view.to_string()),"trace_limit":0,"send_after_release":true,"managed_tx":managed_tx});
             let applied = std::cell::Cell::new(false);
             let initial_version = actual.borrow()["map_version"].as_u64().unwrap_or(0) as u32;
@@ -3068,6 +3075,7 @@ pub async fn run(path: &Path, listen: SocketAddr) -> Result<()> {
     let rf_guard = guard_info[114] == 1;
     let view_modes: &[u32] = if obn5 { &[0,128,256,512,1024,2048,4096] } else if stream002 { &[0,512,1024,2048] } else { &[512,1024,2048] };
     let capabilities = json!({"tx_on":manual,"scan_gain":true,"view_bins":view_modes,"view_delivery_reads_full":obn3&&!c.bench_obn3_view_only,
+        "view_egress":std::env::var("OBS_VIEW_LEGACY_BATCH").as_deref()!=Ok("1"),
         "spectrum_detector":obn5,"analysis_scan_ranges":true,
         "analysis_max_width_hz":if obn5{56_000_000}else{48_000_000},
         "roi":c.roi.is_some(),"roi_exact_bins":c.roi.is_some(),"scan_roi_only":c.roi.is_some(),

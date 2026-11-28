@@ -82,6 +82,37 @@ mod tests {
         assert_eq!(summary(&data[5]),0xc0000002);
         assert!(run(&[],100).is_empty());
     }
+
+    #[test]
+    fn stream_boundary_enqueues_completion_without_sending_a_burst() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.connect(receiver.local_addr().unwrap()).unwrap();
+        let mut net = UdpBatch::configured(0,false,2,552);
+        net.enable_paced(super::super::view_pace::Rate { packets: 0, bytes: 0 });
+        let spec = SweepSpec::from_layout(vec![Some(0),Some(0),Some(1),Some(1)],"stream").unwrap();
+        let mut delivery = Delivery::new(&spec,100,7,&mut net).unwrap();
+        for epoch in 100..104 {
+            delivery.accept(Header {first_seq:0,last_seq:1,ordinal:epoch-100,epoch,
+                first_tick:0,bins:4096,k:2,flags:9}, &[0;512], &mut net, &sender);
+        }
+        delivery.finish_drained(&mut net, &sender, 103);
+        assert_eq!((net.sent, net.notes_sent, net.pending), (0, 0, 4));
+        delivery.poll(&mut net, &sender);
+        assert_eq!((net.sent, net.notes_sent, net.pending), (4, 2, 0));
+        let mut packet = [0; 1200];
+        for pass in 0..2 {
+            let size = receiver.recv(&mut packet).unwrap();
+            assert_eq!(size, 1104);
+            assert_eq!(u64::from_le_bytes(packet[12..20].try_into().unwrap()), 100 + pass * 2);
+            let size = receiver.recv(&mut packet).unwrap();
+            assert_eq!(&packet[..4], b"GEND");
+            assert_eq!(size, 24);
+            assert_eq!(u64::from_le_bytes(packet[12..20].try_into().unwrap()), pass);
+            assert_eq!(summary(&packet[..size]), 0xc0000002);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -154,7 +185,8 @@ impl<'a> Delivery<'a> {
             if bytes > MAX_BYTES {
                 return Err("one scan pass exceeds the bounded VIEW buffer".into());
             }
-            net.bytes.reserve(bytes);
+            if let Some(queue) = net.paced.as_mut() { queue.hold_until_completion(); }
+            else { net.bytes.reserve(bytes); }
         }
         Ok(Self{spec,anchor,generation,pass:None,completed:None,outcome:None,notes_sent:0,notes_lost:0,peak_bytes:0})
     }
@@ -168,13 +200,19 @@ impl<'a> Delivery<'a> {
         let id = 2*(relative/count)+assigned as u64;
         if self.completed.is_some_and(|old| id<=old) {net.suppressed+=1;return;}
         if self.pass.as_ref().is_some_and(|p| p.id != id) {self.close(net,sock,true,Some(id));}
-        let pass = self.pass.get_or_insert(Pass{id,phase,last_epoch:h.epoch,observed:0,drops_before:net.dropped});
+        let drops = if net.paced.is_some() { net.rejected_before_queue } else { net.dropped };
+        let pass = self.pass.get_or_insert(Pass{id,phase,last_epoch:h.epoch,observed:0,drops_before:drops});
         if self.spec.positions[position].is_some() {
             if pass.observed == 0 || pass.last_epoch != h.epoch {pass.observed+=1;}
             pass.last_epoch = h.epoch;
         }
         if self.spec.positions[position].is_none() {net.transition+=1;}
         if view.is_empty() {
+            return;
+        }
+        if net.paced.is_some() {
+            net.enqueue_paced(&header(h,self.generation,0), view);
+            self.peak_bytes = self.peak_bytes.max(net.paced.as_ref().unwrap().bytes());
             return;
         }
         if net.bytes.len()+net.record_size() <= MAX_BYTES {
@@ -194,7 +232,7 @@ impl<'a> Delivery<'a> {
     }
 
     pub(super) fn poll(&self,net:&mut UdpBatch,sock:&UdpSocket) {
-        if self.spec.streams() {
+        if self.spec.streams() || net.paced.is_some() {
             net.stream_flush(sock);
         }
     }
@@ -213,6 +251,13 @@ impl<'a> Delivery<'a> {
 
     fn close(&mut self,net:&mut UdpBatch,sock:&UdpSocket,executed:bool,next:Option<u64>) {
         let Some(pass) = self.pass.take() else {return};
+        if net.paced.is_some() {
+            let dropped = net.rejected_before_queue.saturating_sub(pass.drops_before).min(MAX_DROPS) as u32;
+            let summary = (1 << 31) | (u32::from(executed) << 30) | (dropped << 16) | pass.observed as u32;
+            self.send_outcome(net,sock,&Outcome { ident:pass.id,summary,copies:0 });
+            self.completed = Some(pass.id);
+            return;
+        }
         net.flush(sock);
         if let Some(previous) = self.outcome.take().filter(|outcome| outcome.copies == 0) {
             self.send_outcome(net,sock,&previous);
@@ -234,7 +279,8 @@ impl<'a> Delivery<'a> {
         message[4..12].copy_from_slice(&self.generation.to_le_bytes());
         message[12..20].copy_from_slice(&outcome.ident.to_le_bytes());
         message[20..].copy_from_slice(&outcome.summary.to_le_bytes());
-        if net.completion(sock,&message) {self.notes_sent+=1;}
+        if net.paced.is_some() { net.paced_completion(&message); }
+        else if net.completion(sock,&message) {self.notes_sent+=1;}
         else {self.notes_lost+=1;}
     }
 }

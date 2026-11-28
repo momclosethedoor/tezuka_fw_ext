@@ -15,7 +15,7 @@ struct field_packet {
     size_t length, used;
     enum field_message kind;
     uint64_t tag;
-    double ready, first_send;
+    double ready, first_send, last_progress;
 };
 
 struct field_egress {
@@ -66,6 +66,7 @@ static int field_queue(struct field_egress *q, enum field_message kind, uint64_t
     p->tag=tag;
     p->ready=ready;
     p->first_send=0;
+    p->last_progress=0;
     ++q->count;
     q->bytes+=p->length;
     if (q->count>q->peak) q->peak=q->count;
@@ -88,13 +89,16 @@ static void field_pump(struct field_egress *q)
     if (!q->count) return;
     struct field_packet *p=&q->packets[q->head];
     double now=monotonic();
-    if (now-p->ready>FIELD_SEND_DEADLINE_S) { field_abandon(q);return; }
+    if (p->last_progress && now-p->last_progress>FIELD_SEND_DEADLINE_S) { field_abandon(q);return; }
+    if (!p->last_progress) p->last_progress=now;
     if (!p->first_send) p->first_send=now;
     size_t left=p->length-p->used;
     ssize_t n=send(q->fd,p->bytes+p->used,left>FIELD_SEND_SLICE ? FIELD_SEND_SLICE : left,MSG_NOSIGNAL);
-    if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)) { ++q->blocked;return; }
+    if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR ||
+                errno==ENOBUFS || errno==ENOMEM)) { ++q->blocked;return; }
     if (n<=0) { field_abandon(q);return; }
     q->accepted_bytes+=(size_t)n;
+    p->last_progress=now;
     p->used+=(size_t)n;
     q->bytes-=(size_t)n;
     int queued;

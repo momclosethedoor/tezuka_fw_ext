@@ -3,6 +3,9 @@ mod continuous;
 mod view;
 mod discard;
 mod view_batch;
+mod view_pace;
+mod view_send;
+use view_send::send_view_packets;
 mod sweep_delivery;
 mod progress;
 mod obn3;
@@ -61,6 +64,7 @@ impl SweepSpec {
  #[serde(default)]mode:u32,#[serde(default)]peak:bool,#[serde(default)]scan:bool,
  #[serde(default)]stream_config:Option<u32>,
  #[serde(default)]hold_k:Option<u32>,
+ #[serde(default)]view_egress:Option<[u32;4]>,
  #[serde(default)]bench_obn3_layout:bool,
  #[serde(default)]bench_obn3_view_only:bool,
  #[serde(default="settledefault")]settling:u32,#[serde(default="secondsdefault")]seconds:f64,
@@ -600,18 +604,9 @@ fn send_view_datagrams(socket: &std::net::UdpSocket, bytes: &[u8], record_size: 
 {
     let count = bytes.len() / record_size;
     debug_assert!((1..=view_batch::MAX_SENDMMSG).contains(&count));
-    let mut iov: [libc::iovec; view_batch::MAX_SENDMMSG] = unsafe { std::mem::zeroed() };
-    let mut messages: [libc::mmsghdr; view_batch::MAX_SENDMMSG] = unsafe { std::mem::zeroed() };
-    for (index, packet) in bytes.chunks_exact(record_size).enumerate() {
-        iov[index].iov_base = packet.as_ptr().cast_mut().cast();
-        iov[index].iov_len = packet.len();
-        messages[index].msg_hdr.msg_iov = &mut iov[index];
-        messages[index].msg_hdr.msg_iovlen = 1;
-    }
-    let sent = unsafe {
-        libc::sendmmsg(socket.as_raw_fd(), messages.as_mut_ptr(), count as libc::c_uint, libc::MSG_DONTWAIT)
-    };
-    if sent < 0 { Err(std::io::Error::last_os_error()) } else { Ok(sent as usize) }
+    let mut packets = [&[][..]; view_batch::MAX_SENDMMSG];
+    for (slot, packet) in packets.iter_mut().zip(bytes.chunks_exact(record_size)) { *slot = packet; }
+    send_view_packets(socket, None, &packets[..count])
 }
 
 fn histogram(h:timing::Histogram)->Value {
@@ -621,6 +616,19 @@ fn histogram(h:timing::Histogram)->Value {
 fn udp_socket_queue(socket:&std::net::UdpSocket)->Option<i32> {
  let mut value=0i32;
  (unsafe{libc::ioctl(socket.as_raw_fd(),libc::TIOCOUTQ,&mut value)}==0).then_some(value)
+}
+
+pub(crate) fn view_egress_numbers(value: &Value) -> R<[u32;4]> {
+ let mut settings = [0;4];
+ let keys = ["batch", "queue_mib", "packets_per_s", "payload_bytes_per_s"];
+ let values = value.as_object().filter(|values| values.len() == keys.len())
+     .ok_or("VIEW egress needs batch, queue_mib, packets_per_s and payload_bytes_per_s")?;
+ for (out, key) in settings.iter_mut().zip(keys) {
+  *out = values.get(key).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+      .ok_or_else(|| format!("VIEW egress {key} must be an unsigned integer"))?;
+ }
+ view_pace::Settings::from_numbers(settings)?;
+ Ok(settings)
 }
 
 fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
@@ -664,13 +672,20 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   return Ok(())
  }
  if c.command!="rate"&&c.command!="drain"{return Err("command must be capture, drain, rate".into())}
- if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
- let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split(control,c)?}else{Value::Null};
- save(c,"cold-start.json",&cold)?;
- let initial=io.snapshot()?;
- let mut reader=view::PairReader::attach(initial)?;
- let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
- let socket=if let Some(dest)=&c.udp{let sock=std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e|e.to_string())?;sock.connect(dest).map_err(|e|e.to_string())?;sock.set_nonblocking(true).map_err(|e|e.to_string())?;Some(sock)}else{None};
+ let paced = (control.is_some() && c.udp.is_some()
+     && std::env::var("OBS_VIEW_LEGACY_BATCH").as_deref() != Ok("1"))
+     .then(|| c.view_egress.map_or_else(view_pace::Settings::from_env, view_pace::Settings::from_numbers))
+     .transpose()?;
+ let mut unconnected = None;
+ let socket = if let Some(dest) = &c.udp {
+  let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+  socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+  if let Err(error) = socket.connect(dest) {
+   if paced.is_none() || !view_pace::retryable(&error) { return Err(error.to_string()); }
+   unconnected = Some(dest.parse::<std::net::SocketAddrV4>().map_err(|e| e.to_string())?);
+  }
+  Some(socket)
+ } else { None };
  let record_bytes=(if control.is_some(){sweep_delivery::HEADER_BYTES}else{56})+wire_view_bins;
  let network=std::cell::RefCell::new(UdpBatch::new(record_bytes));let mut status_due=Instant::now();let mut begin_link=Value::Null;let mut end_link=Value::Null;let mut begin_network=serde_json::Value::Null;let mut end_network=serde_json::Value::Null;
  if control.is_some() && let Some(sock)=&socket{
@@ -679,12 +694,17 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   let mut mtu:libc::c_int=0;
   let mut len=std::mem::size_of_val(&mtu) as libc::socklen_t;
   let fd=sock.as_raw_fd();
-  if unsafe{libc::getsockopt(fd,libc::IPPROTO_IP,libc::IP_MTU,(&mut mtu as *mut libc::c_int).cast(),&mut len)}!=0 || mtu<=28{
+  if unconnected.is_some() {
+   mtu = 1500;
+  } else if unsafe{libc::getsockopt(fd,libc::IPPROTO_IP,libc::IP_MTU,(&mut mtu as *mut libc::c_int).cast(),&mut len)}!=0 || mtu<=28{
    return Err("managed VIEW needs an IPv4 route MTU".into());
   }
   net.set_path_mtu(mtu as u32);
-  if obn5 && matches!(wire_view_bins,1024|2048) && net.max_records==1 &&
-      control.and_then(|q|q.sweep).is_some_and(SweepSpec::streams) {
+  if let Some(settings) = paced {
+   net.configure_paced(settings, send_view_packets);
+   net.unconnected = unconnected;
+  } else if obn5 && matches!(wire_view_bins,1024|2048) && net.max_records==1 &&
+     control.and_then(|q|q.sweep).is_some_and(SweepSpec::streams) {
    net.enable_datagram_batch(send_view_datagrams);
   }
   if net.ip_fragmentation {
@@ -695,6 +715,12 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    }
   }
  }
+ if c.discard_cold{let s=io.snapshot()?;if s.running||s.dma_busy||s.released!=0||s.committed==0{return Err("cold discard only stopped retained ordinal0".into())}io.release(s.cookie,1)?;}
+ let cold=if c.command=="rate"{io.prepare(c)?;io.start()?;io.cold_split(control,c)?}else{Value::Null};
+ save(c,"cold-start.json",&cold)?;
+ let initial=io.snapshot()?;
+ let mut reader=view::PairReader::attach(initial)?;
+ let start=Instant::now();let mut deadline=c.warmup+c.seconds;let mut begin=None;let mut end=None;let mut records=Vec::<[u64;7]>::with_capacity(c.trace_limit);let mut trace_omitted=0u64;let mut max_service_us=0u64;let mut max_poll_us=0u64;let mut last_poll=Instant::now();let mut route_failure=None;
  let initial_anchor=io.live64(0x238);
  let sweeps=std::cell::RefCell::new(control.and_then(|q|q.sweep.map(|spec|
    sweep_delivery::Delivery::new(spec,initial_anchor,q.generation,&mut network.borrow_mut()))).transpose()?);
@@ -756,17 +782,21 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
    if let Some(sweep)=sweeps.borrow_mut().as_mut() {
     sweep.accept(h,overview,&mut net,sock);
    } else if !overview.is_empty() {
-    net.start_record();
-    if let Some(q)=control {
-     net.bytes.extend_from_slice(&sweep_delivery::header(h,q.generation,0));
-    }else{
-     net.bytes.extend_from_slice(b"GVIEW3\0\0");
-     for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64] {
-      net.bytes.extend_from_slice(&x.to_le_bytes());
+    if net.paced.is_some() && let Some(q) = control {
+     net.enqueue_paced(&sweep_delivery::header(h,q.generation,0),overview);
+    } else {
+     net.start_record();
+     if let Some(q)=control {
+      net.bytes.extend_from_slice(&sweep_delivery::header(h,q.generation,0));
+     }else{
+      net.bytes.extend_from_slice(b"GVIEW3\0\0");
+      for x in [h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64] {
+       net.bytes.extend_from_slice(&x.to_le_bytes());
+      }
      }
+     net.bytes.extend_from_slice(overview);net.pending+=1;
+     if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}
     }
-    net.bytes.extend_from_slice(overview);net.pending+=1;
-    if net.pending==net.max_records as u64&&!c.send_after_release{net.flush(sock);}
    }}
   if c.trace_limit!=0{if records.len()<c.trace_limit{records.push([h.ordinal,h.first_seq,h.epoch,h.first_tick,h.k as u64,h.flags as u64,start.elapsed().as_nanos()as u64]);}else{trace_omitted+=1;}}Ok(())
  };
@@ -845,6 +875,7 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
   zoom.close();
  }
+ if let Some(sock) = &socket { network.borrow_mut().finish_paced(sock); }
  if let Ok(mut v)=mark(&mut io,&reader,start){
   v["network"]=network.borrow().counts();
   v["network"]["socket_pending_bytes"]=json!(socket.as_ref().and_then(udp_socket_queue));
@@ -868,7 +899,10 @@ fn execute(c:&Config,control:Option<&RunControl<'_>>)->R<()>{
   }
  }
  if io.pressure_on{save(c,"pressure.json",&json!({"columns":["board_monotonic_ns","reserved","committed","physical_released"],"period_min_ms":2,"omitted":io.pressure_omitted,"samples":io.pressure}))?;}
- let sweep_network=sweeps.borrow().as_ref().map(|s|json!({"completion_datagrams":s.notes_sent,"completion_send_drop":s.notes_lost,"peak_payload_bytes":s.peak_bytes}));
+ let sweep_network=sweeps.borrow().as_ref().map(|s| {
+  let net = network.borrow();
+  json!({"completion_datagrams":net.notes_sent,"completion_send_drop":net.notes_lost,"peak_payload_bytes":s.peak_bytes})
+ });
  let result=json!({"begin":begin,"end":end,"measured":measured,"after":after,"cold_start":cold,"full_read_total":reader.read,"consumed_total":reader.consumed,"trace_rows":records.len(),"trace_omitted":trace_omitted,"consumer":if managed_view_only{"owned metadata and VIEW, release, then VIEW send"}else{"ALL4096 volatile read, release, then VIEW send and trace; no full queue or checksum"},"network_spectrum":c.udp.is_some(),"udp_sent":network.borrow().sent,"udp_drop":network.borrow().dropped,"udp_datagrams":network.borrow().datagrams,"udp_batch_max":network.borrow().max_records,"sweep_network":sweep_network,"begin_interface":begin_link,"end_interface":end_link,"begin_network":begin_network,"end_network":end_network,"strategy":{"read_without_sum":c.read_without_sum,"send_after_release":c.send_after_release,"reuse_owned_cache":c.reuse_owned_cache,"batch_sync":c.batch_sync,"direct":c.direct,"release_only":c.release_only,"batch_limit":c.batch_limit,"aligned":c.aligned,"neon":c.neon},"memory_final":memory(),"seconds_total":start.elapsed().as_secs_f64()});save(c,"result.json",&result)?;println!("{}",result);Ok(())
 }
 
@@ -880,16 +914,19 @@ pub(crate) fn run_controlled(data:&[u8],q:&RunControl<'_>)->R<()>{let c:Config=s
 
 impl UdpBatch {
  fn counts(&self)->Value{json!({"sent":self.sent,"sent_bytes":self.sent_bytes,"dropped":self.dropped,
-  "datagrams":self.datagrams,"send_calls":self.send_calls,"path_mtu":self.mtu,"ip_fragmentation":self.ip_fragmentation,"pending":self.pending,"pending_bytes":self.bytes.len(),"queue_high_records":self.high_records.max(self.pending),
+  "datagrams":self.datagrams,"send_calls":self.send_calls,"path_mtu":self.mtu,"ip_fragmentation":self.ip_fragmentation,"pending":self.pending,"pending_bytes":self.paced.as_ref().map_or(self.bytes.len(),view_pace::Queue::bytes),"queue_high_records":self.high_records.max(self.pending),
   "send_errors":self.send_errors,"send_would_block":self.would_block,"last_socket_errno":self.last_errno,
   "admitted_records":self.sent+self.dropped+self.pending-self.rejected_before_queue,
   "rejected_before_queue":self.rejected_before_queue,"transition_records":self.transition,"suppressed_records":self.suppressed,
   "completion_sent":self.notes_sent,"completion_send_drop":self.notes_lost,
   "send_ns":self.send_ns.to_string(),"phase_timing":self.phase_on,"coalesce_us":self.coalesce_us,
   "max_records":self.max_records,"max_wait_ns":self.max_wait_ns.to_string(),"oldest_view_wait_ns_pow2":self.phase_on.then_some(self.oldest_wait_bins),
-  "datagrams_per_call_limit":if self.datagram_batch.is_some(){view_batch::MAX_SENDMMSG}else{1},
-  "sendmmsg_calls":self.datagram_batch.as_ref().map_or(0,|batch|batch.calls),
+  "datagrams_per_call_limit":self.paced.as_ref().map_or(if self.datagram_batch.is_some(){view_batch::MAX_SENDMMSG}else{1},|q|q.batch),
+  "sendmmsg_calls":self.paced_batch_calls+self.datagram_batch.as_ref().map_or(0,|batch|batch.calls),
   "datagram_batch_wait":self.datagram_batch.as_ref().map(|batch|histogram(batch.wait)),
+  "pacing":self.paced.as_ref().map(|q|json!({"packets_per_s":q.rate.packets,"payload_bytes_per_s":q.rate.bytes,
+    "queue_budget_bytes":q.budget,"queue_datagrams_per_call":q.batch,"queue_datagrams_per_call_high":self.paced_batch_high,
+    "high_bytes":q.high_bytes,"cancelled_at_stop":q.cancelled})),
   "api_send_ns":self.phase_on.then(||histogram(self.api_send)),
   "batch_oldest_to_api_complete_ns":self.phase_on.then(||histogram(self.oldest_to_send)),})}
 }

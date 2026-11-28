@@ -3,13 +3,92 @@
 use std::{
     collections::VecDeque,
     io::{self, Read, Write},
-    time::Instant,
+    net::{SocketAddr, TcpStream},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 pub const MIN_BLOCK_BYTES: usize = 16384;
 pub const MAX_BLOCK_BYTES: usize = 65536;
-pub const MAX_FRAMES: usize = 8;
+pub const MAX_FRAMES: usize = 512;
+pub const MAX_QUEUE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const NO_CRC: u32 = 1 << 31;
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+pub struct Link {
+    pub stream: Option<TcpStream>,
+    address: SocketAddr,
+    negotiate: bool,
+    retry_at: Instant,
+    connecting: Option<JoinHandle<io::Result<TcpStream>>>,
+}
+
+impl Link {
+    pub fn open(address: SocketAddr, negotiate: bool) -> io::Result<Self> {
+        Ok(Self { stream: Some(Self::connect(address, negotiate)?), address, negotiate,
+            retry_at: Instant::now(), connecting: None })
+    }
+
+    fn connect(address: SocketAddr, negotiate: bool) -> io::Result<TcpStream> {
+        let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)?;
+        if negotiate {
+            stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+            stream.write_all(b"R8H1")?;
+            stream.set_write_timeout(None)?;
+        }
+        stream.set_nonblocking(true)?;
+        Ok(stream)
+    }
+
+    pub fn disconnect(&mut self, queue: &mut Queue) {
+        self.stream = None;
+        queue.rewind_partial_frame();
+        self.retry_at = Instant::now();
+    }
+
+    pub fn pump(&mut self, queue: &mut Queue) -> bool {
+        if let Some(stream) = self.stream.as_mut() {
+            return match queue.pump(stream) {
+                Ok(progress) => progress,
+                Err(_) => { self.disconnect(queue); false }
+            };
+        }
+        if self.connecting.as_ref().is_some_and(|attempt| attempt.is_finished()) {
+            match self.connecting.take().unwrap().join() {
+                Ok(Ok(stream)) => {
+                    self.stream = Some(stream);
+                    queue.counts.reconnects += 1;
+                    return true;
+                }
+                Ok(Err(error)) => {
+                    queue.counts.send_errors += 1;
+                    queue.counts.last_socket_errno = error.raw_os_error();
+                }
+                Err(_) => queue.counts.send_errors += 1,
+            }
+        }
+        let now = Instant::now();
+        if self.connecting.is_none() && now >= self.retry_at {
+            let (address, negotiate) = (self.address, self.negotiate);
+            self.retry_at = now + RETRY_DELAY;
+            match thread::Builder::new().name("real8-connect".into()).spawn(move || Self::connect(address, negotiate)) {
+                Ok(attempt) => self.connecting = Some(attempt),
+                Err(error) => {
+                    queue.counts.send_errors += 1;
+                    queue.counts.last_socket_errno = error.raw_os_error();
+                }
+            }
+        }
+        false
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let Some(attempt) = self.connecting.take() { let _ = attempt.join(); }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 pub enum Packing {
@@ -23,6 +102,7 @@ impl Packing {
     pub fn poll(&mut self, socket: &mut impl Read) -> io::Result<()> {
         let mut commands = [0; 32];
         let count = match socket.read(&mut commands) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => n,
             Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => return Ok(()),
             Err(error) => return Err(error),
@@ -122,6 +202,8 @@ pub struct Counters {
     pub send_ns: u128,
     pub would_block: u64,
     pub overflow: u64,
+    pub overflow_bytes: u64,
+    pub reconnects: u64,
     pub high_frames: usize,
     pub high_payload_bytes: usize,
     pub max_ready_to_send_ns: u128,
@@ -155,15 +237,16 @@ impl Queue {
     }
 
     pub fn push(&mut self, generation: u64, payload: &[u8], ready: Instant, mode: Packing) -> io::Result<()> {
-        if self.frames() == MAX_FRAMES {
-            self.counts.overflow += 1;
-            return Err(io::Error::other("real8 transport queue exhausted"));
-        }
         if payload.is_empty() || payload.len() > MAX_BLOCK_BYTES || payload.len() % 4 != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "unaligned real8 block"));
         }
+        if self.frames() == MAX_FRAMES || self.payload_bytes() + payload.len() as u64 > MAX_QUEUE_PAYLOAD_BYTES as u64 {
+            self.counts.overflow += 1;
+            self.counts.overflow_bytes += payload.len() as u64;
+            return Ok(());
+        }
         let start = Instant::now();
-        let mut buffer = self.buffers.pop().unwrap_or_else(|| Vec::with_capacity(MAX_BLOCK_BYTES + 192));
+        let mut buffer = self.buffers.pop().unwrap_or_else(|| Vec::with_capacity(payload.len() + 192));
         buffer.clear();
         let packed = !matches!(mode, Packing::Raw);
         let header = if packed { 24 } else { 12 };
@@ -171,8 +254,8 @@ impl Queue {
         buffer.extend_from_slice(&[0; 4]);
         buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buffer.resize(header, 0);
-        let pos = self.counts.packed_bytes;
-        let seq = self.counts.packed_frames as u32;
+        let pos = self.counts.packed_bytes + self.counts.overflow_bytes;
+        let seq = (self.counts.packed_frames + self.counts.overflow) as u32;
         write!(buffer, "{{\"generation\":{generation},\"pos\":{pos},\"seq\":{seq},\"code\":{},\"g\":0,\"reset\":{}}}",
             self.code, self.counts.packed_frames == 0)?;
         let payload_offset = buffer.len();
@@ -199,6 +282,10 @@ impl Queue {
         self.counts.high_payload_bytes = self.counts.high_payload_bytes.max(self.payload_bytes() as usize);
         self.counts.pack_ns += start.elapsed().as_nanos();
         Ok(())
+    }
+
+    pub fn rewind_partial_frame(&mut self) {
+        if let Some(frame) = self.pending.front_mut() { frame.offset = 0; }
     }
 
     pub fn pump(&mut self, writer: &mut impl Write) -> io::Result<bool> {
@@ -228,7 +315,8 @@ impl Queue {
                 }
                 Ok(true)
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock
+                || cfg!(target_os = "linux") && matches!(err.raw_os_error(), Some(105 | 12)) => {
                 self.counts.would_block += 1;
                 Ok(false)
             }
@@ -290,14 +378,60 @@ mod tests {
         for _ in 0..MAX_FRAMES {
             q.push(3, &[9; 64], Instant::now(), Packing::Raw).unwrap();
         }
-        assert!(q.push(3, &[7; 64], Instant::now(), Packing::Raw).is_err());
+        q.push(3, &[7; 64], Instant::now(), Packing::Raw).unwrap();
         assert_eq!(q.counts.overflow, 1);
+        assert_eq!(q.counts.overflow_bytes, 64);
         assert_eq!(q.payload_bytes(), (64 * MAX_FRAMES) as u64);
         let mut sink = Vec::new();
         while q.frames() > 0 {
             q.pump(&mut sink).unwrap();
         }
         assert_eq!(q.counts.frames, MAX_FRAMES as u64);
+        q.push(3, &[8; 64], Instant::now(), Packing::Raw).unwrap();
+        let mut next = Vec::new();
+        q.pump(&mut next).unwrap();
+        let meta = std::str::from_utf8(&next[12..next.len()-64]).unwrap();
+        assert!(meta.contains(&format!("\"pos\":{},\"seq\":{}", 64 * (MAX_FRAMES + 1), MAX_FRAMES + 1)));
+    }
+
+    #[test]
+    fn reconnect_resends_the_whole_partial_record() {
+        let mut q = Queue::new(24);
+        q.push(9, &[1; 20], Instant::now(), Packing::Raw).unwrap();
+        let mut old_socket = Partial { blocked: true, result: Vec::new() };
+        assert!(q.pump(&mut old_socket).unwrap());
+        q.rewind_partial_frame();
+        let mut new_socket = Vec::new();
+        assert!(q.pump(&mut new_socket).unwrap());
+        assert_eq!(&new_socket[..4], b"R8V1");
+        assert!(new_socket.starts_with(&old_socket.result));
+        assert_eq!((q.counts.frames, q.counts.bytes), (1, 20));
+    }
+
+    #[test]
+    fn real_tcp_link_reopens_with_negotiation_and_queued_payload() {
+        use std::net::TcpListener;
+        let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut q = Queue::new(24);
+        let mut link = Link::open(peer.local_addr().unwrap(), true).unwrap();
+        let (mut first, _) = peer.accept().unwrap();
+        let mut hello = [0; 4];
+        first.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello, b"R8H1");
+        drop(first);
+        link.disconnect(&mut q);
+        q.push(9, &[3; 20], Instant::now(), Packing::Raw).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while q.frames() != 0 && Instant::now() < deadline {
+            link.pump(&mut q);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!((q.counts.reconnects, q.counts.frames), (1, 1));
+        let (mut second, _) = peer.accept().unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut header = [0; 8];
+        second.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"R8H1R8V1");
     }
 
     #[test]
