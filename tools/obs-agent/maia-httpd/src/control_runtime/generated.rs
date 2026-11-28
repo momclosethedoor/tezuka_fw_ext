@@ -1,6 +1,7 @@
 use super::*;
 use mixer_math::{OFFSET, Tuning, choose};
 mod grid_bench;
+mod ram_spur;
 mod tx_schedule;
 
 pub(super) fn scan_rf_bounds() -> Result<[u64; 2]> {
@@ -69,6 +70,10 @@ pub(super) fn failure(scan: &Value, command: &Value, reason: String) -> Value {
 
 pub(super) fn tiles(state: &Value) -> Result<Vec<Tile>> {
     executable_tiles(state, &core_tiles(state)?)
+}
+
+pub(super) fn spur_tiles(state: &Value) -> Result<Option<Vec<Tile>>> {
+    ram_spur::load(state)
 }
 
 pub(super) fn next_route(previous: &Tile, first: &mut Tile) {

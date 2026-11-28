@@ -21,6 +21,10 @@ on:
         type: boolean
         required: false
         default: false
+      build_spur_agent:
+        description: "Build the ARM scan agent from this revision for the Nano image"
+        type: boolean
+        default: false
 
 # Cancel in-progress dispatch runs on new dispatch of the same ref, but
 # never cancel a tag-push release build (a half-published release is worse
@@ -39,6 +43,10 @@ run-name: >-
       || format('CI ({0})', inputs.boards || 'all') }}
 
 jobs:
+  spur-arm:
+    if: inputs.build_spur_agent
+    uses: ./.github/workflows/system-agent.yml
+
   matrix:
     runs-on: ubuntu-22.04
     permissions:
@@ -127,7 +135,8 @@ jobs:
           if-no-files-found: warn
 
   tezuka:
-    needs: matrix
+    needs: [matrix, spur-arm]
+    if: ${{ !cancelled() && needs.matrix.result == 'success' && (needs.spur-arm.result == 'success' || needs.spur-arm.result == 'skipped') }}
     runs-on: ubuntu-22.04
     name: ${{ matrix.defconfig }}
     permissions:
@@ -186,20 +195,31 @@ jobs:
             libgnutls28-dev curl kmod
 
       - uses: actions/download-artifact@v8
+        if: '!inputs.build_spur_agent'
         with:
           name: obs007c-main-agent
           path: zefir-arm
           run-id: 46084602519
           github-token: ${{ github.token }}
 
+      - uses: actions/download-artifact@v8
+        if: inputs.build_spur_agent && matrix.board == 'nano'
+        with:
+          name: obs007c-main-agent
+          path: zefir-arm
+
       - name: Stage ZEFIR ARM runtime
         if: matrix.board == 'nano'
+        env:
+          BUILD_SPUR_AGENT: ${{ inputs.build_spur_agent }}
         run: |
           set -euo pipefail
-          (cd zefir-arm && sha256sum -c SHA256SUMS &&
-            printf '%s\n' \
+          (cd zefir-arm && sha256sum -c SHA256SUMS)
+          if [[ "$BUILD_SPUR_AGENT" != true ]]; then
+            (cd zefir-arm && printf '%s\n' \
               '45c63996541abe83a7fb1e638bdf2b911fbba0dbcfc76cc31aff6c31f01c1e80  maia-httpd' \
               '45d809ecb4d4d92f0a801ea75e632e07a933675bdeae9e8f490243958f2a0fa6  obs-ffm1-iio' | sha256sum -c -)
+          fi
           overlay=board/tezuka/nano/overlay_goofy
           install -Dm755 zefir-arm/maia-httpd "$overlay/usr/bin/maia-delivery"
           install -Dm755 zefir-arm/obs-ffm1-iio "$overlay/usr/libexec/zefir/obs-ffm1-iio"
