@@ -171,6 +171,9 @@ impl Cache {
     }
 
     fn tiles(&self, pending: &Value) -> Result<Vec<generated::Tile>> {
+        if let Some(tiles) = generated::spur_tiles(pending)? {
+            return Ok(tiles);
+        }
         let scan = &pending["scan"];
         let ranges = scan["ranges"].as_array().ok_or_else(|| anyhow!("ranges"))?;
         ensure!(ranges.iter().filter(|r| r["enabled"]==true).all(|r| r["tx_slot"].is_null()),
@@ -418,3 +421,4 @@ fn cpu_ns() -> Result<u64> {
     );
     Ok(t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64)
 }
+
